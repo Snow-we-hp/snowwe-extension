@@ -98,7 +98,7 @@ echo "これから「Snow-we 自動更新」を1回起動します。"
 echo "「“Snow-we 自動更新”がデスクトップフォルダ内のファイルにアクセスしようとしています」と出たら、"
 echo "👉【許可】を押してください。（出ない場合は、すでに許可されています）"
 echo ""
-mark=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+mark=0; [ -f "$LOG" ] && mark=$(wc -l < "$LOG")
 open -W "$APP"
 result=$(tail -n +"$((mark + 1))" "$LOG" 2>/dev/null | tail -1)
 echo "結果: ${result:-（記録がありません）}"
