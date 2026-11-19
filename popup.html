@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>パーソナライズ生成</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      /* サイドパネル化に伴い、固定幅のポップアップ用ボックスではなく、Chromeが
+         割り当てる（ユーザーがドラッグでリサイズ可能な）サイドパネルの実際の幅に
+         追従させる。固定pxのままだと、パネル幅がそれより広い場合に余白が余ったり、
+         狭い場合に横スクロールが発生したりしてしまう */
+      width: 100%;
+      min-width: 300px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Yu Gothic', sans-serif;
+      font-size: 13px;
+      color: #2c2c2a;
+      background: #fff;
+    }
+
+    .header {
+      padding: 11px 16px;
+      border-bottom: 0.5px solid #e0ddd6;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .logo {
+      width: 28px; height: 28px;
+      background: #EEEDFE; border-radius: 7px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 700; color: #3C3489; flex-shrink: 0;
+    }
+    .header-text .title { font-size: 13px; font-weight: 500; }
+    .header-text .sub { font-size: 10px; color: #888780; margin-top: 1px; }
+
+    .api-section { padding: 10px 16px; border-bottom: 0.5px solid #e0ddd6; }
+    .label { font-size: 10px; font-weight: 500; color: #5F5E5A; margin-bottom: 4px; letter-spacing: .03em; }
+    .api-row { display: flex; gap: 6px; }
+    input[type="password"], input[type="text"], input[type="number"] {
+      flex: 1; padding: 7px 10px;
+      border: 0.5px solid #d3d1c7; border-radius: 6px;
+      font-size: 12px; color: #2c2c2a; background: #fff; outline: none;
+      transition: border-color .15s;
+    }
+    input[type="password"]:focus,
+    input[type="text"]:focus,
+    input[type="number"]:focus { border-color: #7F77DD; }
+    .save-btn {
+      padding: 7px 12px;
+      background: #EEEDFE; color: #3C3489;
+      border: 0.5px solid #AFA9EC; border-radius: 6px;
+      font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap;
+    }
+    .save-btn:hover { background: #CECBF6; }
+
+    .tabs { display: flex; flex-wrap: wrap; border-bottom: 0.5px solid #e0ddd6; }
+    .tab-btn {
+      flex: 1 1 33.33%; min-width: 0; padding: 8px 4px;
+      background: none; border: none; cursor: pointer;
+      font-size: 11px; font-weight: 500; color: #888780;
+      border-bottom: 2px solid transparent;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      transition: all .15s;
+    }
+    .tab-btn.active { color: #534AB7; border-bottom-color: #534AB7; }
+    .tab-btn:hover:not(.active) { color: #5F5E5A; background: #F8F7F3; }
+
+    .tab-content { display: none; padding: 12px 16px; }
+    .tab-content.active { display: block; }
+
+    select {
+      width: 100%; padding: 7px 10px;
+      border: 0.5px solid #d3d1c7; border-radius: 6px;
+      font-size: 12px; color: #2c2c2a; background: #fff;
+      outline: none; cursor: pointer;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888780' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+    }
+    select:focus { border-color: #7F77DD; }
+
+    textarea {
+      width: 100%; padding: 7px 10px;
+      border: 0.5px solid #d3d1c7; border-radius: 6px;
+      font-size: 12px; color: #2c2c2a; background: #fff; outline: none;
+      resize: vertical; min-height: 60px; line-height: 1.5;
+      transition: border-color .15s;
+    }
+    textarea:focus { border-color: #7F77DD; }
+
+    .primary-btn {
+      width: 100%; padding: 10px;
+      background: #534AB7; color: #fff;
+      border: none; border-radius: 8px;
+      font-size: 13px; font-weight: 500;
+      cursor: pointer; transition: background .15s;
+    }
+    .primary-btn:hover { background: #3C3489; }
+    .primary-btn:disabled { background: #AFA9EC; cursor: not-allowed; }
+
+    .status {
+      font-size: 12px; min-height: 18px;
+      display: flex; align-items: center; gap: 6px;
+      margin: 8px 0 6px;
+    }
+    .status.loading { color: #534AB7; }
+    .status.error   { color: #A32D2D; }
+    .status.success { color: #085041; }
+    .status.idle    { color: #888780; }
+    .spinner {
+      width: 11px; height: 11px;
+      border: 2px solid #CECBF6; border-top-color: #534AB7;
+      border-radius: 50%; animation: spin .6s linear infinite; flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .result-box {
+      background: #F8F7F3; border: 0.5px solid #d3d1c7;
+      border-radius: 8px; padding: 11px;
+      font-size: 13px; line-height: 1.7; color: #2c2c2a;
+      min-height: 70px; white-space: pre-wrap; word-break: break-all;
+    }
+
+    .action-row { display: flex; gap: 6px; margin-top: 7px; }
+    .copy-btn {
+      flex: 1; padding: 7px;
+      background: #E1F5EE; color: #085041;
+      border: 0.5px solid #5DCAA5; border-radius: 6px;
+      font-size: 11px; font-weight: 500; cursor: pointer;
+    }
+    .copy-btn:hover, .copy-btn.copied { background: #9FE1CB; }
+    .copy-template-btn {
+      flex: 1; padding: 7px;
+      background: #534AB7; color: #fff;
+      border: none; border-radius: 6px;
+      font-size: 11px; font-weight: 500; cursor: pointer;
+    }
+    .copy-template-btn:hover { background: #3C3489; }
+    .copy-template-btn.copied { background: #085041; }
+    .regen-btn {
+      padding: 7px 12px;
+      background: #fff; color: #534AB7;
+      border: 0.5px solid #AFA9EC; border-radius: 6px;
+      font-size: 11px; font-weight: 500; cursor: pointer; white-space: nowrap;
+    }
+    .regen-btn:hover { background: #EEEDFE; }
+
+    .hint { font-size: 10px; color: #888780; margin-top: 4px; line-height: 1.5; }
+
+    /* 候補者サマリーカード */
+    .candidate-card {
+      background: #F0F4FF; border: 1.5px solid #A5B4FC;
+      border-radius: 10px; padding: 11px 14px; margin-bottom: 10px;
+    }
+    .candidate-card-label {
+      font-size: 10px; font-weight: 600; color: #4338CA;
+      letter-spacing: .04em; margin-bottom: 7px;
+    }
+    .candidate-fields { display: flex; flex-direction: column; gap: 4px; }
+    .candidate-field {
+      display: flex; align-items: baseline; gap: 6px; font-size: 12px;
+    }
+    .candidate-field-name {
+      font-size: 10px; font-weight: 600; color: #6366F1;
+      min-width: 44px; flex-shrink: 0;
+    }
+    .candidate-field-value { color: #1E1B4B; font-weight: 500; }
+    .candidate-field-value.unknown { color: #9CA3AF; font-weight: 400; font-style: italic; }
+
+    /* 一次選定 */
+    .screening-result { margin-top: 10px; }
+
+    .overall-banner {
+      width: 100%; border-radius: 10px; padding: 14px 16px;
+      display: flex; align-items: center; gap: 12px;
+      margin-bottom: 12px;
+    }
+    .overall-banner.ok   { background: #D1FAE5; border: 1.5px solid #34D399; }
+    .overall-banner.ng   { background: #FEE2E2; border: 1.5px solid #F87171; }
+    .overall-banner.warn { background: #FEF3C7; border: 1.5px solid #FBBF24; }
+    .overall-icon { font-size: 32px; flex-shrink: 0; line-height: 1; }
+    .overall-text { flex: 1; }
+    .overall-label { font-size: 11px; font-weight: 500; margin-bottom: 2px; }
+    .overall-banner.ok   .overall-label { color: #065F46; }
+    .overall-banner.ng   .overall-label { color: #991B1B; }
+    .overall-banner.warn .overall-label { color: #78350F; }
+    .overall-verdict { font-size: 20px; font-weight: 800; line-height: 1; }
+    .overall-banner.ok   .overall-verdict { color: #059669; }
+    .overall-banner.ng   .overall-verdict { color: #DC2626; }
+    .overall-banner.warn .overall-verdict { color: #D97706; }
+    .overall-score { font-size: 12px; font-weight: 600; margin-top: 3px; }
+    .overall-banner.ok   .overall-score { color: #065F46; }
+    .overall-banner.ng   .overall-score { color: #991B1B; }
+    .overall-banner.warn .overall-score { color: #78350F; }
+
+    .score-bar-wrap { margin-bottom: 10px; }
+    .score-bar-track {
+      height: 6px; background: #E5E7EB; border-radius: 99px; overflow: hidden;
+    }
+    .score-bar-fill {
+      height: 100%; border-radius: 99px;
+      transition: width .4s ease;
+    }
+    .score-bar-fill.ok   { background: #34D399; }
+    .score-bar-fill.ng   { background: #F87171; }
+    .score-bar-fill.warn { background: #FBBF24; }
+
+    .criteria-list { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
+    .criterion-row {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 8px 11px; border-radius: 7px;
+      background: #F8F7F3; border: 1px solid #e0ddd6;
+      font-size: 12px;
+    }
+    .criterion-row.ok   { background: #ECFDF5; border-color: #6EE7B7; }
+    .criterion-row.ng   { background: #FEF2F2; border-color: #FCA5A5; }
+    .criterion-row.skip { background: #F9FAFB; border-color: #E5E7EB; opacity: 0.75; }
+    .criterion-icon { font-size: 15px; flex-shrink: 0; margin-top: 1px; }
+    .criterion-body { flex: 1; }
+    .criterion-name { font-weight: 700; font-size: 12px; }
+    .criterion-row.ok   .criterion-name { color: #065F46; }
+    .criterion-row.ng   .criterion-name { color: #991B1B; }
+    .criterion-row.skip .criterion-name { color: #6B7280; }
+    .criterion-detail { margin-top: 2px; font-size: 11px; line-height: 1.5; color: #4B5563; }
+
+    .screening-comment {
+      background: #F8F7F3; border: 0.5px solid #d3d1c7;
+      border-radius: 6px; padding: 9px 11px;
+      font-size: 12px; line-height: 1.6; color: #5F5E5A;
+    }
+    .comment-label { font-size: 10px; font-weight: 600; color: #888780; margin-bottom: 3px; }
+
+    /* 設定タブ */
+    .setting-group { margin-bottom: 14px; }
+    .setting-group .label { margin-bottom: 6px; }
+
+    /* GAS設定UI */
+    .gas-section {
+      border: 1px solid #AFA9EC; border-radius: 10px;
+      padding: 12px; margin-bottom: 14px; background: #FAFAFF;
+    }
+    .gas-section-title {
+      font-size: 12px; font-weight: 700; color: #3C3489; margin-bottom: 10px;
+      display: flex; align-items: center; gap: 5px;
+    }
+    .gas-field { margin-bottom: 8px; }
+    .gas-field-label {
+      font-size: 10px; font-weight: 600; color: #5F5E5A;
+      margin-bottom: 3px; display: flex; align-items: center; gap: 5px;
+    }
+    .gas-badge {
+      font-size: 9px; font-weight: 600; padding: 1px 6px; border-radius: 8px;
+      background: #EEEDFE; color: #534AB7;
+    }
+    .gas-badge.required { background: #FEE2E2; color: #991B1B; }
+    .gas-badge.optional { background: #F0FDF4; color: #065F46; }
+    .gas-features {
+      background: #fff; border: 1px solid #AFA9EC;
+      border-radius: 7px; padding: 8px 10px; margin-top: 6px;
+    }
+    .gas-features-title {
+      font-size: 10px; font-weight: 600; color: #534AB7; margin-bottom: 5px;
+    }
+    .gas-feature-item {
+      font-size: 10px; color: #3C3489; line-height: 1.8;
+    }
+    .gas-advanced summary {
+      font-size: 10px; color: #888780; cursor: pointer; margin-top: 8px;
+      padding: 4px 0; user-select: none;
+    }
+    .gas-advanced summary:hover { color: #534AB7; }
+    .gas-advanced-content { margin-top: 8px; }
+    .gas-advanced-field { margin-bottom: 7px; }
+    .gas-advanced-field .gas-field-label { color: #888780; }
+
+    /* トグルスイッチ */
+    .toggle-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 0; border-bottom: 0.5px solid #DDD9F5;
+    }
+    .toggle-row:last-child { border-bottom: none; }
+    .toggle-text .toggle-label { font-size: 12px; color: #2c2c2a; font-weight: 500; }
+    .toggle-text .toggle-desc { font-size: 10px; color: #888780; margin-top: 1px; }
+    .toggle-switch {
+      position: relative; width: 38px; height: 21px; flex-shrink: 0;
+    }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .toggle-slider {
+      position: absolute; inset: 0; cursor: pointer;
+      background: #d3d1c7; border-radius: 21px; transition: .2s;
+    }
+    .toggle-slider::before {
+      content: ''; position: absolute;
+      width: 15px; height: 15px; left: 3px; bottom: 3px;
+      background: #fff; border-radius: 50%; transition: .2s;
+      box-shadow: 0 1px 3px rgba(0,0,0,.2);
+    }
+    .toggle-switch input:checked + .toggle-slider { background: #534AB7; }
+    .toggle-switch input:checked + .toggle-slider::before { transform: translateX(17px); }
+
+    /* チーム設定コード */
+    .setup-code-section {
+      border: 1px dashed #AFA9EC; border-radius: 10px;
+      padding: 11px; margin-bottom: 14px; background: #FAFAFF;
+    }
+    .setup-code-title {
+      font-size: 12px; font-weight: 700; color: #3C3489; margin-bottom: 4px;
+    }
+    .setup-code-desc { font-size: 10px; color: #888780; margin-bottom: 8px; line-height: 1.6; }
+    .setup-code-box {
+      width: 100%; min-height: 44px; padding: 7px 9px;
+      border: 0.5px solid #d3d1c7; border-radius: 6px;
+      font-size: 10px; font-family: monospace; color: #2c2c2a;
+      background: #fff; resize: none; outline: none; word-break: break-all;
+    }
+    .setup-code-box:focus { border-color: #7F77DD; }
+    .setup-code-btn-row { display: flex; gap: 6px; margin-top: 6px; }
+    .setup-code-msg { font-size: 11px; margin-top: 5px; display: none; }
+    .range-row { display: flex; align-items: center; gap: 6px; }
+    .range-row input[type="number"] { flex: 1; }
+    .range-sep { color: #888780; font-size: 12px; flex-shrink: 0; }
+
+    .checkbox-group { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+    .checkbox-item {
+      display: flex; align-items: center; gap: 4px;
+      padding: 4px 10px;
+      border: 0.5px solid #d3d1c7; border-radius: 20px;
+      font-size: 11px; cursor: pointer;
+      transition: all .15s; user-select: none;
+    }
+    .checkbox-item input { display: none; }
+    .checkbox-item.checked {
+      background: #EEEDFE; color: #3C3489;
+      border-color: #AFA9EC; font-weight: 500;
+    }
+    .checkbox-item:hover { background: #F8F7F3; }
+    .checkbox-item.checked:hover { background: #CECBF6; }
+
+    .settings-save-btn {
+      width: 100%; padding: 9px;
+      background: #534AB7; color: #fff;
+      border: none; border-radius: 8px;
+      font-size: 12px; font-weight: 500; cursor: pointer;
+      margin-top: 4px;
+    }
+    .settings-save-btn:hover { background: #3C3489; }
+    .settings-saved { color: #085041; font-size: 11px; text-align: center; margin-top: 5px; display: none; }
+
+    /* ポジション提案カード */
+    .suggest-card {
+      border: 0.5px solid #d3d1c7; border-radius: 8px;
+      padding: 10px 12px; margin-bottom: 8px; background: #fff;
+    }
+    .suggest-card.best { border-color: #7F77DD; background: #FAFAFF; }
+    .suggest-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+    .suggest-rank { font-size: 11px; font-weight: 600; color: #534AB7; }
+    .suggest-score {
+      font-size: 11px; font-weight: 600;
+      background: #EEEDFE; color: #3C3489;
+      padding: 2px 7px; border-radius: 10px;
+    }
+    .suggest-position { font-size: 13px; font-weight: 600; color: #2c2c2a; margin-bottom: 5px; }
+    .suggest-reason { font-size: 11px; color: #5F5E5A; line-height: 1.6; margin-bottom: 7px; }
+    .suggest-url { display: inline-block; font-size: 11px; color: #4B42A3; text-decoration: underline; margin-bottom: 7px; word-break: break-all; }
+    .use-position-btn {
+      width: 100%; padding: 6px;
+      background: #EEEDFE; color: #3C3489;
+      border: 0.5px solid #AFA9EC; border-radius: 6px;
+      font-size: 11px; font-weight: 500; cursor: pointer;
+    }
+    .use-position-btn:hover { background: #CECBF6; }
+    .scout-template-btn {
+      width: 100%; padding: 6px; margin-top: 5px;
+      background: #3C3489; color: #fff;
+      border: 0.5px solid #3C3489; border-radius: 6px;
+      font-size: 11px; font-weight: 600; cursor: pointer;
+    }
+    .scout-template-btn:hover:not(:disabled) { background: #2E2870; }
+    .scout-template-btn:disabled { opacity: 0.7; cursor: default; }
+
+    .debug-btn {
+      width: 100%; padding: 5px;
+      background: #fff; color: #aaa;
+      border: 0.5px solid #e0ddd6; border-radius: 6px;
+      font-size: 10px; cursor: pointer; margin-top: 8px;
+    }
+    .debug-btn:hover { color: #5F5E5A; background: #F8F7F3; }
+    .debug-output {
+      background: #F8F7F3; border: 0.5px solid #d3d1c7;
+      border-radius: 6px; padding: 7px; margin-top: 5px;
+      font-size: 10px; font-family: monospace;
+      line-height: 1.5; color: #5F5E5A;
+      white-space: pre-wrap; word-break: break-all;
+      max-height: 180px; overflow-y: auto;
+    }
+
+    .position-row { margin-bottom: 10px; }
+
+    /* 承認待ちカード */
+    .approval-card {
+      border: 0.5px solid #d3d1c7; border-radius: 8px;
+      padding: 10px 12px; margin-bottom: 8px; background: #fff;
+    }
+    .approval-card-top { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+    .approval-card-platform {
+      font-size: 10px; font-weight: 600; padding: 2px 6px;
+      border-radius: 10px; background: #EEEDFE; color: #3C3489; flex-shrink: 0;
+    }
+    .approval-card-meta { font-size: 11px; color: #5F5E5A; }
+    .approval-card-reason { font-size: 11px; color: #888780; line-height: 1.5; margin-bottom: 7px; }
+    .approval-card-position-label { font-size: 11px; color: #3C3489; font-weight: 500; margin-bottom: 3px; line-height: 1.4; word-break: break-word; }
+    .approval-card-room-link {
+      display: inline-block; font-size: 11px; color: #3C3489; margin-bottom: 7px;
+      text-decoration: underline; background: none; border: none; padding: 0; cursor: pointer;
+      font-family: inherit;
+    }
+    .approval-card-room-link:hover { color: #1e1a6b; }
+    .approval-card-profile-detail { margin-bottom: 7px; }
+    .approval-card-profile-detail summary {
+      font-size: 11px; color: #3C3489; cursor: pointer; user-select: none;
+    }
+    .approval-card-profile-text {
+      font-size: 11px; color: #5F5E5A; line-height: 1.5; white-space: pre-wrap;
+      max-height: 200px; overflow-y: auto; margin-top: 5px; padding: 6px;
+      background: #F7F7F5; border-radius: 6px; border: 1px solid #E5E4E0;
+    }
+    .approval-card select { margin-bottom: 7px; }
+    .approval-card-actions { display: flex; gap: 6px; }
+    .approve-btn {
+      flex: 1; padding: 7px;
+      background: #D1FAE5; color: #065F46;
+      border: 0.5px solid #34D399; border-radius: 6px;
+      font-size: 11px; font-weight: 500; cursor: pointer;
+    }
+    .approve-btn:hover { background: #A7F3D0; }
+    .reject-btn {
+      flex: 1; padding: 7px;
+      background: #FEE2E2; color: #991B1B;
+      border: 0.5px solid #F87171; border-radius: 6px;
+      font-size: 11px; font-weight: 500; cursor: pointer;
+    }
+    .reject-btn:hover { background: #FECACA; }
+
+    /* 履歴タブ */
+    .history-item {
+      display: flex; align-items: flex-start; gap: 8px;
+      padding: 7px 10px;
+      border-bottom: 0.5px solid #e0ddd6; font-size: 11px;
+    }
+    .history-item:last-child { border-bottom: none; }
+    .history-item-platform {
+      font-size: 10px; font-weight: 600; padding: 2px 6px;
+      border-radius: 10px; background: #EEEDFE; color: #3C3489;
+      white-space: nowrap; flex-shrink: 0; margin-top: 1px;
+    }
+    .history-item-body { flex: 1; min-width: 0; }
+    .history-item-company { font-weight: 600; color: #2c2c2a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .history-item-pos { font-size: 10px; color: #6366F1; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .history-item-meta { font-size: 10px; color: #888780; margin-top: 1px; }
+    .history-item-days { font-size: 10px; padding: 2px 6px; border-radius: 10px; flex-shrink: 0; margin-top: 1px; }
+    .history-item-days.rescoutable { background: #FEF3C7; color: #D97706; }
+    .history-item-days.recent { background: #FEE2E2; color: #B91C1C; }
+    .reply-btn { font-size: 10px; padding: 2px 7px; border-radius: 10px; border: 1px solid #6366F1; color: #6366F1; background: #fff; cursor: pointer; flex-shrink: 0; margin-top: 1px; white-space: nowrap; }
+    .reply-btn:hover { background: #EEF2FF; }
+    .reply-tag { font-size: 10px; padding: 2px 7px; border-radius: 10px; background: #D1FAE5; color: #065F46; flex-shrink: 0; margin-top: 1px; white-space: nowrap; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">S</div>
+  <div class="header-text">
+    <div class="title">パーソナライズ文ジェネレーター</div>
+    <div class="sub">Snow-we.Inc — v1.14.0</div>
+  </div>
+</div>
+
+<!-- 会社の Google アカウントでのログイン。承認待ちリスト・送信の記録をログインした鍵で読み書きする -->
+<div id="login-bar" style="display:flex; align-items:center; gap:8px; margin:8px 16px 0; padding:6px 10px; border:1px solid #D3D1C7; border-radius:6px; font-size:11px; color:#444441;">
+  <span id="login-status" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">ログイン状態を確認中…</span>
+  <button id="login-btn" class="save-btn" style="padding:3px 10px; font-size:11px; display:none;">会社のGoogleでログイン</button>
+  <button id="logout-btn" style="padding:3px 8px; font-size:10px; border-radius:4px; border:1px solid #D3D1C7; background:#fff; cursor:pointer; display:none;">ログアウト</button>
+</div>
+<div id="login-error" style="display:none; margin:4px 16px 0; font-size:10px; color:#A32D2D; line-height:1.5;"></div>
+
+<div id="anomaly-banner" style="display:none; background:#FEF3C7; border:1px solid #F59E0B; border-radius:6px; padding:8px 10px; margin:8px 16px 0; font-size:11px; color:#78350F; line-height:1.5;">
+  <div id="anomaly-banner-text" style="white-space:pre-line;"></div>
+  <button id="anomaly-ack-btn" style="margin-top:6px; font-size:10px; padding:3px 8px; border-radius:4px; border:1px solid #F59E0B; background:#fff; cursor:pointer;">確認済みにする</button>
+</div>
+
+<div class="api-section">
+  <div class="label">Claude API Key</div>
+  <div class="api-row">
+    <input type="password" id="api-key" placeholder="sk-ant-api03-..." />
+    <button class="save-btn" id="save-btn">保存</button>
+  </div>
+  <div id="api-cost-display" style="font-size:10px; color:#888780; margin-top:4px;"></div>
+  <!-- 利用額を表示するだけでは、気づいたときには使い切っている。
+       上限に達したらAPIを呼ばないようにする（0で無制限） -->
+  <div style="display:flex; align-items:center; gap:6px; margin-top:6px; font-size:10px; color:#888780;">
+    <span>上限 1日</span>
+    <span>$</span><input type="number" id="budget-daily" min="0" step="1"
+      style="width:52px; padding:2px 4px; font-size:10px;" />
+    <span>／ 1か月</span>
+    <span>$</span><input type="number" id="budget-monthly" min="0" step="10"
+      style="width:60px; padding:2px 4px; font-size:10px;" />
+    <button class="save-btn" id="budget-save-btn" style="padding:2px 8px; font-size:10px;">保存</button>
+  </div>
+  <div id="budget-status" style="font-size:10px; color:#888780; margin-top:3px;"></div>
+</div>
+
+<div class="tabs">
+  <button class="tab-btn active" data-tab="generate">✍️ 文生成</button>
+  <button class="tab-btn" data-tab="suggest">🎯 ポジション</button>
+  <button class="tab-btn" data-tab="screening">🔍 一次選定</button>
+  <button class="tab-btn" data-tab="approval">✅ 承認待ち</button>
+  <button class="tab-btn" data-tab="history">📋 履歴</button>
+  <button class="tab-btn" data-tab="chat">💬 相談</button>
+  <button class="tab-btn" data-tab="settings">⚙️ 設定</button>
+</div>
+
+<!-- タブ1: パーソナライズ文生成 -->
+<div class="tab-content active" id="tab-generate">
+  <select id="position-select" style="display:none;">
+    <!-- 選択肢は background.js の POSITION_LIST で管理 -->
+  </select>
+
+  <button class="primary-btn" id="generate-btn">プロフィールを取得してパーソナライズ文を生成</button>
+  <div class="status idle" id="status">候補者のプロフィールページで実行してください</div>
+
+  <div id="result-section" style="display:none;">
+    <div class="label">生成されたパーソナライズ文</div>
+    <div class="result-box" id="result-text"></div>
+    <div class="action-row">
+      <button class="copy-btn" id="copy-btn">文のみコピー</button>
+      <button class="copy-template-btn" id="copy-template-btn">テンプレ全文をコピー</button>
+      <button class="regen-btn" id="regen-btn">再生成</button>
+    </div>
+    <div class="hint">「テンプレ全文をコピー」でポジション名入り全文をコピーできます</div>
+  </div>
+
+  <button class="debug-btn" id="debug-btn">🔍 診断情報を取得（不具合時）</button>
+  <div id="debug-section" style="display:none;">
+    <div class="debug-output" id="debug-output"></div>
+  </div>
+</div>
+
+<!-- タブ2: ポジション提案 -->
+<div class="tab-content" id="tab-suggest">
+  <div style="margin-bottom:10px; font-size:12px; color:#5F5E5A; line-height:1.6;">
+    候補者の経歴を分析し、最適なポジションを提案します。
+  </div>
+  <button class="primary-btn" id="suggest-btn">🎯 最適ポジションを分析・提案する</button>
+  <div class="status idle" id="suggest-status">候補者のプロフィールページで実行してください</div>
+  <div id="suggest-result" style="display:none;">
+    <div class="label" style="margin-bottom:8px;">推奨ポジション</div>
+    <div id="suggest-cards"></div>
+    <div class="hint">「このポジションで生成」を押すとパーソナライズ文タブに移動して生成開始します</div>
+  </div>
+</div>
+
+<!-- タブ3: 一次選定 -->
+<div class="tab-content" id="tab-screening">
+  <div style="margin-bottom:10px; font-size:12px; color:#5F5E5A; line-height:1.6;">
+    設定した選定基準で候補者を自動判定します。基準は⚙️設定タブで変更できます。
+  </div>
+  <button class="primary-btn" id="batch-screening-btn" style="margin-bottom:6px;">⚡ 一覧の全候補者を一括判定</button>
+  <button class="primary-btn" id="auto-add-btn" style="background:#0369a1; margin-bottom:6px;">🤖 OK候補を検討リストに自動追加</button>
+  <button class="primary-btn" id="screening-btn" style="background:#888780; font-size:12px; padding:8px;">🔍 選択中の1人を判定（詳細表示後）</button>
+  <div class="status idle" id="screening-status">一覧画面で実行してください</div>
+  <div class="screening-result" id="screening-result" style="display:none;">
+    <div id="candidate-card"></div>
+    <div id="overall-badge-wrap"></div>
+    <div class="criteria-list" id="criteria-list"></div>
+    <div class="comment-label">AIコメント</div>
+    <div class="screening-comment" id="screening-comment"></div>
+    <div id="screening-feedback" style="display:none; margin-top:8px;"></div>
+  </div>
+</div>
+
+<!-- タブ: 承認待ち（AIが星をつけた候補者のレビュー） -->
+<div class="tab-content" id="tab-approval">
+  <div style="margin-bottom:10px; font-size:12px; color:#5F5E5A; line-height:1.6;">
+    AIが選定・星付けした候補者を確認し、ポジションの承認・修正・却下ができます。承認した候補者がRPA自動送信の対象になります。
+  </div>
+  <div style="display:flex; gap:6px; margin-bottom:8px;">
+    <select id="approval-recruiter-filter" style="flex:1; font-size:11px; padding:4px;">
+      <option value="">全員</option>
+    </select>
+    <button class="save-btn" id="approval-refresh-btn" style="flex:1; font-size:11px;">🔄 更新</button>
+  </div>
+  <div style="font-size:10px; color:#888780; margin-bottom:5px;" id="approval-count-label">読み込み中...</div>
+  <div id="approval-list" style="max-height:320px; overflow-y:auto;">
+    <div style="padding:20px; text-align:center; color:#aaa; font-size:12px;">読み込み中...</div>
+  </div>
+</div>
+
+<!-- タブ4: 履歴 -->
+<div class="tab-content" id="tab-history">
+  <div id="history-stats" style="display:flex; gap:8px; margin-bottom:10px;">
+    <div style="flex:1; background:#F0F4FF; border:1px solid #A5B4FC; border-radius:8px; padding:8px 10px; text-align:center;">
+      <div style="font-size:20px; font-weight:700; color:#4338CA;" id="history-total">0</div>
+      <div style="font-size:10px; color:#6366F1; margin-top:2px;">スカウト済み</div>
+    </div>
+    <div style="flex:1; background:#F0FDF4; border:1px solid #86EFAC; border-radius:8px; padding:8px 10px; text-align:center;">
+      <div style="font-size:20px; font-weight:700; color:#16A34A;" id="history-recent">0</div>
+      <div style="font-size:10px; color:#16A34A; margin-top:2px;">直近30日</div>
+    </div>
+    <div style="flex:1; background:#FEF3C7; border:1px solid #FCD34D; border-radius:8px; padding:8px 10px; text-align:center;">
+      <div style="font-size:20px; font-weight:700; color:#D97706;" id="history-rescoutable">0</div>
+      <div style="font-size:10px; color:#D97706; margin-top:2px;">再スカウト可</div>
+    </div>
+  </div>
+
+  <div style="display:flex; gap:6px; margin-bottom:6px;">
+    <button class="save-btn" id="history-export-btn" style="flex:1; font-size:11px;">📥 エクスポート</button>
+    <button class="save-btn" id="history-import-btn" style="flex:1; font-size:11px;">📤 インポート</button>
+    <button class="save-btn" id="history-manual-btn" style="flex:1; font-size:11px;">✏️ 手動追加</button>
+    <input type="file" id="history-import-file" accept=".csv" style="display:none;">
+  </div>
+  <div style="display:flex; gap:6px; margin-bottom:10px;">
+    <button class="save-btn" id="history-resend-btn" style="flex:1; font-size:11px; background:#D97706; color:#fff; border-color:#D97706;">📡 未送信をGASに再送</button>
+    <button class="save-btn" id="history-sync-btn" style="flex:1; font-size:11px; background:#4338CA; color:#fff; border-color:#4338CA;">🔄 チーム同期</button>
+  </div>
+  <div id="history-import-hint" style="font-size:10px; color:#888; margin-bottom:8px; display:none; line-height:1.5;">
+    CSVの列: 送信日時, 会社名, 年齢, 大学, ポジション名, 業界, 媒体<br>
+    ※1行目がヘッダーの場合は自動スキップします
+  </div>
+  <div id="history-manual-form" style="display:none; background:#f9f8f6; border:0.5px solid #d9d6cf; border-radius:6px; padding:10px; margin-bottom:8px;">
+    <div style="font-size:11px; font-weight:600; margin-bottom:6px; color:#3C3489;">手動でスカウト記録を追加</div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px; font-size:11px;">
+      <div><div class="label" style="font-size:10px; margin-bottom:2px;">会社名 *</div><input type="text" id="manual-company" placeholder="例: 株式会社〇〇" style="width:100%; box-sizing:border-box;"></div>
+      <div><div class="label" style="font-size:10px; margin-bottom:2px;">年齢</div><input type="text" id="manual-age" placeholder="例: 32歳" style="width:100%; box-sizing:border-box;"></div>
+      <div><div class="label" style="font-size:10px; margin-bottom:2px;">大学</div><input type="text" id="manual-univ" placeholder="例: 東京大学" style="width:100%; box-sizing:border-box;"></div>
+      <div><div class="label" style="font-size:10px; margin-bottom:2px;">ポジション</div><input type="text" id="manual-position" placeholder="例: AC) PMO" style="width:100%; box-sizing:border-box;"></div>
+      <div><div class="label" style="font-size:10px; margin-bottom:2px;">媒体</div>
+        <select id="manual-platform" style="width:100%; box-sizing:border-box; font-size:11px; padding:4px 6px;">
+          <option value="bizreach">Bizreach</option>
+          <option value="rds">RDS</option>
+          <option value="dodax">Doda X</option>
+          <option value="ambi">AMBI</option>
+          <option value="green">Green</option>
+          <option value="mynavi">Mynavi</option>
+        </select>
+      </div>
+      <div><div class="label" style="font-size:10px; margin-bottom:2px;">送信日</div><input type="date" id="manual-date" style="width:100%; box-sizing:border-box; font-size:11px;"></div>
+    </div>
+    <div style="display:flex; gap:6px; margin-top:8px;">
+      <button class="save-btn" id="manual-save-btn" style="flex:1; font-size:11px; background:#6366F1; color:#fff; border-color:#6366F1;">保存</button>
+      <button class="debug-btn" id="manual-cancel-btn" style="flex:1; font-size:11px;">キャンセル</button>
+    </div>
+  </div>
+
+  <div style="font-size:10px; color:#888780; margin-bottom:5px;" id="history-count-label">読み込み中...</div>
+  <div id="history-list" style="max-height:260px; overflow-y:auto; border:0.5px solid #e0ddd6; border-radius:6px;">
+    <div style="padding:20px; text-align:center; color:#aaa; font-size:12px;">データなし</div>
+  </div>
+
+  <button class="debug-btn" id="history-clear-btn" style="margin-top:8px; color:#c04040;">🗑️ 履歴をすべてクリア</button>
+  <div id="history-msg" style="font-size:11px; text-align:center; margin-top:5px; display:none;"></div>
+</div>
+
+<!-- タブ5: 設定 -->
+<!-- タブ6: 社内ナレッジへの相談 -->
+<div class="tab-content" id="tab-chat">
+  <div id="chat-knowledge-status" style="font-size:10px; color:#888780; margin-bottom:4px;"></div>
+  <div id="chat-candidate-status" style="font-size:10px; color:#4338CA; margin-bottom:6px;"></div>
+
+  <div id="chat-log" style="border:1px solid #E5E3DD; border-radius:8px; padding:10px;
+       height:360px; overflow-y:auto; background:#FCFCFA; font-size:12px; line-height:1.7;">
+    <div style="color:#888780;">
+      社内ナレッジ（scoutのFAQ）とポジション情報をもとに答えます。<br>
+      例：「このファームの選考は何次まで？」「未経験可のポジションは？」<br>候補者について聞くときは、下の「画面の候補者を読み込む」を先に押してください。<br>
+      <span style="color:#B45309;">候補者の氏名や経歴は入力しないでください。</span>
+    </div>
+  </div>
+
+  <div style="display:flex; gap:6px; margin-top:8px;">
+    <textarea id="chat-input" rows="2" placeholder="質問を入力（Enterで送信 / Shift+Enterで改行）"
+      style="flex:1; padding:8px; border:1px solid #E5E3DD; border-radius:8px;
+             font-size:12px; font-family:inherit; resize:vertical;"></textarea>
+    <button id="chat-send-btn" style="white-space:nowrap;">送信</button>
+  </div>
+
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+    <div style="display:flex; gap:6px;">
+      <button id="chat-load-candidate-btn" style="font-size:10px; padding:4px 8px;">👤 画面の候補者を読み込む</button>
+      <button id="chat-reset-btn" style="font-size:10px; padding:4px 8px; background:#F5F4F0;
+              color:#5A5852; border:1px solid #E5E3DD;">会話をリセット</button>
+    </div>
+    <button id="chat-reload-knowledge-btn" style="font-size:10px; padding:4px 8px; background:#F5F4F0;
+            color:#5A5852; border:1px solid #E5E3DD;">ナレッジを取り直す</button>
+  </div>
+  <div id="chat-status" style="font-size:11px; margin-top:6px;"></div>
+</div>
+
+<div class="tab-content" id="tab-settings">
+  <div style="border:1px solid #E5E3DD; border-radius:8px; padding:10px; margin-bottom:12px; background:#FCFCFA;">
+    <div style="font-size:12px; font-weight:600; margin-bottom:4px;">🔎 送る前に、記録されるか確かめる</div>
+    <div style="font-size:10px; color:#888780; margin-bottom:8px;">
+      送信する直前の状態で押すと、記録に使うのとまったく同じ処理を最後まで走らせて、
+      このまま送れば記録されるかを先に判定します。読み取るだけで、記録も送信もしません。
+      記録されない場合はその理由が出ます。画面の表示と違う項目があれば、それが直すべき場所です。
+    </div>
+    <button id="diagnose-btn" style="font-size:11px; padding:5px 10px;">送ったら記録されるか調べる</button>
+    <pre id="diagnose-result" style="display:none; margin-top:8px; font-size:10px; line-height:1.6;
+         white-space:pre-wrap; word-break:break-all; background:#F5F4F0; border:1px solid #E5E3DD;
+         border-radius:6px; padding:8px; max-height:320px; overflow:auto;"></pre>
+    <button id="diagnose-copy-btn" style="display:none; font-size:10px; padding:4px 8px; margin-top:6px;
+            background:#F5F4F0; color:#5A5852; border:1px solid #E5E3DD;">結果をコピー</button>
+  </div>
+
+
+  <div class="setting-group">
+    <div class="label">年齢（歳）</div>
+    <div class="range-row">
+      <input type="number" id="age-min" placeholder="下限（例: 28）" min="18" max="70">
+      <span class="range-sep">〜</span>
+      <input type="number" id="age-max" placeholder="上限（例: 50）" min="18" max="70">
+    </div>
+  </div>
+
+  <div class="setting-group">
+    <div class="label">年齢別 最低年収（万円・空欄でデフォルト値を使用）</div>
+    <table style="width:100%; border-collapse:collapse; font-size:11px;">
+      <tr style="color:#888780;">
+        <td style="padding:3px 6px 3px 0; width:55%;">年齢</td>
+        <td style="padding:3px 0;">最低年収（万円）</td>
+      </tr>
+      <tr>
+        <td style="padding:3px 6px 3px 0;">20代</td>
+        <td><input type="number" id="income-20s" placeholder="400" min="0" max="5000" style="width:100%;"></td>
+      </tr>
+      <tr>
+        <td style="padding:3px 6px 3px 0;">30〜35歳</td>
+        <td><input type="number" id="income-30to35" placeholder="550" min="0" max="5000" style="width:100%;"></td>
+      </tr>
+      <tr>
+        <td style="padding:3px 6px 3px 0;">36〜39歳</td>
+        <td><input type="number" id="income-36to39" placeholder="650" min="0" max="5000" style="width:100%;"></td>
+      </tr>
+      <tr>
+        <td style="padding:3px 6px 3px 0;">40〜42歳</td>
+        <td><input type="number" id="income-40to42" placeholder="800" min="0" max="5000" style="width:100%;"></td>
+      </tr>
+      <tr>
+        <td style="padding:3px 6px 3px 0;">43〜45歳</td>
+        <td><input type="number" id="income-43to45" placeholder="1000" min="0" max="5000" style="width:100%;"></td>
+      </tr>
+    </table>
+    <div style="font-size:10px; color:#888780; margin-top:4px;">46歳以上は財務・経理職歴がある場合のみ「要確認」で通過</div>
+  </div>
+
+  <div class="setting-group">
+    <div class="label">社格条件（複数選択可）</div>
+    <div class="checkbox-group" id="company-tier-group">
+      <label class="checkbox-item" data-value="上場企業">
+        <input type="checkbox" value="上場企業">上場企業
+      </label>
+      <label class="checkbox-item" data-value="大手企業">
+        <input type="checkbox" value="大手企業">大手企業
+      </label>
+      <label class="checkbox-item" data-value="外資系">
+        <input type="checkbox" value="外資系">外資系
+      </label>
+      <label class="checkbox-item" data-value="コンサルファーム">
+        <input type="checkbox" value="コンサルファーム">コンサルファーム
+      </label>
+      <label class="checkbox-item" data-value="メガベンチャー">
+        <input type="checkbox" value="メガベンチャー">メガベンチャー
+      </label>
+      <label class="checkbox-item" data-value="不問">
+        <input type="checkbox" value="不問">不問
+      </label>
+    </div>
+  </div>
+
+  <div class="setting-group">
+    <div class="label">学歴条件</div>
+    <select id="education-req">
+      <option value="不問">不問</option>
+      <option value="大卒以上">大卒以上</option>
+      <option value="大学院卒以上">大学院卒以上</option>
+      <option value="旧帝大・早慶以上">旧帝大・早慶以上</option>
+    </select>
+  </div>
+
+  <div class="setting-group">
+    <div class="label">最低在籍期間（年・空欄で不問）</div>
+    <input type="number" id="min-tenure" placeholder="例: 2" min="0.5" max="10" step="0.5" style="width:100%;">
+    <div style="font-size:10px; color:#888; margin-top:3px;">直近の職歴でこの年数未満の在籍はNGと判定します</div>
+  </div>
+
+  <div class="setting-group">
+    <div class="label">必須経験キーワード（カンマ区切り、空欄で不問）</div>
+    <textarea id="required-keywords" placeholder="例: コンサルタント, PM, ERP, DX"></textarea>
+  </div>
+
+  <div class="setting-group">
+    <div class="label">除外企業（職歴に含む場合はNG・カンマ区切り）</div>
+    <textarea id="exclude-companies" placeholder="例: アクセンチュア, ベイカレント"></textarea>
+    <div style="font-size:10px; color:#888; margin-top:3px;">過去・現職問わず職歴にこれらの企業名があればNG判定します</div>
+  </div>
+
+  <div class="setting-group">
+    <div class="label">除外キーワード（カンマ区切り、空欄で不問）</div>
+    <textarea id="exclude-keywords" placeholder="例: 販売員, アルバイト"></textarea>
+  </div>
+
+  <div class="setting-group">
+    <div class="label">自動追加時のタグ名（doda-X用・空欄でタグなし）</div>
+    <input type="text" id="auto-tag-name" placeholder="例: スカウト候補" style="width:100%;">
+    <div style="font-size:10px; color:#888; margin-top:3px;">doda-Xで自動リスト追加時にこのタグを付与します</div>
+  </div>
+
+  <!-- GAS設定 -->
+  <div class="gas-section">
+    <div class="gas-section-title">📊 Googleスプレッドシート連携</div>
+
+    <div class="gas-field">
+      <div class="gas-field-label">
+        担当者名
+        <span class="gas-badge">スプレッドシートの記録欄を決定</span>
+      </div>
+      <select id="gas-recruiter" style="width:100%;">
+        <option value="">-- 自分の名前を選択 --</option>
+        <option value="たけと">たけと</option>
+        <option value="ゆうき">ゆうき</option>
+        <option value="たいち">たいち</option>
+        <option value="れいしろう">れいしろう</option>
+        <option value="こうじ">こうじ</option>
+      </select>
+    </div>
+
+    <div class="gas-field">
+      <div class="gas-field-label">
+        GASウェブアプリURL
+        <span class="gas-badge required">必須</span>
+      </div>
+      <input type="text" id="gas-url" placeholder="https://script.google.com/macros/s/..." style="width:100%;">
+      <div class="gas-features">
+        <div class="gas-features-title">このURLを設定すると有効になる機能：</div>
+        <div class="gas-feature-item">✅ スカウト送信 → 日付別シートに自動記録</div>
+        <div class="gas-feature-item">✅ スカウト送信 → スカウト管理DBにも記録</div>
+        <div class="gas-feature-item">✅ AI訂正ボタン → フィードバックシートに保存</div>
+        <div class="gas-feature-item">✅ ポジション要件をAI判定プロンプトに反映</div>
+      </div>
+    </div>
+
+    <div class="gas-field">
+      <div class="gas-field-label">
+        シークレットキー
+        <span class="gas-badge">GASと合わせる（デフォルト: snowwe2024）</span>
+      </div>
+      <input type="text" id="gas-secret" placeholder="snowwe2024" style="width:100%;">
+    </div>
+
+    <!-- 機能ON/OFFトグル -->
+    <div style="margin-top:10px; margin-bottom:4px;">
+      <div class="gas-field-label" style="margin-bottom:6px;">機能のON/OFF</div>
+      <div class="toggle-row">
+        <div class="toggle-text">
+          <div class="toggle-label">AI訂正フィードバック保存</div>
+          <div class="toggle-desc">訂正ボタン押下時にシートへ保存・次回AI判定に反映</div>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="toggle-feedback" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <button class="save-btn" id="gas-test-btn" style="margin-top:8px; width:100%; font-size:11px;">🔗 接続テスト</button>
+    <div id="gas-test-result" style="font-size:11px; margin-top:5px; padding:6px; background:#f5f4f0; border-radius:6px; display:none; word-break:break-all;"></div>
+
+    <details class="gas-advanced">
+      <summary>▸ 詳細設定（URLを複数使う場合のみ）</summary>
+      <div class="gas-advanced-content">
+        <div class="gas-advanced-field">
+          <div class="gas-field-label">
+            スカウト管理DB専用URL
+            <span class="gas-badge optional">省略可</span>
+          </div>
+          <div style="font-size:10px; color:#888; margin-bottom:3px;">上記URLと別のGASを使う場合のみ入力。通常は空欄でOK。</div>
+          <input type="text" id="gas-db-url" placeholder="（空欄 = 上のURLと同じ）" style="width:100%;">
+        </div>
+        <div class="gas-advanced-field">
+          <div class="gas-field-label">
+            ポジション管理専用URL
+            <span class="gas-badge optional">省略可</span>
+          </div>
+          <div style="font-size:10px; color:#888; margin-bottom:3px;">上記URLと別のGASを使う場合のみ入力。通常は空欄でOK。</div>
+          <input type="text" id="position-gas-url" placeholder="（空欄 = 上のURLと同じ）" style="width:100%;">
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <!-- 候補者管理システム（ポジションマスタ）のアクセストークン -->
+  <div style="margin-top:14px; padding-top:12px; border-top:0.5px solid #e0ddd6;">
+    <div class="label">📋 ポジションAPI</div>
+    <div style="font-size:10px; color:#888; margin:3px 0 4px;">
+      候補者管理システムからポジション一覧（求人URL・職務内容・応募要件）を取得します。<br>
+      <strong>設定は不要です</strong>（トークン欄は空欄のままにしてください）。動作確認だけ下のボタンで行えます。<br>
+      取得できない場合は、まず update を実行して拡張機能を最新にしてください。
+    </div>
+    <input type="password" id="positions-api-token" placeholder="（空欄のままでOK）" style="width:100%;">
+    <button class="settings-save-btn" id="positions-api-test-btn" style="width:100%; margin-top:6px;">🔌 ポジション取得テスト</button>
+    <div id="positions-api-test-result" style="font-size:11px; margin-top:6px; padding:8px; background:#f5f4f0; border-radius:6px; display:none; word-break:break-all;"></div>
+  </div>
+
+  <!-- チーム設定コード -->
+  <div class="setup-code-section">
+    <div class="setup-code-title">🔗 チーム設定コード</div>
+    <div class="setup-code-desc">
+      管理者：GAS URLとシークレットをコード化してSlackで共有<br>
+      メンバー：コードを貼り付けて「適用」→ URLが自動入力される<br>
+      ※ APIキーは個人のものなので含まれません
+    </div>
+    <textarea class="setup-code-box" id="setup-code-input" placeholder="コードをここに貼り付け、または「生成」で作成..."></textarea>
+    <div class="setup-code-btn-row">
+      <button class="save-btn" id="apply-setup-code-btn" style="flex:1; font-size:11px;">📥 コードを適用</button>
+      <button class="save-btn" id="generate-setup-code-btn" style="flex:1; font-size:11px;">📤 コードを生成</button>
+    </div>
+    <div class="setup-code-msg" id="setup-code-msg"></div>
+  </div>
+
+  <!-- 夜間自動実行設定 -->
+  <div style="margin-top:14px; padding-top:12px; border-top:0.5px solid #e0ddd6;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+      <div class="label" style="margin:0;">🌙 夜間自動実行</div>
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;">
+        <input type="checkbox" id="auto-run-enabled"> 有効
+      </label>
+    </div>
+    <div style="display:flex; align-items:center; gap:5px; margin-bottom:8px; font-size:12px; flex-wrap:wrap;">
+      毎日
+      <input type="number" id="auto-run-hour" min="0" max="23" value="2" style="width:42px; padding:4px 6px;">
+      時
+      <input type="number" id="auto-run-minute" min="0" max="59" value="0" style="width:42px; padding:4px 6px;">
+      分に実行 &nbsp;|&nbsp; 1URLあたり最大
+      <input type="number" id="auto-run-max-pages" min="1" max="20" value="2" style="width:42px; padding:4px 6px;">
+      ページ &nbsp;|&nbsp; 並列数
+      <input type="number" id="auto-run-concurrency" min="1" max="3" value="1" style="width:36px; padding:4px 6px;">
+    </div>
+    <div class="label">処理するURL（1行1件）</div>
+    <textarea id="auto-run-urls" rows="5" style="width:100%; padding:6px 8px; border:0.5px solid #d3d1c7; border-radius:6px; font-size:11px; resize:vertical; font-family:monospace; margin-top:3px;" placeholder="https://ats.hrtech.rikunabi.com/client/scouting/scoutroom/.../searchandrecommend&#10;https://x.doda.jp/...&#10;https://ambi.jp/..."></textarea>
+    <button id="auto-run-test-btn" style="margin-top:8px; width:100%; padding:7px; background:#f0efe9; border:0.5px solid #d3d1c7; border-radius:7px; font-size:12px; cursor:pointer; font-weight:600;">▶ 今すぐテスト実行</button>
+    <div id="auto-run-test-status" style="font-size:11px; margin-top:5px; color:#555; display:none;"></div>
+  </div>
+
+  <button class="settings-save-btn" id="settings-save-btn">設定を保存</button>
+  <div class="settings-saved" id="settings-saved">✅ 保存しました</div>
+
+  <div style="margin-top:14px; border-top:0.5px solid #e0ddd6; padding-top:12px;">
+    <div class="label">APIキー接続テスト</div>
+    <button class="settings-save-btn" id="api-test-btn" style="width:100%; margin-top:6px;">🔌 接続テスト</button>
+    <div id="api-test-result" style="font-size:11px; margin-top:6px; padding:8px; background:#f5f4f0; border-radius:6px; display:none; word-break:break-all;"></div>
+  </div>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,8883 @@
+// content.js v1.18.108
+// 各媒体のプロフィールページからテキストを抽出する
+
+// 複数VMインスタンス競合防止：このインスタンス固有のIDをDOMに刻印し、
+// 最新インスタンスのみがクリックイベントを処理する
+const _INSTANCE_ID = String(Date.now());
+document.documentElement.setAttribute('data-snow-we-id', _INSTANCE_ID);
+
+// 現在選択中のポジション名を同期的に参照できるようキャッシュしておく。
+// 「スカウト」ボタン押下時にフォールバック用ポジションを非同期(chrome.storage読み込み後)に
+// 追記する作りだと、RDSの一括送信等で候補者が高速に連続処理された場合、次の候補者の
+// 処理が始まってから追記が完了して間に合わない・別候補者のpendingScoutに書き込まれる、
+// という不具合があったため、常に最新値をメモリ上に保持し同期的に読めるようにする
+let _cachedCurrentPosition = '';
+chrome.storage.local.get(['currentPosition']).then(r => { _cachedCurrentPosition = r.currentPosition || ''; }).catch(() => {});
+
+// 担当者名も同じ理由でキャッシュする。chrome.storage.local.get()は連続送信のように
+// 短時間に大量の読み込みが走る状況で、まれに空の結果を返すことが実データで確認された。
+// GAS送信側は「担当者名が空なら送らない」ガードがあるため症状が出なかったが、
+// Supabase側はガードが無く、担当者名が空欄のまま保存された行が実際に133件発生していた
+// （空欄だと「担当者×日」での照合が全て外れ、実在するのに未登録と誤判定される）。
+// 一度でも正しく読めた値を保持しておき、読み込みが空だった時の最後の拠り所にする
+let _cachedRecruiterName = '';
+chrome.storage.local.get(['gasSettings', 'recruiterName']).then(r => {
+  _cachedRecruiterName = (r.gasSettings && r.gasSettings.recruiter) || r.recruiterName || '';
+}).catch(() => {});
+
+// Greenのテンプレート選択を追跡するためのキャッシュ。Greenは候補者ごとの「スカウト」
+// 開始ボタンが無く送信時にしかpendingScoutを作れないため、AMBI/RDS等のように
+// pendingScout経由でテンプレート名を記録できない。かつテンプレート選択後もチップの
+// 表示は「テンプレート」のまま変わらず、送信時にDOMを読むだけでは選択内容が分からない
+// （実機で確認）。このため「テンプレート」チップのクリックを起点に、直後に選ばれる
+// メニュー項目のテキストをここに保持しておき、送信時のpendingScout復元時に使う
+// ページを読み込み直すと消え、その後の送信がポジション空欄で記録されていた
+// （実データで確認）。同じタブの中では引き継ぐ
+let _cachedGreenTemplate = (() => {
+  try { return sessionStorage.getItem('snowweGreenTemplate') || ''; } catch (_) { return ''; }
+})();
+let _greenTemplatePickerOpenTs = 0;
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && (changes.gasSettings || changes.recruiterName)) {
+    const next = (changes.gasSettings && changes.gasSettings.newValue && changes.gasSettings.newValue.recruiter)
+      || (changes.recruiterName && changes.recruiterName.newValue)
+      || '';
+    // 設定画面で担当者名を意図的に消した場合を除き、空で上書きしてキャッシュを
+    // 失わせない（空になる原因の大半は読み込み側の一時的な不調のため）
+    if (next) {
+      _cachedRecruiterName = next;
+      // 未設定を知らせる警告を出していたら、設定された時点で自動的に消す
+      try { document.getElementById('snowwe-recruiter-overlay')?.remove(); } catch (_) {}
+    }
+  }
+  if (area === 'local' && changes.currentPosition) {
+    _cachedCurrentPosition = changes.currentPosition.newValue || '';
+    // 「スカウトを作成」クリック後・送信前にポジションを選び直すケースがあるため
+    // （候補者のプロフィールを見てから該当ポジションを選ぶ運用）、未送信のpendingScoutが
+    // あればfallbackPositionもその場で更新しておく。他候補者の「スカウトを作成」で
+    // pendingScout自体が上書きされていれば、その新しいレコードにのみ反映される。
+    try {
+      const raw = sessionStorage.getItem('pendingScout');
+      if (raw) {
+        const pending = JSON.parse(raw);
+        if (pending && pending.id) {
+          pending.fallbackPosition = _cachedCurrentPosition;
+          sessionStorage.setItem('pendingScout', JSON.stringify(pending));
+          console.log('[Snow-we] ポジション変更をpendingScoutに反映:', pending.id, '→', _cachedCurrentPosition || 'なし');
+        }
+      }
+    } catch (_) {}
+  }
+});
+
+// Chrome の Extension context invalidated は try-catch をすり抜けて
+// グローバルの unhandledrejection として発火することがある → 全体で抑制
+window.addEventListener('unhandledrejection', event => {
+  const msg = event.reason?.message || String(event.reason || '');
+  if (msg.includes('Extension context invalidated') || msg.includes('message channel closed')) {
+    event.preventDefault();
+    showExtensionInvalidatedBanner();
+  }
+});
+
+// chrome.runtime/chrome.storage呼び出しは、拡張機能が再読み込みされた直後は
+// Promiseのrejectではなく同期的なthrowになることがあり、try-catchで囲んでいない
+// 箇所ではコンソールにUncaught Errorとして大量に出続け、かつGAS送信等が
+// 何のエラー表示もなく無音で失敗する（ユーザーには「記録されない」としか見えない）。
+// ここで検知し、原因（ページ再読み込みが必要）を画面上に明示する。
+window.addEventListener('error', event => {
+  const msg = event.error?.message || event.message || '';
+  if (msg.includes('Extension context invalidated')) {
+    event.preventDefault();
+    showExtensionInvalidatedBanner();
+  }
+});
+
+// 記録に影響する警告は、見落とされると数十件が失われる・担当者不明のまま積み上がる。
+// 隅の小さなバナーでは実際に見落とされていたため、画面全体を覆う大きな表示にして、
+// 閉じるまでページを操作できないようにする（気づかずに送り続けるのを止めるのが目的）
+function showBigWarningOverlay({ id, title, message, actionLabel, onAction, onClose }) {
+  try {
+    if (document.getElementById(id)) return;
+    const overlay = document.createElement('div');
+    overlay.id = id;
+    overlay.style.cssText = `
+      position:fixed;inset:0;z-index:2147483647;
+      background:rgba(0,0,0,0.72);
+      display:flex;align-items:center;justify-content:center;
+      font-family:sans-serif;padding:24px;box-sizing:border-box;
+    `;
+    const card = document.createElement('div');
+    card.style.cssText = `
+      background:#b91c1c;color:#fff;max-width:760px;width:100%;
+      border-radius:16px;padding:40px 44px;box-sizing:border-box;
+      box-shadow:0 12px 48px rgba(0,0,0,0.5);text-align:center;
+      border:6px solid #fca5a5;
+    `;
+    const h = document.createElement('div');
+    h.style.cssText = 'font-size:34px;font-weight:800;line-height:1.3;margin-bottom:18px;';
+    h.textContent = title;
+    card.appendChild(h);
+
+    const p = document.createElement('div');
+    p.style.cssText = 'font-size:19px;font-weight:600;line-height:1.8;margin-bottom:28px;';
+    p.textContent = message;
+    card.appendChild(p);
+
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:12px;justify-content:center;flex-wrap:wrap;';
+    if (actionLabel) {
+      const act = document.createElement('button');
+      act.textContent = actionLabel;
+      act.style.cssText = `
+        background:#fff;color:#b91c1c;border:none;border-radius:10px;
+        padding:16px 32px;font-size:19px;font-weight:800;cursor:pointer;
+      `;
+      act.addEventListener('click', () => { if (onAction) onAction(); });
+      row.appendChild(act);
+    }
+    // onCloseが渡された場合だけ閉じられる。記録が失われ続ける状態では閉じさせない
+    // （隅の小さなバナーでは見落とされ、実際に数十件が失われていたため）
+    if (onClose) {
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = '閉じる';
+      closeBtn.style.cssText = `
+        background:transparent;color:#fff;border:2px solid #fca5a5;border-radius:10px;
+        padding:16px 28px;font-size:17px;font-weight:700;cursor:pointer;
+      `;
+      closeBtn.addEventListener('click', () => {
+        overlay.remove();
+        onClose();
+      });
+      row.appendChild(closeBtn);
+    }
+    card.appendChild(row);
+    overlay.appendChild(card);
+    document.documentElement.appendChild(overlay);
+  } catch (_) {}
+}
+
+let _extensionInvalidatedBannerShown = false;
+function showExtensionInvalidatedBanner() {
+  if (_extensionInvalidatedBannerShown) return;
+  _extensionInvalidatedBannerShown = true;
+  // この状態で送り続けると記録が失われ続ける（実データで1週間分176件が失われていた）。
+  // 再読み込みでしか直らないので、閉じさせずに再読み込みを促す
+  showBigWarningOverlay({
+    id: 'snowwe-invalidated-overlay',
+    title: '⚠️ このタブでは記録が保存されません',
+    message: 'Snow-we拡張機能が更新されたため、このページは拡張機能から切り離されています。'
+      + 'このままスカウトを送ると記録が残りません。ページを再読み込みしてから再開してください。',
+    actionLabel: '🔄 ページを再読み込みする',
+    onAction: () => { location.reload(); },
+  });
+}
+
+// 担当者名が未設定のまま記録すると、その行は「担当者×日」の集計から丸ごと外れ、
+// 実在するのに未登録と誤判定される。実データではBizreachの44%が担当者不明で、
+// 古いバージョンのまま設定せずに送り続けている人がいた。
+// 記録時のトーストだけでは気づかれずに数十件が積み上がるため、ページを開いた
+// 時点で消えないバナーを出し、設定するまで気づき続けられるようにする
+function showRecruiterMissingBanner() {
+  // 担当者名を設定するまで閉じられない。設定が済めば自動的に消える
+  // （設定タブで保存すると storage.onChanged が発火してキャッシュが更新される）
+  showBigWarningOverlay({
+    id: 'snowwe-recruiter-overlay',
+    title: '⚠️ 担当者名を設定してください',
+    message: '担当者名が未設定のままスカウトを送ると、記録は残りますが「誰が送ったか不明」の状態になり、'
+      + '担当者別の集計から漏れます。サイドパネルの「⚙️ 設定」タブで担当者名を入力して保存してください。',
+    actionLabel: '設定したので確認する',
+    onAction: () => {
+      chrome.storage.local.get(['gasSettings', 'recruiterName']).then(r => {
+        const name = (r.gasSettings && r.gasSettings.recruiter) || r.recruiterName || '';
+        if (name) {
+          _cachedRecruiterName = name;
+          document.getElementById('snowwe-recruiter-overlay')?.remove();
+          showAutoStatus(`✅ 担当者名「${name}」を確認しました`, 4000);
+        } else {
+          showAutoStatus('担当者名がまだ設定されていません。設定タブで保存してください', 5000);
+        }
+      }).catch(() => {});
+    },
+  });
+}
+
+// ページを開いた時点で担当者名を確認する。設定済みならキャッシュにも載るので、
+// 記録時に chrome.storage の読み込みが空を返しても取り違えない
+chrome.storage.local.get(['gasSettings', 'recruiterName']).then(r => {
+  const name = (r.gasSettings && r.gasSettings.recruiter) || r.recruiterName || '';
+  if (name) {
+    _cachedRecruiterName = name;
+  } else {
+    console.warn('[Snow-we] 担当者名が未設定です。記録しても担当者不明になります');
+    setTimeout(showRecruiterMissingBanner, 2000);
+  }
+}).catch(() => {});
+
+// 拡張機能が GitHub の main より古いときに知らせる（判定は background.js の checkVersions）。
+// 実データで、ほとんどの人が何週間も前の版のままで、直した内容が誰にも届いていなかった。
+// 閉じられるが、その日のうちは出さないだけで、更新するまで毎日出す
+function showOutdatedBanner(vs) {
+  const today = new Date().toISOString().slice(0, 10);
+  chrome.storage.local.get(['outdatedDismissedOn']).then(r => {
+    if (r.outdatedDismissedOn === today) return;
+    const isWin = /Windows/i.test(navigator.userAgent || '');
+    showBigWarningOverlay({
+      id: 'snowwe-outdated-overlay',
+      title: `⚠️ 拡張機能が古いままです（${vs.current} → ${vs.latest}）`,
+      message: '古いままだと、スカウトの記録が漏れたり誤ったりする不具合が直っていません。'
+        + `デスクトップの snow-we フォルダにある「${isWin ? 'update.bat' : 'update.command'}」を`
+        + 'ダブルクリックしてください。更新後は数分以内に自動で切り替わります'
+        + '（すぐに切り替えたい場合は chrome://extensions で🔄を押し、このページを再読み込み）。',
+      actionLabel: '今日はもう出さない',
+      onAction: () => {
+        chrome.storage.local.set({ outdatedDismissedOn: today }).catch(() => {});
+        document.getElementById('snowwe-outdated-overlay')?.remove();
+      },
+    });
+  }).catch(() => {});
+}
+
+// 記録が誤った内容になる不具合を直した版より前では、送信そのものを止める。
+// 「更新してください」の案内だけでは更新されないまま送られ続け、あとから直せない
+// 記録（誤ったポジション・空の会社名）が積み上がるため。
+// 止めるのは、最低バージョンを実際に取得できて、かつその情報が新しいときだけ。
+// 取得できなかったことを理由に止めると、通信が不調なだけで仕事が止まる
+let _blockSendUntilUpdate = false;
+let _blockSendMessage = '';
+let _blockSendMin = '';
+function refreshMinVersionGate() {
+  chrome.storage.local.get(['minVersion']).then(({ minVersion: mv }) => {
+    try {
+      if (!mv || !mv.min || !mv.checkedAt) return;
+      // 2週間以上前の情報は使わない（古い判定で止め続けない）
+      if (Date.now() - mv.checkedAt > 14 * 24 * 60 * 60 * 1000) return;
+      const current = chrome.runtime.getManifest().version;
+      _blockSendUntilUpdate = String(mv.min).localeCompare(current, undefined, { numeric: true }) > 0;
+      _blockSendMessage = mv.message || '';
+      _blockSendMin = mv.min;
+    } catch (_) {}
+  }).catch(() => {});
+}
+refreshMinVersionGate();
+
+function showUpdateRequiredOverlay() {
+  try {
+    if (document.getElementById('snowwe-must-update')) return;
+    const bar = document.createElement('div');
+    bar.id = 'snowwe-must-update';
+    bar.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;'
+      + 'background:#B3261E;color:#fff;padding:14px 18px;font-size:13px;line-height:1.7;'
+      + 'font-family:system-ui,-apple-system,sans-serif;box-shadow:0 -2px 12px rgba(0,0,0,.3)';
+    const current = (() => { try { return chrome.runtime.getManifest().version; } catch (_) { return '?'; } })();
+    bar.innerHTML = '<div style="font-weight:700;margin-bottom:4px">⛔ 更新してから送信してください'
+      + `（いま v${current} / 必要 v${_blockSendMin}）</div>`
+      + `<div>${(_blockSendMessage || '').replace(/[<>]/g, '')}</div>`
+      + '<div style="margin-top:6px">update（update.command / update.bat）を実行し、'
+      + 'chrome://extensions の「更新」を押してから、このページを再読み込み（F5）してください。</div>';
+    document.body.appendChild(bar);
+  } catch (_) {}
+}
+
+// 送信・スカウト開始のボタンを、サイト側の処理より先に止める（capture段階）
+document.addEventListener('click', e => {
+  if (!_blockSendUntilUpdate) return;
+  if (document.documentElement.getAttribute('data-snow-we-id') !== _INSTANCE_ID) return;
+  let btn = null;
+  try { btn = e.target.closest && e.target.closest('button, a, [role="button"]'); } catch (_) {}
+  if (!btn) return;
+  const { text, textCore } = readButtonLabel(btn);
+  const kind = classifyScoutButton(btn, text, textCore);
+  if (!kind.isStart && !kind.isSend) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+  showUpdateRequiredOverlay();
+}, true);
+
+chrome.storage.local.get(['versionStatus']).then(({ versionStatus: vs }) => {
+  try {
+    if (!vs || !vs.latest) return;
+    const current = chrome.runtime.getManifest().version;
+    // 判定後に更新された場合は current が変わっているので、いまの版で比べ直す
+    const older = String(vs.latest).localeCompare(current, undefined, { numeric: true }) > 0;
+    if (older) setTimeout(() => showOutdatedBanner({ current, latest: vs.latest }), 3000);
+  } catch (_) {}
+}).catch(() => {});
+
+// Supabase設定
+const SUPABASE_URL = 'https://ovwnyivqnqqiagutjxoo.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_tEQ4TOve0uCydsGiEm1cDA_D1LQ49wN';
+
+// scouts / scout_queue の読み書きに使う鍵。会社の Google アカウントでログイン中ならその人の鍵、
+// そうでなければ公開キー（ログインの管理は background.js。鍵が通らなければ公開キーで送り直す）
+async function supabaseUserFetch(url, init = {}) {
+  let token = null;
+  try {
+    const r = await chrome.runtime.sendMessage({ type: 'getSupabaseAccessToken' });
+    token = (r && r.token) || null;
+  } catch (_) {}
+  const withKey = key => ({ ...init, headers: { ...(init.headers || {}), apikey: SUPABASE_KEY, Authorization: `Bearer ${key}` } });
+  const res = await fetch(url, withKey(token || SUPABASE_KEY));
+  if (token && res.status === 401) return fetch(url, withKey(SUPABASE_KEY));
+  return res;
+}
+
+async function supabaseInsert(table, data) {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal'
+      },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      console.warn(`[Snow-we] Supabase ${table} 保存エラー:`, err);
+      return false;
+    }
+    console.log(`[Snow-we] Supabase ${table} 保存成功`);
+    return true;
+  } catch (e) {
+    console.warn(`[Snow-we] Supabase ${table} 保存失敗:`, e.message);
+    return false;
+  }
+}
+
+// 同一候補者×媒体の重複レコードを避けるため upsert（onConflict列で衝突時の挙動をresolutionで指定）
+async function supabaseUpsert(table, data, onConflict, resolution = 'ignore-duplicates') {
+  try {
+    const res = await supabaseUserFetch(`${SUPABASE_URL}/rest/v1/${table}?on_conflict=${encodeURIComponent(onConflict)}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Prefer': `resolution=${resolution},return=minimal`
+      },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      console.warn(`[Snow-we] Supabase ${table} upsertエラー:`, err);
+      return false;
+    }
+    console.log(`[Snow-we] Supabase ${table} upsert成功`);
+    return true;
+  } catch (e) {
+    console.warn(`[Snow-we] Supabase ${table} upsert失敗:`, e.message);
+    return false;
+  }
+}
+
+// AIが星をつけた候補者を承認待ちキューに記録する（承認/ポジション修正/却下はポップアップの
+// 承認待ちリスト画面で行う。星を押す処理自体はこれまで通りtriggerAutoAdd内で完結する）
+// RDSは候補者ごとの固定URLがないため、後から候補者を探し直すには「どのスカウトルームで
+// 見つけたか」が要る。星をつけた候補者は、そのルームの「検討中リスト」タブ（候補者一覧
+// 全体ではなく、既に追加済みの候補者だけに絞られた一覧）に入るため、そこに戻れるURLを
+// 導出して保存しておく。/scoutroom/{roomId}/searchandrecommend 等 → /scoutroom/{roomId}/pick
+function deriveRDSPickListUrl(href) {
+  const m = href.match(/\/scoutroom\/(\d+)\//);
+  if (!m) return '';
+  return `${location.origin}/client/scouting/scoutroom/${m[1]}/pick`;
+}
+
+async function recordScoutQueueEntry({ candidateId, platform, position, info, reason, verdict, fullProfile }) {
+  if (!candidateId) return;
+  // location.hrefは関数の最初で同期的に取得しておく。以前はawait chrome.storage.local.get()の
+  // 後で読んでいたため、そのわずかな待ち時間の間にバッチ処理が次の部屋・ページへ遷移して
+  // しまうと、location.hrefが既に別の（間違った）部屋のURLになってしまい、room_urlが実際に
+  // 候補者を見つけた部屋と食い違って記録される事故が実機で発生した（後からRPA/拡張機能が
+  // その候補者を探しに行っても本人が存在しない部屋を開いてしまう原因になっていた）。
+  const hrefAtCallTime = location.href;
+  let recruiterName = '';
+  try {
+    const s = await chrome.storage.local.get(['recruiterName']);
+    recruiterName = s.recruiterName || '';
+  } catch (_) {}
+  const roomUrl = platform === 'rds' ? deriveRDSPickListUrl(hrefAtCallTime) : '';
+  await supabaseUpsert('scout_queue', {
+    candidate_id: candidateId,
+    platform,
+    position: position || '',
+    recruiter: recruiterName,
+    age: info?.age || '',
+    company: info?.company || '',
+    univ: info?.univ || '',
+    ai_reason: (reason || '').substring(0, 500),
+    ai_verdict: verdict || '',
+    // AI判定に使ったフルプロフィール(getFullProfile())を保存しておく。承認待ちレビュー時に
+    // 短いAI要約だけでは判断材料が足りないという課題があったため、承認パネル側で
+    // 「詳細を見る」として展開表示できるようにする（RDSに行かなくても中身が見える）
+    full_profile: (fullProfile || '').substring(0, 3000),
+    // gicsAutoClassify()はscoutsテーブルへの手動記録時(recordScoutSent)と同じ分類器。
+    // RPA(taichi536/scout)は自ブラウザにこの分類ロジックを持たないため、ここで先に
+    // 計算して保存しておき、RPA送信時にはこの値をそのままscoutsテーブルへ引き継ぐ
+    // （分類ロジックの複製・二重メンテナンスを避けるため）
+    industry: gicsAutoClassify(info?.company || ''),
+    status: 'pending_review',
+    source_url: hrefAtCallTime,
+    room_url: roomUrl,
+  }, 'candidate_id,platform');
+}
+
+async function updateScoutQueueStatus(candidateId, platform, patch) {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/scout_queue?candidate_id=eq.${encodeURIComponent(candidateId)}&platform=eq.${encodeURIComponent(platform)}`;
+    await supabaseUserFetch(url, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify(patch),
+    });
+  } catch (e) {
+    console.warn('[Snow-we] scout_queue更新失敗:', e.message);
+  }
+}
+
+// 実際のスカウト送信（スカウトボタン→テンプレート選択→確定→送信）は拡張機能内では
+// 行わない。RDSのReact UIに対する自動クリックが不安定だったため、承認後の送信は
+// 別プロセスのPlaywright RPA（scout_queueのstatus='approved'を拾って送信する）に
+// 委譲している。ここでは承認時にscout_queueのステータスを更新するだけでよい。
+
+// AIが星をつけた候補者を、このページを離れる前にその場でレビューする画面。
+// 別タブ・別ポップアップにせず、候補者カードがまだDOM上にある間に完結させる
+// （後から候補者を探し直す必要がある設計は、RDS等の固定URLがない媒体で破綻するため）。
+async function showApprovalReviewPanel(items) {
+  const existing = document.getElementById('snow-we-approval-panel');
+  if (existing) existing.remove();
+
+  let positions = [];
+  try {
+    const res = await chrome.runtime.sendMessage({ type: 'getPositionList' });
+    positions = res?.positions || [];
+  } catch (_) {}
+
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.id = 'snow-we-approval-panel';
+    overlay.style.cssText = `
+      position:fixed;top:0;right:0;bottom:0;width:420px;z-index:2147483647;
+      background:#fff;border-left:1px solid #e2e8f0;box-shadow:-4px 0 20px rgba(0,0,0,0.15);
+      font-family:sans-serif;display:flex;flex-direction:column;
+    `;
+    const header = document.createElement('div');
+    header.style.cssText = 'padding:14px 16px;border-bottom:1px solid #e2e8f0;flex-shrink:0;';
+    header.innerHTML = `
+      <div style="font-size:14px;font-weight:700;color:#1e293b;">✅ 承認待ち（${items.length}件）</div>
+      <div style="font-size:11px;color:#64748b;margin-top:3px;line-height:1.5;">AIが星をつけた候補者です。ポジションを確認・修正して承認してください（承認後の実際のスカウト送信は別のRPAが行います。この画面では送信されません）。</div>
+    `;
+    overlay.appendChild(header);
+
+    // 「候補者の詳細プロフィールを開く」を押すと、隠れてしまわないよう承認パネル自体を
+    // 一時的に隠す。この小さな復帰用ボタンで承認パネルに戻れるようにする
+    function showReturnToReviewButton() {
+      const existingReturn = document.getElementById('snow-we-return-to-review');
+      if (existingReturn) existingReturn.remove();
+      const returnBtn = document.createElement('button');
+      returnBtn.id = 'snow-we-return-to-review';
+      returnBtn.textContent = '📋 承認パネルに戻る';
+      returnBtn.style.cssText = `
+        position:fixed;bottom:20px;right:20px;z-index:2147483647;
+        padding:10px 16px;background:#4f46e5;color:#fff;border:none;border-radius:8px;
+        font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,0.25);
+        font-family:sans-serif;
+      `;
+      returnBtn.addEventListener('click', () => {
+        overlay.style.display = 'flex';
+        returnBtn.remove();
+      });
+      document.body.appendChild(returnBtn);
+    }
+
+    const list = document.createElement('div');
+    list.style.cssText = 'flex:1;overflow-y:auto;padding:10px;';
+    overlay.appendChild(list);
+
+    let remaining = items.length;
+    const footer = document.createElement('div');
+    footer.style.cssText = 'padding:10px 16px;border-top:1px solid #e2e8f0;flex-shrink:0;';
+    const doneBtn = document.createElement('button');
+    doneBtn.textContent = '閉じて次へ進む';
+    doneBtn.style.cssText = 'width:100%;padding:9px;background:#f1f5f9;color:#475569;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;cursor:pointer;';
+    doneBtn.addEventListener('click', () => { overlay.remove(); resolve(); });
+    footer.appendChild(doneBtn);
+    overlay.appendChild(footer);
+
+    items.forEach(item => {
+      const card = document.createElement('div');
+      card.style.cssText = 'border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin-bottom:8px;';
+      const metaParts = [item.info?.age, item.info?.company, item.info?.univ].filter(Boolean);
+      card.innerHTML = `
+        <div style="font-size:12px;color:#334155;margin-bottom:5px;">${escapeHtml(metaParts.join(' · ') || '情報なし')}</div>
+        ${item.reason ? `<div style="font-size:11px;color:#94a3b8;margin-bottom:6px;line-height:1.4;">🤖 ${escapeHtml(item.reason)}</div>` : ''}
+      `;
+      // 年齢・会社名・大学とAI理由だけではポジション判断の材料として薄いため、
+      // 本来の詳細プロフィール（職務経歴等）を開けるようにする。AI判定時の
+      // getFullProfile()と同じ「カードクリック→詳細パネルでレジュメタブに切り替え」を
+      // 流用する（実績のある処理のため、新たに不安定な自動化を作らずに済む）
+      const viewBtn = document.createElement('button');
+      viewBtn.textContent = '🔍 候補者の詳細プロフィールを開く';
+      viewBtn.style.cssText = 'width:100%;padding:6px;margin-bottom:7px;background:#eff6ff;color:#1e40af;border:1px solid #93c5fd;border-radius:6px;font-size:11px;cursor:pointer;';
+      viewBtn.addEventListener('click', async () => {
+        if (!document.body.contains(item.el)) { alert('候補者のカードがページ上に見つかりません（スクロール等で表示が変わった可能性があります）'); return; }
+        item.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        if (getPlatform() === 'rds') {
+          // 承認パネルは最前面(最大z-index)固定のため、開いた詳細パネルがその下に
+          // 隠れてしまう。一時的に承認パネルを隠し、「戻る」ボタンで再表示する
+          overlay.style.display = 'none';
+          item.el.click();
+          await sleep(1500);
+          await tryClickRDSResumeTab();
+          showReturnToReviewButton();
+        } else {
+          const prevOutline = item.el.style.outline;
+          const prevOffset = item.el.style.outlineOffset;
+          item.el.style.outline = '3px solid #6366f1';
+          item.el.style.outlineOffset = '2px';
+          setTimeout(() => { item.el.style.outline = prevOutline; item.el.style.outlineOffset = prevOffset; }, 3000);
+        }
+      });
+      card.appendChild(viewBtn);
+
+      // ドロップダウン自体は幅の都合で長いポジション名が省略されて見えることがあるため、
+      // 現在選択中のポジション名を上に全文表示しておく（選択を変えるたびに更新する）
+      const posLabel = document.createElement('div');
+      posLabel.style.cssText = 'font-size:11px;color:#334155;margin-bottom:4px;line-height:1.4;word-break:break-word;';
+      posLabel.textContent = `送信ポジション: ${item.position || '（未設定）'}`;
+      card.appendChild(posLabel);
+
+      const select = document.createElement('select');
+      select.style.cssText = 'width:100%;padding:6px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;margin-bottom:7px;';
+      const posOptions = positions.length > 0 ? positions : (item.position ? [item.position] : []);
+      posOptions.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p; opt.textContent = p; opt.title = p;
+        if (p === item.position) opt.selected = true;
+        select.appendChild(opt);
+      });
+      select.addEventListener('change', () => {
+        posLabel.textContent = `送信ポジション: ${select.value || '（未設定）'}`;
+      });
+      card.appendChild(select);
+
+      const actions = document.createElement('div');
+      actions.style.cssText = 'display:flex;gap:6px;';
+      const approveBtn = document.createElement('button');
+      approveBtn.textContent = '✅ 承認';
+      approveBtn.style.cssText = 'flex:1;padding:7px;background:#d1fae5;color:#065f46;border:1px solid #34d399;border-radius:6px;font-size:12px;cursor:pointer;';
+      const rejectBtn = document.createElement('button');
+      rejectBtn.textContent = '❌ 却下';
+      rejectBtn.style.cssText = 'flex:1;padding:7px;background:#fee2e2;color:#991b1b;border:1px solid #f87171;border-radius:6px;font-size:12px;cursor:pointer;';
+
+      const finish = () => {
+        card.remove();
+        remaining--;
+        header.querySelector('div').textContent = `✅ 承認待ち（残り${remaining}件）`;
+      };
+
+      approveBtn.addEventListener('click', async () => {
+        approveBtn.disabled = true; rejectBtn.disabled = true;
+        approveBtn.textContent = '⏳ 承認中...';
+        item.position = select.value;
+        // 実際のスカウト送信は拡張機能内では行わない（Playwright RPA側の役割）。
+        // ここでの自動送信クリックはRDSのReact UIに対して不安定だったため廃止し、
+        // 承認はscout_queueのステータス更新のみに専念する。
+        await updateScoutQueueStatus(item.candidateId, getPlatform(), { status: 'approved', position: select.value, reviewed_at: new Date().toISOString() });
+        approveBtn.textContent = '✅ 承認済み（送信はRPAが実行）';
+        finish();
+      });
+      rejectBtn.addEventListener('click', async () => {
+        approveBtn.disabled = true; rejectBtn.disabled = true;
+        await updateScoutQueueStatus(item.candidateId, getPlatform(), { status: 'rejected', reviewed_at: new Date().toISOString() });
+        finish();
+      });
+
+      actions.appendChild(approveBtn);
+      actions.appendChild(rejectBtn);
+      card.appendChild(actions);
+      list.appendChild(card);
+    });
+
+    document.body.appendChild(overlay);
+  });
+}
+
+// ポジション要件のセッション内キャッシュ（GAS呼び出しを最小化）
+const _posReqCache = new Map();
+
+// Bizreach仮想スクロール対応：バッジ状態レジストリ
+const _bizreachBadgeRegistry = new Map(); // resumeId → {cls, text, tooltip, profileSummary, aiVerdict}
+let _bizreachObserver = null;
+let _reapplyBizreachTimer = null;
+
+// バッチ処理中のAPIキー・条件キャッシュ（Extension context invalidated 後の再読み込みを防ぐ）
+let _batchApiKey = null;
+let _batchCriteria = null;
+let _batchPosition = null; // このバッチ実行が対象としているポジション名（承認キュー記録用）
+let _batchIsRunning = false; // chrome.storage失敗時もisFreshStartを誤判定しないためのフラグ
+let _triggerAutoAddLock = false; // 外部からの重複起動を防ぐロック（再帰呼び出しは _batchIsRunning=true で区別）
+let _batchScoutHistory = null; // スカウト履歴キャッシュ（CDKスクロールごとの再取得を防ぐ）
+let _autoAddResuming = false; // ページ遷移後にtriggerAutoAddが再開予定の場合true（autoScreenCandidatesを抑制）
+
+// 夜間自動実行モード
+let _isAutoRunMode = false;
+let _autoRunPageCount = 0;
+let _autoRunMaxPages = 2;
+let _autoRunSlotId = 0;
+
+
+// -------------------------------------------------------
+// プラットフォーム判定
+// -------------------------------------------------------
+function getPlatform() {
+  const h = location.hostname;
+  if (h.includes('rikunabi') || h.includes('hrtech') || h.includes('recruitdirect')) return 'rds';
+  if (h.includes('bizreach') || h.includes('es-support'))  return 'bizreach';
+  if (h.includes('doda-x') || h.includes('dodax') || h.includes('x.doda')) return 'dodax';
+  if (h.includes('ambi') || h.includes('en-ambi'))         return 'ambi';
+  if (h.includes('green-japan'))                            return 'green';
+  if (h.includes('mynavi'))                                 return 'mynavi';
+  // LinkedIn Recruiter のみ。個人利用の linkedin.com では拡張機能を動かさない
+  // （manifest の対象も /talent/ 配下に限っている）
+  if (h.includes('linkedin.com') && location.pathname.startsWith('/talent')) return 'linkedin';
+  return 'unknown';
+}
+
+// -------------------------------------------------------
+// 候補者カードへのビジュアルフィードバック
+// -------------------------------------------------------
+let _selectedCard = null;
+
+function injectStyles() {
+  if (document.getElementById('snow-we-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'snow-we-styles';
+  style.textContent = `
+    .snow-we-selected {
+      outline: 3px solid #6366F1 !important;
+      outline-offset: -2px;
+      transition: outline .2s;
+    }
+    .snow-we-badge {
+      position: absolute !important;
+      top: 6px !important;
+      right: 6px !important;
+      font-size: 11px !important;
+      font-weight: 700 !important;
+      padding: 3px 10px !important;
+      border-radius: 20px !important;
+      z-index: 99999 !important;
+      pointer-events: none !important;
+      white-space: nowrap !important;
+      box-shadow: 0 1px 4px rgba(0,0,0,.25) !important;
+      font-family: -apple-system, sans-serif !important;
+    }
+    .snow-we-badge.checking { background: #6366F1 !important; color: #fff !important; }
+    .snow-we-badge.ok       { background: #059669 !important; color: #fff !important; cursor: pointer !important; pointer-events: auto !important; }
+    .snow-we-badge.ng       { background: #DC2626 !important; color: #fff !important; cursor: pointer !important; pointer-events: auto !important; }
+    .snow-we-badge.warn     { background: #D97706 !important; color: #fff !important; cursor: pointer !important; pointer-events: auto !important; }
+    .snow-we-badge.corrected { background: #6366F1 !important; color: #fff !important; }
+    .snow-we-badge.ok:hover, .snow-we-badge.ng:hover, .snow-we-badge.warn:hover {
+      filter: brightness(1.15) !important;
+    }
+    .snow-we-fb-popup {
+      position: absolute !important; top: 28px !important; right: 6px !important;
+      background: #1e1b4b !important; border-radius: 8px !important; padding: 6px 8px !important;
+      z-index: 9999999 !important; display: flex !important; flex-direction: column !important;
+      gap: 4px !important; box-shadow: 0 4px 16px rgba(0,0,0,.5) !important; min-width: 130px !important;
+    }
+    .snow-we-fb-popup span {
+      color: #a5b4fc !important; font-size: 10px !important; font-weight: 600 !important;
+      padding: 0 2px 2px !important; font-family: -apple-system, sans-serif !important;
+    }
+    .snow-we-fb-row { display: flex !important; gap: 4px !important; }
+    .snow-we-fb-btn {
+      flex: 1 !important; font-size: 11px !important; font-weight: 700 !important;
+      padding: 5px 0 !important; border-radius: 12px !important; border: none !important;
+      cursor: pointer !important; color: #fff !important; font-family: -apple-system, sans-serif !important;
+    }
+    .snow-we-fb-btn.ok { background: #059669 !important; }
+    .snow-we-fb-btn.ng { background: #DC2626 !important; }
+    .snow-we-fb-reason {
+      color: #c7d2fe !important; font-size: 10px !important; font-family: -apple-system, sans-serif !important;
+      padding: 2px 2px 4px !important; border-bottom: 1px solid #3730a3 !important; margin-bottom: 2px !important;
+      line-height: 1.4 !important; max-width: 200px !important; word-break: break-all !important;
+    }
+    @keyframes snow-we-pulse {
+      0%,100% { opacity: 1; } 50% { opacity: .6; }
+    }
+    .snow-we-badge.checking { animation: snow-we-pulse 1.2s ease-in-out infinite; }
+
+    /* 追加ボタンのハイライト */
+    .snow-we-btn-highlight {
+      outline: 3px solid #6366F1 !important;
+      outline-offset: 3px !important;
+      box-shadow: 0 0 10px rgba(99,102,241,0.7) !important;
+      animation: snow-we-pulse 1s ease-in-out infinite !important;
+      position: relative !important;
+      z-index: 9999 !important;
+    }
+    .snow-we-btn-tip {
+      position: absolute !important;
+      background: #6366F1 !important;
+      color: #fff !important;
+      font-size: 10px !important;
+      font-weight: 700 !important;
+      padding: 2px 8px !important;
+      border-radius: 10px !important;
+      white-space: nowrap !important;
+      z-index: 99999 !important;
+      top: -22px !important;
+      left: 50% !important;
+      transform: translateX(-50%) !important;
+      pointer-events: none !important;
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+// -------------------------------------------------------
+// プラットフォーム別：候補者カードの取得
+// -------------------------------------------------------
+function findCandidateCardsByPlatform() {
+  const platform = getPlatform();
+  const agePattern = /\d{2}歳/;
+  const vw = window.innerWidth;
+
+  // 親子重複を除外するフィルター（最小要素を優先）
+  function dedup(els) {
+    return els.filter((el, _, arr) => !arr.some(p => p !== el && p.contains(el)));
+  }
+
+  if (platform === 'ambi') {
+    // 実際のDOMから確認した正確なセレクター
+    const cards = Array.from(document.querySelectorAll('.js_userSet')).filter(el => {
+      // スカウト済みカードも含めてIDを取得するためフィルタは緩く
+      return (el.innerText || '').length > 30;
+    });
+    if (cards.length > 0) {
+      console.log('[Snow-we] AMBI カード検出 .js_userSet 件数:', cards.length);
+      return dedup(cards);
+    }
+    return [];
+  }
+
+  if (platform === 'bizreach') {
+    // ess-resume-list-item を直接選択（broad selector による phantom element を排除）
+    const items = Array.from(document.querySelectorAll('ess-resume-list-item'));
+    if (items.length > 0) {
+      return dedup(items.filter(el => {
+        const text = el.innerText || '';
+        return agePattern.test(text) && text.length > 50;
+      }));
+    }
+    // フォールバック：ess-resume-list-item が見つからない場合は旧ロジック
+    return dedup(Array.from(document.querySelectorAll('div, article, li')).filter(el => {
+      const rect = el.getBoundingClientRect();
+      const text = (el.innerText || '');
+      return rect.width > vw * 0.45 &&
+             rect.height > 80 && rect.height < 700 &&
+             agePattern.test(text) &&
+             (text.includes('ラベル') || text.includes('コメント') || text.includes('万円')) &&
+             text.length > 80 && text.length < 6000;
+    }));
+  }
+
+  if (platform === 'dodax') {
+    // 候補者検索結果の一覧は <li id="search-result-0..29"> が1人分（実機のHTMLで確認）。
+    // 大きさと文言での推測では、親子の塊を拾ったり1人分を取り逃したりする。
+    // 一括送信のチェックボックス（.bulk-scout-chk）もこの中にあるため、
+    // 「選択された候補者」を数えるにはこの単位でなければならない
+    const listItems = Array.from(document.querySelectorAll('li[id^="search-result-"]'));
+    if (listItems.length > 0) {
+      console.log('[Snow-we] doda-x 一覧カード検出数:', listItems.length);
+      return listItems;
+    }
+    // doda-X (doda-x.jp / x.doda.jp) の候補者カード
+    const hits = dedup(Array.from(document.querySelectorAll('div, article, li')).filter(el => {
+      const rect = el.getBoundingClientRect();
+      const text = (el.innerText || '');
+      return rect.width > vw * 0.4 &&
+             rect.height > 60 && rect.height < 1000 &&
+             agePattern.test(text) &&
+             (text.includes('タグ') || text.includes('コメント') ||
+              text.includes('万円') || text.includes('年収') ||
+              text.includes('経験') || text.includes('スカウト')) &&
+             text.length > 80 && text.length < 10000;
+    }));
+    console.log('[Snow-we] doda-x カード検出数:', hits.length, '/ url:', location.hostname);
+    return hits;
+  }
+
+  if (platform === 'rds') {
+    // RDS(リクナビHRTech)の検索一覧：全幅カード（スカウト・検討中リスト追加ボタンあり）
+    const fullWidthCards = dedup(Array.from(document.querySelectorAll('div, article, li')).filter(el => {
+      const rect = el.getBoundingClientRect();
+      const text = (el.innerText || '');
+      return rect.width > vw * 0.5 &&
+             rect.height > 100 && rect.height < 900 &&
+             agePattern.test(text) &&
+             (text.includes('スカウト') || text.includes('検討中リスト') || text.includes('万円') || text.includes('レジュメ')) &&
+             text.length > 100 && text.length < 8000;
+    }));
+    if (fullWidthCards.length > 0) return fullWidthCards;
+
+    // フォールバック：左パネル型（詳細が右に表示される旧レイアウト）
+    return dedup(Array.from(document.querySelectorAll('div, li, article')).filter(el => {
+      const rect = el.getBoundingClientRect();
+      const text = (el.innerText || '');
+      return rect.left < vw * 0.55 &&
+             rect.width > 180 && rect.width < vw * 0.6 &&
+             rect.height > 50 && rect.height < 500 &&
+             agePattern.test(text) &&
+             text.length > 40 && text.length < 3000;
+    }));
+  }
+
+  if (platform === 'green') {
+    // Green Compass の候補者カード。実機DOM調査で確認したセレクター。
+    // css-1gva7jy等のハッシュ付きクラス名(CSS-in-JSによる自動生成でビルドごとに
+    // 変わりうる)は使わず、MUI(Material UI)の固定コンポーネントクラス名だけを使う
+    const cards = Array.from(document.querySelectorAll('.MuiPaper-root.MuiPaper-elevation.MuiPaper-rounded')).filter(el => {
+      const text = el.innerText || '';
+      return agePattern.test(text) && text.length > 15 && text.length < 4000;
+    });
+    if (cards.length > 0) return dedup(cards);
+    return [];
+  }
+
+  // mynavi・その他：年齢を含む適度なサイズのカード
+  return dedup(Array.from(document.querySelectorAll('div, li, article')).filter(el => {
+    const rect = el.getBoundingClientRect();
+    const text = (el.innerText || '');
+    return rect.width > vw * 0.4 &&
+           rect.height > 80 && rect.height < 800 &&
+           agePattern.test(text) &&
+           text.length > 80 && text.length < 6000;
+  }));
+}
+
+// -------------------------------------------------------
+// プラットフォーム別：追加ボタンをハイライト
+// -------------------------------------------------------
+function highlightAddButton(cardEl) {
+  const platform = getPlatform();
+  // Bizreach: 星ボタン（ess-star-icon-toggle）をハイライト
+  if (platform === 'bizreach') {
+    const btn = findBizreachStarButton(cardEl);
+    if (!btn) return;
+    btn.classList.add('snow-we-btn-highlight');
+    if (getComputedStyle(btn).position === 'static') btn.style.position = 'relative';
+    const tip = document.createElement('span');
+    tip.className = 'snow-we-btn-tip';
+    tip.textContent = '★';
+    btn.appendChild(tip);
+    return;
+  }
+
+  // doda-x: 星ボタンをハイライト
+  if (platform === 'dodax') {
+    const searchRoot = cardEl.closest('li, [class*="result"], [class*="member"], [class*="item"]') || cardEl;
+    const starBtn = searchRoot.querySelector('.c-star-cts');
+    if (!starBtn) return;
+    starBtn.classList.add('snow-we-btn-highlight');
+    return;
+  }
+
+  const btnTextMap = {
+    ambi:     'この検討人材リストに追加',
+    rds:      '検討中リスト追加',
+  };
+  const label = btnTextMap[platform];
+  if (!label) return;
+
+  // カード内 or カードの兄弟・親から検索
+  const searchRoot = cardEl.closest('li, article, [class*="row"], [class*="item"]') || cardEl.parentElement || document;
+  let btn = null;
+  searchRoot.querySelectorAll('button, a, span, div').forEach(el => {
+    if (!btn && (el.innerText || '').trim().includes(label)) btn = el;
+  });
+  // カード内で見つからなければページ全体から
+  if (!btn) {
+    document.querySelectorAll('button, a, span, div').forEach(el => {
+      if (!btn && (el.innerText || '').trim() === label) btn = el;
+    });
+  }
+  if (!btn) return;
+
+  // ハイライト
+  btn.classList.add('snow-we-btn-highlight');
+  if (getComputedStyle(btn).position === 'static') btn.style.position = 'relative';
+  const tip = document.createElement('span');
+  tip.className = 'snow-we-btn-tip';
+  tip.textContent = '👆 ここをクリック';
+  btn.appendChild(tip);
+
+  // 5分後に自動解除（追加ボタンをクリックしたら即解除）
+  const dismissHighlight = () => {
+    btn.classList.remove('snow-we-btn-highlight');
+    tip.remove();
+    btn.removeEventListener('click', dismissHighlight);
+  };
+  btn.addEventListener('click', dismissHighlight);
+  setTimeout(dismissHighlight, 5 * 60 * 1000);
+}
+
+function setupClickTracking() {
+  injectStyles();
+  document.addEventListener('click', e => {
+    // アクションボタン（スカウト送信など）のクリックでは選択カードを上書きしない
+    const btn = e.target.closest('button, a');
+    const btnText = (btn?.innerText || '').trim();
+    if (btnText === 'スカウト' || btnText.includes('スカウトを送る') || btnText.includes('スカウトする')) return;
+
+    const cards = findCandidateCardsByPlatform();
+    const clicked = cards.find(c => c.contains(e.target) || c === e.target);
+    if (!clicked) return;
+
+    // 以前の選択ハイライトだけ外す（バッジは消さない）
+    document.querySelectorAll('.snow-we-selected').forEach(el => el.classList.remove('snow-we-selected'));
+    // 単体判定バッジ（batch以外）だけ消す
+    document.querySelectorAll('.snow-we-badge:not(.batch)').forEach(b => b.remove());
+
+    _selectedCard = clicked;
+    if (getComputedStyle(clicked).position === 'static') clicked.style.position = 'relative';
+    clicked.classList.add('snow-we-selected');
+  }, true);
+}
+
+function showBadge(cls, text, tooltip = '', profileSummary = '', aiVerdict = '') {
+  if (!_selectedCard) return;
+  document.querySelectorAll('.snow-we-badge').forEach(b => b.remove());
+  if (getComputedStyle(_selectedCard).position === 'static') _selectedCard.style.position = 'relative';
+  const badge = document.createElement('div');
+  badge.className = `snow-we-badge ${cls}`;
+  badge.textContent = text;
+  if (tooltip) badge.title = tooltip;
+  attachFeedbackHandler(badge, cls, tooltip, profileSummary, aiVerdict);
+  _selectedCard.appendChild(badge);
+}
+
+// クリックトラッキング開始
+setupClickTracking();
+
+// このタブに読み込まれているコードのバージョンを出す。拡張機能を更新しても、
+// 既に開いているタブでは古いコードが動き続けるため、「拡張機能のバージョン」と
+// 「このタブで動いているバージョン」は一致しないことがある。不具合の調査時に
+// どちらを見ているのか分からなくなるので、必ず出しておく
+try {
+  console.log(`[Snow-we] content.js 起動 v${chrome.runtime.getManifest().version} / ${location.host}`);
+} catch (_) {
+  console.warn('[Snow-we] content.js 起動（拡張機能から切り離された状態です）');
+}
+
+// 拡張機能から切り離されたことを、自分から定期的に確認する。
+// 以前は「スカウトボタンを押した」「記録に失敗した」等の操作を起点にしか警告を
+// 出していなかったため、拡張機能を更新した直後は画面に何も出ず、次に操作するまで
+// 気づけなかった（その1件目の記録は既に失われている）。
+// 5秒おきに確認しておけば、作業を再開する前に気づける
+setInterval(() => {
+  if (!isExtensionAlive()) showExtensionInvalidatedBanner();
+}, 5000);
+// タブを離れて戻ってきたときも確認する（別タブで作業している間に更新された場合）
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && !isExtensionAlive()) {
+    showExtensionInvalidatedBanner();
+  }
+});
+
+// 前回、拡張機能との接続が切れていて送信できなかった記録があれば送り直す。
+// ページを読み込み直した時点では接続が回復しているため、ここで回収できる。
+//
+// 1回だけだと、その瞬間にサービスワーカーが起動中だった場合に再送が空振りし、
+// 次にこのページを開き直すまで記録が滞留する。間隔を空けて複数回試し、
+// タブを再び表示したときにも試す
+[3000, 20000, 60000, 180000].forEach(ms => {
+  setTimeout(() => { resendUnsentRecords().catch(() => {}); }, ms);
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') resendUnsentRecords().catch(() => {});
+});
+
+// -------------------------------------------------------
+// スカウト送信履歴の管理
+// -------------------------------------------------------
+const SCOUT_KEY = 'scoutHistory';
+const RESCOUNT_DAYS = 7; // 1週間 = 7日
+
+// 会社名キーワードから業界を簡易判定（GASのgicsAutoClassifyを移植）
+function gicsAutoClassify(companyName) {
+  if (!companyName) return '';
+  // 全角英数字（例:「ＮＴＴ東日本株式会社」）を半角に正規化してから判定する。
+  // これをしないと、以下の半角前提の正規表現（/ntt.../ 等）が一致せず、
+  // 実際に全角表記の会社名で業界が空欄になる事例があった
+  const toHalfWidth = s => s.replace(/[Ａ-Ｚａ-ｚ０-９]/g, c =>
+    String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  const n = toHalfWidth(companyName).replace(/[株式会社　\s]/g, '').toLowerCase();
+
+  // コンサルティング・専門サービス
+  if (/accenture|アクセンチュア/.test(n))                                  return 'コンサルティングサービス';
+  if (/マッキンゼー|mckinsey|ボストンコンサル|bcg|roland berger|ローランドベルガー|bain|ベイン/.test(n)) return 'コンサルティングサービス';
+  if (/デロイト|deloitte|pwc|kpmg|ey |アーンスト/.test(n))                 return 'コンサルティングサービス';
+  if (/ベイカレント|baycurrent/.test(n))                                    return 'コンサルティングサービス';
+  if (/アビーム|abeam/.test(n))                                             return 'コンサルティングサービス';
+
+  // SIer（システムインテグレーター）
+  if (/ntt(データ|data|コミュニケーションズ|communications)/.test(n))       return 'SIer';
+  if (/野村総研|nri/.test(n))                                               return 'SIer';
+  if (/伊藤忠テクノ|ctc/.test(n))                                           return 'SIer';
+  if (/scsk/.test(n))                                                        return 'SIer';
+  if (/インフォシス|infosys|tcs|wipro/.test(n))                             return 'SIer';
+
+  // 情報技術サービス
+  if (/富士通|fujitsu/.test(n))                                             return '情報技術サービス';
+  if (/日立|hitachi/.test(n))                                               return '情報技術サービス';
+  if (/nec|日本電気/.test(n))                                               return '情報技術サービス';
+  if (/ibm|日本ibm/.test(n))                                                return '情報技術サービス';
+
+  // 電子装置・機器・部品
+  if (/東芝|toshiba/.test(n) && !/デバイス/.test(n))                       return '電子装置・機器・部品';
+  if (/三菱電機|mitsubishi electric/.test(n))                               return '電子装置・機器・部品';
+  if (/キーエンス|keyence/.test(n))                                         return '電子装置・機器・部品';
+
+  // 民生用電子機器
+  if (/ソニー|sony/.test(n))                                                return '民生用電子機器';
+  if (/パナソニック|panasonic/.test(n))                                     return '民生用電子機器';
+  if (/シャープ|sharp/.test(n))                                             return '民生用電子機器';
+
+  // SaaS
+  if (/salesforce|セールスフォース/.test(n))                                return 'SaaS';
+  if (/freee/.test(n))                                                       return 'SaaS';
+  if (/smarthr/.test(n))                                                     return 'SaaS';
+  if (/マネーフォワード|money forward/.test(n))                             return 'SaaS';
+  if (/sansan/.test(n))                                                      return 'SaaS';
+  if (/cybozu|サイボウズ|kintone/.test(n))                                  return 'SaaS';
+
+  // ソフトウェア
+  if (/microsoft|マイクロソフト/.test(n))                                   return 'ソフトウェア';
+  if (/oracle|オラクル/.test(n))                                            return 'ソフトウェア';
+  if (/sap/.test(n))                                                         return 'ソフトウェア';
+
+  // AI
+  if (/google|グーグル|alphabet/.test(n))                                   return 'AI';
+
+  // メガベンチャー
+  if (/amazon|アマゾン|aws/.test(n) && !/モバイル/.test(n))                return 'メガベンチャー';
+  if (/楽天|rakuten/.test(n) && !/モバイル|銀行/.test(n))                  return 'メガベンチャー';
+  if (/メルカリ|mercari/.test(n))                                           return 'メガベンチャー';
+  if (/サイバーエージェント|cyberagent/.test(n))                            return 'メガベンチャー';
+
+  // 通信
+  if (/softbank|ソフトバンク/.test(n) && !/銀行/.test(n))                  return '各種電気通信サービス';
+  if (/kddi|au/.test(n))                                                     return '各種電気通信サービス';
+  if (/docomo|ドコモ/.test(n))                                              return '各種電気通信サービス';
+  if (/楽天モバイル|rakutenmobile/.test(n))                                 return '各種電気通信サービス';
+  if (/ntt(東日本|西日本)/.test(n) || n === 'ntt')                          return '各種電気通信サービス';
+
+  // 金融・銀行
+  if (/信託銀行|三菱uf.+信託|三井住友信託|みずほ信託/.test(n))             return '信託銀行';
+  if (/三菱uf|mufg|三菱東京/.test(n))                                       return '銀行';
+  if (/みずほ|mizuho/.test(n) && !/証券/.test(n))                          return '銀行';
+  if (/三井住友|smbc/.test(n) && !/証券|日興/.test(n))                     return '銀行';
+  if (/りそな|resona/.test(n))                                              return '銀行';
+  if (/(銀行|bank)/.test(n) && !/信託/.test(n))                            return '銀行';
+  if (/野村証券|大和証券|みずほ証券|三菱uf.+証券|smbc日興|証券/.test(n))   return '資本市場';
+  if (/日本生命|第一生命|住友生命|明治安田|生命保険/.test(n))              return '生命保険・健康保険';
+  if (/東京海上|損保ジャパン|三井住友海上|あいおい|損保|火災/.test(n))     return '動産保険・損害保険';
+  if (/オリックス|orix/.test(n))                                            return '金融サービス';
+
+  // 不動産・デベロッパー
+  if (/三井不動産|三菱地所|住友不動産|野村不動産/.test(n))                 return 'デベロッパー';
+  if (/積水ハウス|大和ハウス|旭化成ホームズ|住宅/.test(n))                 return '住宅建設';
+  if (/(不動産)/.test(n))                                                   return '不動産';
+
+  // 製造・自動車
+  if (/toyota|トヨタ/.test(n))                                             return '自動車';
+  if (/honda|ホンダ|本田技/.test(n))                                       return '自動車';
+  if (/nissan|日産/.test(n))                                                return '自動車';
+  if (/mazda|マツダ/.test(n))                                               return '自動車';
+  if (/subaru|スバル/.test(n))                                              return '自動車';
+  if (/suzuki|スズキ/.test(n))                                              return '自動車';
+  if (/mitsubishi motors|三菱自動車/.test(n))                               return '自動車';
+  if (/デンソー|denso|アイシン|aisin|豊田自動/.test(n))                     return '自動車用部品';
+  if (/ブリヂストン|bridgestone|住友ゴム/.test(n))                          return '自動車用部品';
+
+  // 重工業
+  if (/川崎重工|川崎車両|川崎車輛|三菱重工|ihiエアロ|ihi|石川島/.test(n))  return '重工業';
+
+  // 半導体・半導体製造装置
+  if (/東京エレク|tel|applied materials|レーザーテック/.test(n))            return '半導体・半導体製造装置';
+  if (/ルネサス|renesas|ローム|rohm|東芝デバイス/.test(n))                  return '半導体・半導体製造装置';
+  if (/(半導体|semiconductor)/.test(n))                                      return '半導体・半導体製造装置';
+
+  // 医薬品・ヘルスケア
+  if (/武田薬品|takeda|アステラス|astellas|第一三共|大塚製薬|中外製薬|エーザイ|eisai/.test(n)) return '医薬品';
+  if (/塩野義|田辺三菱|協和キリン|小野薬品|住友ファーマ|大日本住友/.test(n))  return '医薬品';
+  if (/ファイザー|pfizer|ノバルティス|novartis|アストラゼネカ|astrazeneca/.test(n)) return '医薬品';
+  if (/msd|グラクソ|gsk|サノフィ|sanofi|ロシュ|roche|アッヴィ|abbvie/.test(n)) return '医薬品';
+  if (/バイエル|bayer|イーライリリー|eli lilly|ノボノルディスク|novo nordisk/.test(n)) return '医薬品';
+  if (/ジョンソン.エンド.ジョンソン|johnson.{0,2}johnson/.test(n))          return '医薬品';
+  if (/医薬品|製薬|pharma/.test(n))                                         return '医薬品';
+  if (/オリンパス|olympus|テルモ|terumo|シスメックス/.test(n))              return 'ヘルスケア機器・用品';
+  if (/病院|クリニック|メディカル|medical|healthcare/.test(n))              return 'ヘルスケアプロバイダー';
+
+  // 人材・採用
+  if (/リクルート|recruit/.test(n) && !/不動産|住宅/.test(n))              return '人事・雇用サービス';
+  if (/パーソル|persol|マンパワー|manpower/.test(n))                        return '人事・雇用サービス';
+
+  // セキュリティ
+  if (/セコム|secom|アルソック|alsok/.test(n))                              return 'セキュリティ・警報装置サービス';
+
+  // 小売
+  if (/セブン.?イレブン|ローソン|ファミリーマート|コンビニ/.test(n))       return '大規模小売り';
+  if (/イオン|ウォルマート|walmart|ドンキ|ユニー/.test(n))                  return '大規模小売り';
+  if (/ユニクロ|uniqlo|ファーストリテ|zara|h&m/.test(n))                   return '専門小売り';
+  if (/ニトリ|nitori/.test(n))                                              return '家具・装飾';
+
+  // 消費財
+  if (/花王|kao|資生堂|shiseido|p&g/.test(n))                              return '家庭用品・パーソナルケア用品';
+  if (/味の素|ajinomoto|キリン|kirin|アサヒ|asahi|サントリー|suntory|サッポロ/.test(n)) return '飲料';
+  if (/日清食品|明治|森永|カルビー|ネスレ|nestle/.test(n))                  return '食品';
+
+  // メディア・エンタメ
+  if (/電通|dentsu|博報堂|hakuhodo/.test(n))                                return 'メディア';
+  if (/(テレビ|tv|放送|フジ|ntv|tbs|abc)/.test(n))                          return 'メディア';
+  if (/任天堂|nintendo|コナミ|konami|netflix|ネットフリックス/.test(n))      return '娯楽';
+
+  // 商社
+  if (/三菱商事|三井物産|住友商事|伊藤忠|丸紅|双日|豊田通商|商事|物産/.test(n)) return '商社';
+
+  // 建設・土木
+  if (/鹿島|清水建設|大成建設|竹中工務|大林組|建設/.test(n))               return '建設・土木';
+
+  // 物流・運輸
+  if (/ヤマト|yamato|佐川|sagawa|日本郵便|jppost/.test(n))                  return '航空貨物・物流サービス';
+  if (/jal|ana|日本航空|全日空|航空/.test(n))                               return '旅客航空輸送';
+  if (/jr.*(東日本|西日本|東海|九州|北海道)|鉄道|地下鉄|メトロ|railway|subway/.test(n)) return '陸上運輸';
+  if (/商船三井|日本郵船|川崎汽船|海運/.test(n))                            return '海上運輸';
+
+  // エネルギー・化学
+  if (/jxtg|eneos|出光|idemitsu|コスモ石油/.test(n))                        return '石油・ガス・消耗燃料';
+  if (/東電|東京電力|関西電力|中部電力|九州電力|電力|北陸電力|東北電力|北海道電力|四国電力/.test(n)) return '電力';
+  if (/大阪ガス|東京ガス|東邦ガス|西部ガス|都市ガス/.test(n))               return 'ガス';
+  if (/旭化成|住友化学|三菱化学|東レ|toray|化学/.test(n))                   return '化学';
+
+  // 官公庁・教育機関
+  if (/省|庁|役所|官公庁|市役所|区役所|町役場|裁判所|警察署|消防署|検察庁|税務署|法務局|国会|議会/.test(n)) return '官公庁';
+  if (/大学|高校|中学校|小学校|専門学校|学校法人|教育委員会|幼稚園|保育園/.test(n)) return '教育機関';
+
+  // 汎用キーワード（最後のフォールバック）
+  if (/(コンサルティング|コンサルタント|consulting)/.test(n)) return 'コンサルティングサービス';
+  if (/(人材|採用サービス|ヘッドハンティング)/.test(n)) return '人事・雇用サービス';
+  if (/(フィンテック|fintech|決済サービス|ペイメント)/.test(n)) return '金融サービス';
+  if (/(ゲーム会社|ゲーム開発|gaming)/.test(n)) return '娯楽';
+  if (/(物流会社|運送会社|配送サービス)/.test(n)) return '航空貨物・物流サービス';
+  if (/(医療法人|クリニック|診療所|病院)/.test(n)) return 'ヘルスケアプロバイダー';
+  if (/(介護|福祉|ケアサービス)/.test(n)) return 'ヘルスケアプロバイダー';
+  if (/(スタートアップ|ベンチャー企業)/.test(n)) return 'その他';
+
+  return '';
+}
+
+async function getScoutHistory() {
+  try {
+    const r = await chrome.storage.local.get([SCOUT_KEY]);
+    return r[SCOUT_KEY] || {};
+  } catch (e) {
+    if (!e.message?.includes('Extension context invalidated'))
+      console.warn('[Snow-we] getScoutHistory error:', e.message);
+    return {};
+  }
+}
+
+// scoutHistory（1オブジェクトに全候補者ぶんまとめて入っている）の1件だけを更新する。
+// 「読む→書き換える→丸ごと書き戻す」を素朴にやると、その間に別の候補者の記録が
+// 割り込んできた場合に後勝ちで消えてしまう（このプロジェクトで何度も踏んだ地雷と
+// 同じ形）。書き込み直前に読み直してから該当キーだけをマージすることで、
+// 競合の窓を最小化する。
+async function patchScoutHistory(candidateId, patch) {
+  try {
+    const latest = await getScoutHistory();
+    latest[candidateId] = { ...(latest[candidateId] || {}), ...patch };
+    await chrome.storage.local.set({ [SCOUT_KEY]: latest });
+  } catch (e) {
+    if (!e.message?.includes('Extension context invalidated'))
+      console.warn('[Snow-we] patchScoutHistory error:', e.message);
+  }
+}
+
+// 直近に記録した候補者IDと時刻。同一候補者が短時間に何度も記録されるのを防ぐ
+// ── 記録できなかった送信を、拡張機能自身が報告する ──────────────
+//
+// これまでは、記録が止まっても画面に何も出ず、誰かが気づいて言ってくるまで
+// 分からなかった。実データで、ある担当者のRDSの送信45%が記録されておらず、
+// 15日間放置されていた。警告を画面に出すようにしても、見るかどうかは人次第で、
+// 「気づいた人が報告する」設計のままでは同じことが起きる。
+//
+// 記録に至らなかった事実そのものを残す。誰も何もしなくても、翌日にはSQLで
+// 分かる。次に掲載側が画面を変えたときも、報告を待たずに気づける。
+//
+// 個人情報は入れない。原因の切り分けに要るものだけを残す。
+// 書き込み先はSupabaseで、拡張機能の接続が切れていても動く経路を使う
+// （background経由だと、切れているときに報告自体が届かない）。
+// 直近に押されたボタンの文言。認識できなかった送信ボタンが何だったかを
+// 失敗の報告に添えるために覚えておく。これが無いと「認識できなかった」ことしか
+// 分からず、何を認識対象に加えればよいかが分からない
+let _lastButtonText = '';
+let _lastButtonAt = 0;
+// 認識できた送信ボタンが最後に押された時刻。送信の通信を検知したのに直前に
+// 認識済みの送信ボタンが無ければ、ボタンの検知に失敗したことになる
+let _lastRecognizedSendAt = 0;
+// 同じパスを何度も送らないための記録
+const _reportedPaths = new Map();
+// 送信APIが未登録の媒体で、APIを特定するために通信を控える期間。
+// これまでは名前に scout/message/send 等を含むものだけを報告していたが、
+// LinkedInで実際に送信した際、失敗ログに通信が1件も残らなかった（ボタンの
+// 認識失敗だけが記録された）。送信APIの名前がこちらの想定どおりとは限らない。
+// 送信ボタンを押した直後の通信に限れば、名前で絞らなくても対象は十分に少ない
+let _sendDiscoveryUntil = 0;
+let _sendDiscoveryCount = 0;
+let _sendDiscoveryButton = '';
+// 計測・ログ送信の類は送信APIではありえない。これを除かないと本物が埋もれる
+const TRACKING_PATHS = /(?:^|\/)(?:li\/track|track|platform-telemetry|telemetry|realtime|analytics|metrics|beacon|csp|collect|log|logs|events?)(?:\/|$)/i;
+
+async function reportRecordFailure(reason, extra = {}) {
+  try {
+    let recruiter = _cachedRecruiterName || '';
+    try {
+      const r = await chrome.storage.local.get(['gasSettings', 'recruiterName']);
+      recruiter = (r.gasSettings && r.gasSettings.recruiter) || r.recruiterName || recruiter;
+    } catch (_) {}
+    let version = '';
+    try { version = chrome.runtime.getManifest().version; } catch (_) {}
+
+    console.warn('[Snow-we] 記録できませんでした:', reason, extra);
+    await supabaseInsert('scout_record_failures', {
+      recruiter_name: recruiter,
+      platform: getPlatform() || '',
+      reason,
+      button_text: (extra.buttonText || '').slice(0, 200),
+      // 通信のパスが分かっている場合はそちらを残す。媒体ごとの送信APIを
+      // 特定するための手がかりになる
+      page_path: (extra.path || (() => { try { return location.pathname; } catch (_) { return ''; } })()).slice(0, 300),
+      ext_version: version,
+    });
+  } catch (e) {
+    console.warn('[Snow-we] 記録失敗の報告に失敗:', e && e.message);
+  }
+}
+
+// doda-Xの会社名に候補者の氏名が連結されて記録される件を、実データで把握するための報告。
+// innerTextは隣り合うインライン要素の間に改行も空白も入れないため、氏名と会社名が
+// 1行に連結される（「佐々木 貴紀株式会社SHIFT」「栗原 裕也日本メドトロニック株式会社」）。
+// 姓名の切れ目が文字列からは決められないので、推測で切らずに残している。
+// どの画面でどう出ているかが分かれば、その画面のDOMから会社名だけを読む修正ができる
+// 会社名が取れないまま記録された画面を特定するための報告。
+// 実データでビズリーチに「会社名なし」が複数あったが、実機で確認した
+// 「検索 → カード → スカウトを作成 → スカウトを送信」の画面では正しく
+// 取れている。別の画面から送っているはずで、その画面のURLが分かれば直せる。
+// page_path には location.pathname が入る
+let _reportedNoCompanyAt = 0;
+function reportMissingCompany(info) {
+  try {
+    // 一括送信は候補者ごとの詳細が画面に出ないため会社名が無くて当然。
+    // これを報告すると本物が埋もれる
+    if (!info || Object.keys(info).length === 0) return;
+    if ((info.company || '').trim()) return;
+    if (Date.now() - _reportedNoCompanyAt < 10 * 60 * 1000) return;
+    _reportedNoCompanyAt = Date.now();
+    reportRecordFailure('記録はできたが会社名を取れない', { buttonText: _lastButtonText });
+  } catch (_) {}
+}
+
+const DODAX_NAME_IN_COMPANY = /^[一-龯々]{1,5}[ 　][^\s　]{1,20}(?:株式会社|合同会社|有限会社|ホールディングス|銀行|証券|保険|グループ)/;
+let _reportedNameInCompanyAt = 0;
+function reportDodaxNameInCompany(company) {
+  try {
+    if (getPlatform() !== 'dodax' || !company) return;
+    if (!DODAX_NAME_IN_COMPANY.test(company)) return;
+    // 同じ原因で連続して報告しても分かることは増えないため、30分に1回までにする
+    if (Date.now() - _reportedNameInCompanyAt < 30 * 60 * 1000) return;
+    _reportedNameInCompanyAt = Date.now();
+    // 会社名そのものは scouts.company_name にも同じ形で入るため、ここで残しても
+    // 新たに出す情報は増えない。直すための手がかりとして値を残す
+    reportRecordFailure('会社名に候補者の氏名が連結されている', { buttonText: company.slice(0, 60) });
+  } catch (_) {}
+}
+
+// ── 送信そのものを検知して記録する ──────────────────────────
+//
+// ボタンの表示文字列で検知していたため、掲載側が文言を変えたり、担当者によって
+// 通る画面が違ったりすると、その瞬間から記録が止まっていた。実データで、ある担当者の
+// RDSだけ送信の36〜52%が記録されておらず、25分間に19件連続で消えた時間帯もあった。
+// 文言を足しても次の変更でまた止まるので、送信リクエストそのものを見る。
+//
+// 検知した通信は net-hook.js（ページ側の世界）から CustomEvent で渡ってくる。
+// URLの数字は「自社のスカウトルーム」を指しており、候補者ごとには変わらない。
+// 実機で別々の候補者2人に送ったところ、どちらも同じ 1678665 になった。
+// これを候補者の識別子に使うと全員が1つに潰れ、重複判定で5分に1件しか
+// 記録されなくなる。あくまで「送信された」という合図としてのみ使う。
+//
+// 候補者の特定は、スカウトボタンを押した時点で作られる pendingScout に入って
+// いる会員IDベースの識別子を使う（rds_mid_...）。こちらは候補者ごとに固有。
+const SEND_REQUESTS = {
+  // 実機で確認: POST .../scouting/scoutroom/1678665/scout → 200
+  rds: /\/scouting\/scoutroom\/\d+\/scout(?:\?|$)/,
+  // 失敗ログから判明: スカウトを送信 → POST /v1/api/send-scout
+  bizreach: /\/v1\/api\/send-scout(?:\?|$)/,
+  // 失敗ログから判明。LinkedInは全ての操作が /talent/api/graphql を通るため、
+  // パスだけでは送信を見分けられない。何の操作かはクエリ文字列の queryId に出る。
+  // 実データで、送信ボタン（このメッセージを送信送信）の直後に飛んでいたのは
+  //   queryId=talentMultiMessagePosts.be0f985141a7cf89d4d410c4e5839e8f  ← 送信そのもの
+  //   queryId=talentRecruiterTracking.ab2236be...                      ← 操作ログ
+  // queryIdの後ろのハッシュは媒体側の更新で変わるため、名前の部分だけを見る。
+  // 採用アシスタントへの指示（talentCopilotMessages）は別物なので混ざらない
+  linkedin: /\/talent\/api\/graphql\?[^#]*queryId=talentMultiMessagePosts\./,
+  // doda X は1人に送るときも一括送信と同じ /iapi/scout/bulkSendScout を使う（10/30 の失敗報告と記録で確認）。
+  // 以前はここに登録しておらず、送信ボタンの文言で記録していたため、送信のたびに「送信APIの特定用」の
+  // 20秒の窓が開き、送信の合図ではない通信（/iapi/search-condition/conversion/・
+  // /iapi/member_search/resume/browsing・/sentry/api/...）を拾って報告していた（11/11 ゆうき）。
+  // 一括送信の扱いは BULK_SEND_REQUESTS の側で先に行い、1人への送信はここで扱う
+  dodax: /\/iapi\/scout\/bulkSendScout(?:\?|$)/,
+};
+
+// 1回の通信で複数人に送る経路。doda X の一括スカウト送信が該当する。
+// 「1送信＝1記録」を前提にした経路では扱えず、実データでゆうきさんの doda X で
+// 連続した取りこぼしになっていた（9/30 13:41〜13:53 の4件など）。
+const BULK_SEND_REQUESTS = {
+  dodax: /\/iapi\/scout\/bulkSendScout(?:\?|$)/,
+};
+
+// 「送信」ボタンで送られるが、スカウトではない通信。
+// doda X は日程調整などメッセージへの返信も「送信」ボタンで、スカウト開始ボタンを
+// 経由しないため、送信時に詳細パネルから候補者を組み立て直す経路に入り、
+// スカウトとして記録されていた（逆方向の突き合わせで過剰記録11件の原因）
+const NOT_SEND_REQUESTS = {
+  // doda Xの返信。/iapi/message/saveByCorporate だけを見ていたが、媒体側が
+  // /bff/message/send に移行しており、返信を記録しない仕組みが効かなくなって
+  // いた（10/09に返信が1件スカウトとして記録されたのを実データで確認）。
+  // 失敗ログに「送信の可能性がある通信（未登録）」として残っていたパスから判明
+  dodax: /\/(?:iapi\/message\/saveByCorporate|bff\/message\/send)(?:\?|$)/,
+  // ビズリーチの返信。スカウト送信（/v1/api/send-scout）とは別の通信
+  bizreach: /\/v1\/api\/send-message(?:\?|$)/,
+};
+
+// 送信ではないと分かっている通信。報告しない。
+// 実データで、ビズリーチの「送信の可能性がある通信（未登録）」30件はすべてこれだった：
+//   /v1/api/scouts/validate（送信前の検証）  /v1/api/action-logs/send-scouts（操作ログ）
+//   /v1/api/messages/validate  /v1/api/send-message（返信）
+//   /v1/api/message-templates(/validate)（テンプレート保存）
+// 本物の送信（/v1/api/send-scout）は登録済み。誤検知を放置すると本物が埋もれる
+const IGNORED_REQUESTS = {
+  bizreach: /\/v1\/api\/(?:scouts\/validate|action-logs\/|messages\/validate|send-message|message-templates)/,
+  // 実データで報告されていたもの。いずれも送信ではない：
+  //   検索(scoutsearch)／AIによる理由生成／テンプレートの上限確認／送信済み一覧
+  // 検索条件の保存・レジュメの閲覧記録・エラー収集（sentry）・既読化も送信ではない（11/11 の報告で確認）
+  dodax: /\/(?:iapi\/scoutsearch\/|iapi\/scout\/(?:generateScoutReason|sent|prohibitionCharacterCheck|lump_sent_list)|iapi\/template\/|bff\/message\/(?:search|update-read)|iapi\/search-condition\/|iapi\/member_search\/resume\/browsing|sentry\/api\/)/,
+  // 求人の登録・テンプレートの確定・スカウトルームの検索。
+  // 本物の送信は /scouting/scoutroom/{id}/scout で、そちらは登録済み
+  rds: /\/api\/client\/(?:transaction\/(?:joboffers|scouting\/employee\/scout-template)|headhunter\/transaction\/scouting\/scoutroom(?:\?|$))/,
+  // Greenの送信は /green_compass/apis/v1/agent/scouts だが、あえて登録しない。
+  // Greenは候補者ごとの開始ボタンが無く、送信時に詳細モーダルから候補者を
+  // 組み立てる経路で記録している。通信検知に移すとこの経路を通らなくなり、
+  // 候補者を特定できなくなる。実データでGreenは44/44・12/12と完全に
+  // 記録できているため、報告だけ止めて仕組みは変えない
+  green: /\/green_compass\/apis\/v1\/agent\/(?:scouts|scout_templates)/,
+};
+let _lastNotSendRequestAt = 0;
+
+function isNetHookAlive() {
+  if (_netHookAlive) return true;
+  try { return document.documentElement.getAttribute('data-snowwe-net-hook') === '1'; } catch (_) { return false; }
+}
+
+/**
+ * LinkedIn: 作成中のメッセージ（宛先がその候補者）を候補者情報の読み取り元にする。
+ * 一覧の封筒から始められず控えが無いときの、送信時のフォールバック。
+ * 実データで「送信ボタンは押されたが候補者を特定できない」が発生し、
+ * 送信そのものが記録されなかった
+ */
+function findLinkedinDetailPanel() {
+  const visible = (el) => {
+    try {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    } catch (_) { return false; }
+  };
+  try {
+    for (const d of document.querySelectorAll('[role="dialog"], .artdeco-modal')) {
+      if (/メッセージを作成|宛先/.test(d.innerText || '') && visible(d)) return d;
+    }
+    // 候補者のプロフィールだけを開いた画面（「検索結果から」等のモーダル）。
+    // 実データで、この画面から送ったスカウトは読み取り元が見つからず、
+    // 会社名が空欄のまま記録されていた
+    for (const d of document.querySelectorAll('[role="dialog"], .artdeco-modal')) {
+      if (/公開プロフィール|職歴/.test(d.innerText || '') && visible(d)) return d;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function findDetailPanelForPlatform(platform) {
+  return platform === 'linkedin' ? findLinkedinDetailPanel() :
+    platform === 'ambi' ? findAMBIDetailPanel() :
+    platform === 'rds' ? findRDSDetailPanel() :
+    platform === 'dodax' ? (findDodaxProfilePane() || findDodaxDetailPanel()) :
+    platform === 'bizreach' ? findBizreachDetailPanel() :
+    platform === 'green' ? findGreenDetailPanel() :
+    null;
+}
+
+/**
+ * 送信フォームに出ているテンプレート名と本文を、その場で同期的に読む。
+ * 送信が成立すると画面が切り替わって読めなくなるため、送信ボタンを押した瞬間に取る。
+ * bizreach・doda X は本文を一度も読んでおらず、scout_message が100%空だった
+ */
+function readSendFormSnapshot(platform) {
+  const snap = { templateRaw: '', bodyText: '' };
+  try {
+    if (platform === 'bizreach') {
+      const el = document.querySelector('[data-templates-dropdown] .bui-select-box-label');
+      snap.templateRaw = el ? (el.textContent || '').trim() : '';
+    } else if (platform === 'dodax') {
+      const el = document.querySelector('.vs__selected');
+      snap.templateRaw = el ? (el.getAttribute('title') || el.textContent || '').trim() : '';
+    } else if (platform === 'rds') {
+      // 送信フォームの「求人票」欄に、ポジション名がそのまま入っている（実機で確認）
+      //   アクセンチュア）デジタルワークプレイスコンサルタント / アーキテクト / エンジニア
+      // これまでRDSはテンプレート選択の「確定」でしか拾えず、その経路を通らないと
+      // ポジションが分からなかった
+      const label = Array.from(document.querySelectorAll('*'))
+        .find(e => !e.children.length && (e.textContent || '').trim() === '求人票');
+      const row = label && label.closest('div, tr, li');
+      const a = row && row.querySelector('a');
+      if (a) snap.templateRaw = (a.textContent || '').trim();
+    } else if (platform === 'linkedin') {
+      // テンプレート名は検索ボックスの値に入る（実機で確認：選ぶと
+      // 「AC）インダストリーコンサルタント（自動車領域） - BUS」が入った状態になる）。
+      // これが取れないと、サイドパネルで選んでいるポジションが使われ、
+      // 実際に送ったテンプレートと食い違う（実機で確認）
+      for (const inp of document.querySelectorAll('input')) {
+        const ph = (inp.getAttribute('placeholder') || '') + (inp.getAttribute('aria-label') || '');
+        if (!/テンプレート|template/i.test(ph)) continue;
+        const v = (inp.value || '').trim();
+        if (v) { snap.templateRaw = v; break; }
+      }
+    }
+    // 本文欄は画面によって位置が違うので、表示されている textarea のうち最も長い値を本文とみなす
+    // 見えている欄が無ければ（判定を誤った場合も含めて）全体から選ぶ
+    let best = '';
+    let bestVisible = '';
+    for (const ta of document.querySelectorAll('textarea')) {
+      const v = ta.value || '';
+      if (!v || v === 'スカウト本文を入力') continue;
+      if (v.length > best.length) best = v;
+      if (ta.getClientRects().length > 0 && v.length > bestVisible.length) bestVisible = v;
+    }
+    snap.bodyText = (bestVisible || best).substring(0, 2000);
+
+    // LinkedInの本文は textarea ではなく contenteditable の編集領域（実機で確認）。
+    // textarea だけを見ていたため本文がまったく取れていなかった
+    if (!snap.bodyText && platform === 'linkedin') {
+      let ce = '';
+      for (const ed of document.querySelectorAll('[contenteditable="true"]')) {
+        if (ed.getClientRects().length === 0) continue;
+        const t = (ed.innerText || '').trim();
+        if (t.length > ce.length) ce = t;
+      }
+      snap.bodyText = ce.substring(0, 2000);
+    }
+  } catch (_) {}
+  return snap;
+}
+
+/** 送信の通信内容から本文らしい値（最も長い文字列）を取り出す */
+function extractMessageFromBody(body) {
+  let best = '';
+  const walk = v => {
+    if (typeof v === 'string') { if (v.length > best.length) best = v; return; }
+    if (v && typeof v === 'object') Object.values(v).forEach(walk);
+  };
+  try { walk(JSON.parse(String(body || ''))); } catch (_) {
+    try { walk(Object.fromEntries(new URLSearchParams(String(body || '')))); } catch (_) {}
+  }
+  // 件名・IDなど短い値は本文ではない
+  return best.length >= 50 ? best.substring(0, 2000) : '';
+}
+
+/** テンプレート名をポジション一覧と照合する。合わなければテンプレート名そのものを返す */
+async function resolveTemplateName(tmplVal) {
+  if (!tmplVal) return '';
+  try {
+    const res = await chrome.runtime.sendMessage({ type: 'getPositionList' });
+    const sorted = [...(res?.positions || [])].sort((a, b) => b.length - a.length);
+    const normStr = x => stripFirmPrefix(x).replace(/[-–—－]/g, '-').replace(/[（]/g, '(').replace(/[）]/g, ')').replace(/　/g, ' ').trim();
+    const stripSuffix = x => x.replace(/\s*[-–—－]\s*[A-Za-z]{2,}[\s）)]*$/, '').replace(/\s*[-–—－]\s*[゠-ヿ一-鿿]{2,}[\s）)]*$/, '').trim();
+    const n = normStr(tmplVal);
+    const exact = sorted.filter(x => x && n === normStr(x));
+    const stripped = exact.length === 0 ? sorted.filter(x => { const t = stripSuffix(x); return t.length >= 8 && n === normStr(t); }) : [];
+    const hits = exact.length > 0 ? exact : stripped;
+    if (hits.length === 1) return hits[0];
+  } catch (_) {}
+  return tmplVal;
+}
+
+/**
+ * 一括送信の内容から候補者の識別子を取り出す。
+ *
+ * doda X の候補者番号は8桁の数字（getCandidateId も同じ形を使っている）。
+ * 送信内容のどこに入っているかは実機を見ていないので、構造を決め打ちせず、
+ * 8桁の数字をすべて拾って重複を除く。
+ *
+ * テンプレート番号などの別の8桁が混ざる可能性はあるが、記録が残らないよりは
+ * 多めに拾うほうがよい（余分な記録は後から消せるが、消えた記録は戻らない）。
+ * 取り出せなかった場合は、中身の「形」だけを報告して次に直せるようにする。
+ */
+function extractBulkCandidateIds(body) {
+  const ids = new Set();
+  // doda X の一括送信は {scoutSendRequest: string, resendSetting: string} の形で、
+  // 文字列の中にさらに JSON が入っている。中身まで開いて、候補者を指すキーの値を拾う。
+  // 番号は先頭のゼロが落ちていることがある（URL の /member_search/detail/705981 と同じ）ので8桁にそろえる
+  const KEY = /^(?:member|candidate|jobseeker|jobSeeker)(?:_?(?:id|no|number|ids|nos|numbers|list))?s?$/i;
+  const addNum = v => {
+    const t = String(v).trim();
+    if (/^\d{5,8}$/.test(t)) ids.add(t.padStart(8, '0'));
+  };
+  const walk = (v, keyHit, depth) => {
+    if (depth > 8 || v === null || v === undefined) return;
+    if (typeof v === 'string') {
+      const t = v.trim();
+      if ((t.startsWith('{') || t.startsWith('[')) && t.length < MAX_NESTED_JSON) {
+        try { walk(JSON.parse(t), keyHit, depth + 1); return; } catch (_) {}
+      }
+      if (keyHit) t.split(/[,\s]+/).forEach(addNum);
+      return;
+    }
+    if (typeof v === 'number') { if (keyHit) addNum(v); return; }
+    if (Array.isArray(v)) { v.forEach(x => walk(x, keyHit, depth + 1)); return; }
+    if (typeof v === 'object') {
+      for (const [k, x] of Object.entries(v)) walk(x, keyHit || KEY.test(k), depth + 1);
+    }
+  };
+  try { walk(String(body || ''), false, 0); } catch (_) {}
+  // キー名が想定と違っても、8桁の会員番号がそのまま入っていれば拾う（以前からの拾い方）
+  try {
+    for (const m of String(body || '').matchAll(/(?<!\d)(\d{8})(?!\d)/g)) ids.add(m[1]);
+  } catch (_) {}
+  return [...ids];
+}
+const MAX_NESTED_JSON = 200000;
+
+/** 送信内容の「形」だけを残す。値は入れない（個人情報が含まれるため） */
+function describeBodyShape(body) {
+  // 値そのものは残さない。キー名と形だけを見て、次に直せるようにする
+  const shape = (v, depth) => {
+    if (Array.isArray(v)) return `配列(${v.length})`;
+    if (v && typeof v === 'object') {
+      if (depth <= 0) return 'オブジェクト';
+      return `{${Object.entries(v).map(([k, x]) => `${k}:${shape(x, depth - 1)}`).join(',')}}`;
+    }
+    // 文字列の中にさらにJSONが入っている形があった（doda Xの一括送信の
+    // scoutSendRequest）。中を見ないと候補者がどう入っているか分からない
+    if (typeof v === 'string') {
+      try {
+        const inner = JSON.parse(v);
+        if (inner && typeof inner === 'object') return `string→${shape(inner, depth - 1)}`;
+      } catch (_) {}
+      return 'string';
+    }
+    return typeof v;
+  };
+  const text = String(body || '');
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object') return shape(parsed, 3).slice(0, 280);
+  } catch (_) {}
+  return `長さ${text.length}`;
+}
+
+// 本文に出てくる数字の並びを、桁数ごとに数える。値は残さない。
+// 候補者の識別子が何桁なのかが分かれば、取り出し方を決められる
+function describeDigitRuns(body) {
+  const byLen = {};
+  try {
+    for (const m of String(body || '').matchAll(/\d+/g)) {
+      byLen[m[0].length] = (byLen[m[0].length] || 0) + 1;
+    }
+  } catch (_) {}
+  return Object.entries(byLen)
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([len, n]) => `${len}桁×${n}`)
+    .join(' ') || '数字なし';
+}
+
+// ── 一括送信で「誰に送ったか」を画面から控える ──
+// 通信の中身には候補者の識別子が入っていなかった（実データで確認。本文は
+// scoutSendRequest と resendSetting の2つの文字列だけで、8桁の会員番号は
+// どこにも現れない）。桁数を広げて数字を拾うと、関係のない値を候補者として
+// 記録してしまう。選択された候補者は画面に出ているので、押した時点で控える
+let _pendingBulkIds = [];
+let _pendingBulkAt = 0;
+
+function captureSelectedCandidateIds() {
+  // 識別子だけでなく、カードに出ている会社名・大学・年齢も一緒に控える。
+  // 一括送信の経路では空の情報で記録しており、実データでdoda Xの28件が
+  // 会社名・大学・年齢・ポジションすべて空欄になっていた（シートとの
+  // 突き合わせが「時刻が近いだけ」になり、本人確認ができない）。
+  // 送信画面へ進むと一覧が消えるため、控えられるのはこの時点だけ
+  const picked = [];
+  try {
+    for (const card of findCandidateCardsByPlatform()) {
+      const box = card.querySelector('input[type="checkbox"]');
+      if (!box || !box.checked) continue;
+      const id = getCandidateId(card);
+      if (!id || picked.some(p => p.id === id)) continue;
+      let info = {};
+      try { info = extractBasicInfo(card); } catch (_) {}
+      picked.push({ id, info });
+    }
+  } catch (_) {}
+  return picked;
+}
+
+// net-hook.js が生きているか。生きていなければボタン検知の従来経路に任せる。
+// 通信の検知に一本化したあとでフックが動かない環境があると、記録が丸ごと
+// 止まってしまうため、切り替えは「フックが動いていることを確認できた場合」に限る
+let _netHookAlive = false;
+
+window.addEventListener('snowwe:request', e => {
+  try {
+    _netHookAlive = true;
+    const { url } = e.detail || {};
+    const platform = getPlatform();
+    const pattern = SEND_REQUESTS[platform];
+    if (!url) return;
+
+    const notSend = NOT_SEND_REQUESTS[platform];
+    if (notSend && notSend.test(String(url))) {
+      _lastNotSendRequestAt = Date.now();
+      return;
+    }
+
+    // ── 一括送信 ──
+    // 1回の通信で複数人に送るため、画面の操作だけでは対象が分からない。
+    // 送信内容から候補者の識別子を取り出して、人数分を記録する
+    const bulkPattern = BULK_SEND_REQUESTS[platform];
+    let bulkHintId = '';
+    if (bulkPattern && bulkPattern.test(String(url))) {
+      // 画面で控えた選択を最優先に使う。識別子がそのまま取れているので確実。
+      // ただし1人への送信も同じ通信なので、控えが1件で、スカウトボタンから始めた送信（pendingScout）が
+      // あるときは1人への送信として下で扱う（一覧に残ったチェックで別人を記録しないため）
+      const bulkPickedFresh = _pendingBulkIds.length && Date.now() - _pendingBulkAt < 10 * 60 * 1000;
+      const hasSinglePending = (() => {
+        try { const p = JSON.parse(sessionStorage.getItem('pendingScout') || 'null'); return !!(p && p.id && Date.now() - p.ts < 30 * 60 * 1000); }
+        catch (_) { return false; }
+      })();
+      if (bulkPickedFresh && (_pendingBulkIds.length >= 2 || !hasSinglePending)) {
+        const picked = _pendingBulkIds.slice();
+        _pendingBulkIds = [];
+        console.log(`[Snow-we] 一括送信を検知: 画面で選択されていた${picked.length}件を記録します`);
+        // テンプレート名と本文は、送信が成立したこの時点なら送信画面から読める。
+        // 以前は渡しておらず、ポジションも本文も空のまま記録していた
+        const bulkSnap = readSendFormSnapshot(platform);
+        (async () => {
+          const name = bulkSnap.templateRaw ? await resolveTemplateName(bulkSnap.templateRaw) : '';
+          for (const it of picked) {
+            recordScoutSent(it.id, it.info || {}, name, bulkSnap.bodyText || '', '');
+          }
+        })();
+        return;
+      }
+      const ids = extractBulkCandidateIds(e.detail && e.detail.body);
+      console.log(`[Snow-we] 一括送信を検知: ${ids.length}件`);
+      // 中身から1人しか取れない・取れないのは、1人への送信。下の1人への送信の扱いに進む
+      // （候補者は pendingScout か詳細パネルから取る。こちらのほうが会社名・年齢まで取れる）
+      if (ids.length <= 1 && pattern && pattern.test(String(url))) {
+        bulkHintId = ids.length === 1 ? `${platform}_${ids[0]}` : '';
+      } else if (ids.length === 0) {
+        // doda X は1人に送るときも bulkSendScout を使う。その場合は通常の経路が
+        // 約6秒後に記録するため、ここで警告すると送信のたびに誤った警告と失敗報告が
+        // 出ていた（10/30 の失敗報告6件すべてに、数秒後の記録があるのを確認）。
+        // 少し待って、その間に記録されていなければ本当に取りこぼしたとみなす
+        const reqAt = Date.now();
+        const body = e.detail && e.detail.body;
+        const btn = _lastButtonText;
+        setTimeout(() => {
+          const recorded = [..._recentlyRecorded.values()].some(t => t >= reqAt - 60 * 1000);
+          if (recorded) return;
+          // 取り出せなかった。中身の形だけを残して、次に直せるようにする。
+          // 値は残さず、キー名と数字の桁数だけにする
+          reportRecordFailure('一括送信の内容から候補者を取り出せない', {
+            buttonText: btn,
+            path: `${describeBodyShape(body)} / ${describeDigitRuns(body)}`,
+          });
+          try {
+            showAutoStatus('⚠️ 一括送信を検知しましたが、対象を特定できませんでした', 12000);
+          } catch (_) {}
+        }, 20 * 1000);
+        return;
+      }
+      else {
+        // 一括送信では候補者ごとの詳細が画面に出ていないため、年齢・会社名・大学は
+        // 残せない。送った事実・相手・ポジションだけでも残すほうがよい
+        // こちらは通信の中身から識別子だけを取り出す経路で、候補者の詳細は
+        // 分からない。テンプレート名と本文は画面から読めるので、それだけでも渡す
+        const bodySnap = readSendFormSnapshot(platform);
+        (async () => {
+          const name = bodySnap.templateRaw ? await resolveTemplateName(bodySnap.templateRaw) : '';
+          for (const id of ids) {
+            recordScoutSent(`${platform}_${id}`, {}, name, bodySnap.bodyText || '', '');
+          }
+        })();
+        return;
+      }
+    }
+
+    // 送信のURLがまだ分かっていない媒体で、それらしい通信を拾って記録する。
+    // これが無いと、媒体ごとに誰かが開発者ツールを開いて送信の通信を
+    // 探す作業が要る。スカウト系のボタンを押した直後の通信に限るので、
+    // 無関係な通信は入らない
+    if (!pattern || !pattern.test(String(url))) {
+      try {
+        const u = new URL(String(url), location.origin);
+        const path = u.pathname;
+        // GraphQLの媒体では、パスは全ての操作で共通で（LinkedInは
+        // /talent/api/graphql）、何の操作かはクエリ文字列のqueryId等にしか出ない。
+        // パスだけ報告しても送信APIを特定できないため、クエリ文字列も残す
+        const fullPath = (path + (u.search || '')).slice(0, 300);
+        const ignored = IGNORED_REQUESTS[platform];
+        if (ignored && ignored.test(path)) return;
+        // 送信ボタンを押した直後は、名前で絞らずに控える（上のコメントの理由）。
+        // 1回の送信につき10件までにして、報告が溢れないようにする
+        if (Date.now() < _sendDiscoveryUntil && !TRACKING_PATHS.test(path)
+            && _sendDiscoveryCount < 10
+            && Date.now() - (_reportedPaths.get(fullPath) || 0) > 30 * 60 * 1000) {
+          _sendDiscoveryCount++;
+          _reportedPaths.set(fullPath, Date.now());
+          // 窓が開いている20秒の間に次の操作へ進むと、_lastButtonTextが
+          // 「次の候補者」等に変わり、どのボタンの直後の通信だったのか
+          // 分からなくなる（実データで全件そうなった）。窓を開いた時点の
+          // 文言を使う
+          reportRecordFailure('送信直後の通信（送信APIの特定用）', {
+            buttonText: _sendDiscoveryButton || _lastButtonText,
+            path: fullPath,
+          });
+          return;
+        }
+        // LinkedInのように全操作が同じパス（/talent/api/graphql）を通る媒体では、
+        // 媒体側がqueryIdを変えた瞬間に送信APIの照合が外れ、記録が静かに止まる。
+        // パスに送信らしい語が無いので、上の語句判定では報告もされない。
+        // 認識できた送信ボタンの直後に来たgraphqlは、たとえ照合が外れていても残す
+        const sendJustClicked = Date.now() - _lastRecognizedSendAt < 20 * 1000;
+        const looksLikeSend = /scout|message|offer|approach|mail|send/i.test(path)
+          || (sendJustClicked && /graphql/i.test(path));
+        const inScoutFlow = Date.now() - _lastButtonAt < 60 * 1000;
+        const alreadyReported = Date.now() - (_reportedPaths.get(fullPath) || 0) < 30 * 60 * 1000;
+        if (looksLikeSend && inScoutFlow && !alreadyReported) {
+          _reportedPaths.set(fullPath, Date.now());
+          reportRecordFailure('送信の可能性がある通信（未登録）', {
+            buttonText: _lastButtonText,
+            path: fullPath,
+          });
+        }
+      } catch (_) {}
+      return;
+    }
+
+    console.log('[Snow-we] 送信リクエストを検知');
+
+    // 送信の通信は来たのに、直前に認識できた送信ボタンが無い。
+    // ボタンの文言との照合に失敗している状態で、これが記録漏れの原因になる。
+    // 何のボタンが押されたのかを残しておけば、認識対象に加えられる
+    if (Date.now() - _lastRecognizedSendAt > 60 * 1000 && _lastButtonText) {
+      reportRecordFailure('送信ボタンを認識できていない（通信で検知）', {
+        buttonText: _lastButtonText,
+      });
+    }
+
+    // 候補者は、スカウトボタンを押した時点の pendingScout から取る。
+    // 送信が成立した時点では送信用の画面に切り替わっていて、詳細パネルから
+    // 読み直せないことがある（実機で会社名が空のまま記録された）
+    let candidateId = '';
+    let info = {};
+    let templateName = '';
+    let templateRaw = '';
+    let bodyText = '';
+    let fallbackPosition = _cachedCurrentPosition;
+    try {
+      const raw = sessionStorage.getItem('pendingScout');
+      if (raw) {
+        const p = JSON.parse(raw);
+        if (p && p.id && Date.now() - p.ts < 30 * 60 * 1000) {
+          candidateId = p.id;
+          info = p.info || {};
+          templateName = p.templateName || '';
+          templateRaw = p.templateRaw || '';
+          bodyText = p.bodyText || '';
+          fallbackPosition = p.fallbackPosition || fallbackPosition;
+        }
+      }
+    } catch (_) {}
+    sessionStorage.removeItem('pendingScout');
+
+    // 取れていなければ、その場の詳細パネルから読み直す。
+    // 以前は RDS しか見ておらず、bizreach は開始ボタンを取り逃すと
+    // 「候補者を特定できない」で記録されなかった
+    if (!candidateId) {
+      const panel = findDetailPanelForPlatform(platform);
+      if (panel) {
+        candidateId = getCandidateId(panel) || '';
+        if (!info.company) info = extractBasicInfo(panel);
+      }
+    }
+    // それでも取れなければ、送信内容から取り出せた1人の番号を使う（doda X）
+    // パネルの番号がハッシュに落ちたとき（dodax_h…）も、送信内容の番号のほうが確か
+    if (bulkHintId && (!candidateId || /^dodax_h/.test(candidateId))) candidateId = bulkHintId;
+    // 本文は送った内容そのものが通信に入っているので、そちらを優先する
+    const sentBody = extractMessageFromBody(e.detail && e.detail.body);
+    if (sentBody) bodyText = sentBody;
+
+    // 候補者を特定できないまま記録すると、全員が同じ行に潰れるより悪い
+    // （誰への送信か分からない記録が残る）。記録せず、その場で知らせる
+    if (!candidateId) {
+      reportRecordFailure('送信は検知できたが候補者を特定できない');
+      try {
+        showAutoStatus(
+          '⚠️ この送信は記録されませんでした（候補者を特定できていません）。'
+          + '管理者に、いまの画面と操作手順を伝えてください',
+          12000,
+        );
+      } catch (_) {}
+      return;
+    }
+    const sendAt = Date.now();
+    const verdict = judgeRepeatedSendRequest(candidateId, _lastSendRequest, sendAt);
+    if (verdict === 'same-event') {
+      console.log('[Snow-we] 同じ送信の通信が続けて届いたため1件として扱います:', candidateId);
+      return;
+    }
+    _lastSendRequest = { id: candidateId, at: sendAt };
+    (async () => {
+      // 直前の送信（数十秒前）と同じ候補者に見える。RDSで続けて送ると、次の候補者の画面に
+      // 切り替わる前の詳細パネルを読んでしまい、前の候補者の識別子のままになる。
+      // 以前はここで「5分以内に記録済み」として黙って捨てており、後の1通が記録されず、
+      // 失敗の記録にも何も残らなかった（10/31 たいち 14:24:38→14:24:47 など）。
+      // 送信の通信は1通につき1回なので、画面が次の候補者に変わるのを少し待って読み直し、
+      // 変わらなくても送信としては必ず記録する
+      let forceNew = false;
+      if (verdict === 'repeat') {
+        const fresh = await readChangedCandidate(platform, candidateId);
+        if (fresh) {
+          console.log('[Snow-we] 続けての送信: 画面を読み直して次の候補者を特定しました:', fresh.id);
+          candidateId = fresh.id;
+          info = fresh.info || {};
+          _lastSendRequest = { id: candidateId, at: sendAt };
+        } else {
+          forceNew = true;
+          reportRecordFailure('続けての送信で前と同じ候補者に見えた（記録はした）', { buttonText: _lastButtonText });
+        }
+      }
+      if (!templateName && templateRaw) templateName = await resolveTemplateName(templateRaw);
+      recordScoutSent(candidateId, info, templateName, bodyText, fallbackPosition, { forceNew });
+    })();
+  } catch (err) {
+    console.warn('[Snow-we] 送信リクエストの処理に失敗:', err && err.message);
+  }
+});
+
+const _recentlyRecorded = new Map();
+const RECORD_DEDUPE_MS = 5 * 60 * 1000;
+
+// 送信の通信で最後に記録しようとした候補者と時刻
+let _lastSendRequest = { id: '', at: 0 };
+// これより短い間隔で同じ候補者の送信通信が来たら、同じ送信が二重に届いたものとみなす
+const SAME_SEND_EVENT_MS = 3 * 1000;
+
+/**
+ * 送信の通信が来たとき、直前の送信と同じ候補者に見えるかを判定する。
+ *   'same-event' … 3秒以内に同じ候補者。同じ送信の通信が二重に届いたもの（記録しない）
+ *   'repeat'     … 5分以内に同じ候補者。続けて送ったのに、画面が前の候補者のまま読まれた可能性が高い
+ *   'new'        … 別の候補者、または時間が空いている
+ */
+function judgeRepeatedSendRequest(candidateId, last, now) {
+  if (!candidateId || !last || !last.id || last.id !== candidateId) return 'new';
+  const gap = now - (last.at || 0);
+  if (gap < 0 || gap >= RECORD_DEDUPE_MS) return 'new';
+  return gap < SAME_SEND_EVENT_MS ? 'same-event' : 'repeat';
+}
+
+/**
+ * 詳細パネルが前の候補者（prevId）から別の候補者に変わるのを、最大 waitMs 待って読む。
+ * 変わったら {id, info}、変わらなければ null
+ */
+async function readChangedCandidate(platform, prevId, waitMs = 3000) {
+  const until = Date.now() + waitMs;
+  while (Date.now() <= until) {
+    try {
+      const panel = findDetailPanelForPlatform(platform);
+      if (panel) {
+        const stable = await readCandidateWhenStable(panel);
+        if (stable.id && stable.id !== prevId) return { id: stable.id, info: stable.info };
+      }
+    } catch (_) {}
+    await sleep(200);
+  }
+  return null;
+}
+
+async function recordScoutSent(candidateId, info, templateName, templateRaw = '', fallbackPosition = '', opts = {}) {
+  if (!candidateId) return;
+  const now = Date.now();
+  const platform = getPlatform();
+
+  // 同一候補者の多重記録を防ぐ。実データで同じ候補者が数分以内に3〜4回記録されている
+  // ケースが確認されており、経路が複数ある：
+  // ・「確認」ボタンと「送信」ボタンの両方がこの関数に到達する（2回目はpendingScoutが
+  //   消費済みのため、送信時フォールバックで候補者情報を組み直して再度記録してしまう）
+  // ・送信がバリデーション等で失敗し、ユーザーがもう一度送信ボタンを押した場合
+  // ・background.js側のタイムアウト再送（サーバは書き込み済みだがabortで失敗扱いになる）
+  // ただし送信の通信で確かめた別の送信（opts.forceNew）は捨てない。送信の通信は1通につき1回なので
+  const lastRecordedAt = _recentlyRecorded.get(candidateId);
+  if (lastRecordedAt && now - lastRecordedAt < RECORD_DEDUPE_MS && !(opts && opts.forceNew)) {
+    console.log(`[Snow-we] 直近${Math.round((now - lastRecordedAt) / 1000)}秒前に記録済みのためスキップ:`, candidateId);
+    return;
+  }
+  _recentlyRecorded.set(candidateId, now);
+  reportDodaxNameInCompany(info.company || '');
+  reportMissingCompany(info);
+  // fallbackPosition（拡張機能で「選択中」とされていたポジション）は使わない。
+  // この値は、画面に出していない選択欄の先頭項目で、ポップアップを開くたびに
+  // 上書きされていた。実データでdoda X 40件・LinkedIn 10件の記録が、送信画面の
+  // テンプレートではなくこの値になっており、連続する行で同じ名前が並んでいた。
+  // 送信画面から読めたテンプレート名だけを使い、読めなければ空欄にする
+  const positionName = templateName || '';
+  if (!positionName) {
+    // 空欄が続くようなら、その媒体の送信画面からテンプレートを読めていない。
+    // 気づけるように残す（30分に1回まで）
+    try {
+      if (Date.now() - (window.__snowwePosReportedAt || 0) > 30 * 60 * 1000) {
+        window.__snowwePosReportedAt = Date.now();
+        reportRecordFailure('記録はできたがポジションを取れない', { buttonText: _lastButtonText });
+      }
+    } catch (_) {}
+  }
+  const industry = gicsAutoClassify(info.company || '');
+
+  // ① ローカル記録（メイン・必ず保存）
+  // RDSの一括送信等で複数候補者が短時間に連続処理される場合があるため、
+  // 該当候補者の1件だけをpatchScoutHistoryで安全に更新する
+  await patchScoutHistory(candidateId, {
+    date: now,
+    platform,
+    name: info.name || '',
+    company: info.company || '',
+    age: info.age || '',
+    univ: info.univ || '',
+    position: positionName,
+    industry,
+    gasSent: false,
+    supabaseSent: false,
+  });
+
+  // 担当者名・現在ポジション名は②③どちらのブロックでも使うため、ここで一度だけ読み込み、
+  // 両方で使い回す。以前は②③がそれぞれ独立に chrome.storage.local.get() を呼んでおり、
+  // 実機ログで「②(GAS)は正しい担当者名で記録できているのに③(Supabase)だけ担当者名が
+  // 空になる」というケースが確認された（RDSの一括送信等、短時間に大量の非同期読み込みが
+  // 走る状況で発生）。原因の特定に関わらず、同じ値を1回だけ読んで使い回せば、この種の
+  // 読み込みズレは構造的に起こりえなくなる
+  let sharedSettings = {};
+  try {
+    sharedSettings = await chrome.storage.local.get(['gasSettings', 'currentPosition', 'recruiterName']);
+  } catch (_) {}
+  let sharedGas = sharedSettings.gasSettings || {};
+  let sharedRecruiter = sharedGas.recruiter || sharedSettings.recruiterName || '';
+  const sharedCurrentPosition = sharedSettings.currentPosition || '';
+
+  // AMBIの連続送信等、chrome.storage.local.get()が短時間に大量に呼ばれる状況では、
+  // まれに担当者名が空で返ってくることが実データで確認された（GAS側は空なら書き込み
+  // 自体をスキップするため症状が出ないが、Supabase側は無条件に書き込むため、その回だけ
+  // 担当者名が空欄のまま記録されてしまっていた）。空だった場合は一度だけ読み直す
+  if (!sharedRecruiter) {
+    await new Promise(r => setTimeout(r, 80));
+    try {
+      const retrySettings = await chrome.storage.local.get(['gasSettings', 'recruiterName']);
+      const retryGas = retrySettings.gasSettings || {};
+      const retryRecruiter = retryGas.recruiter || retrySettings.recruiterName || '';
+      if (retryRecruiter) {
+        sharedGas = retryGas;
+        sharedRecruiter = retryRecruiter;
+        console.log('[Snow-we] 担当者名の読み込みが空だったため再読み込みで復元:', sharedRecruiter);
+      }
+    } catch (_) {}
+  }
+  // 再読み込みでも空だった場合は、起動時等に読めていたキャッシュ値を使う。
+  // 空欄のまま記録するとSupabase側で担当者不明の行になり、集計・照合から漏れる
+  if (!sharedRecruiter && _cachedRecruiterName) {
+    sharedRecruiter = _cachedRecruiterName;
+    console.log('[Snow-we] 担当者名を再読み込みでも取得できなかったためキャッシュ値で補完:', sharedRecruiter);
+  }
+  // それでも空 ＝ そもそも設定されていない。記録自体は残すが（消えるより良い）、
+  // 消えないバナーで知らせて、次の1件までに設定してもらう
+  if (!sharedRecruiter) showRecruiterMissingBanner();
+
+  // ② スカウト実績のスプレッドシート(GAS)への記録は廃止した。
+  // 以前はGASとSupabaseの両方に書いていたが、書き込み条件が両者で異なっていたため
+  // （GASは担当者名が空・GAS URL未設定・自動記録OFFのいずれかでスキップ、Supabaseは
+  // 無条件に記録）、片方にしか存在しない記録が常時発生し、どちらが正しいのかを
+  // 照合するだけで多大な手間がかかっていた。記録先をSupabaseの一本に統一する。
+  // なお、ポジション一覧の取得やフィードバック送信など、スカウト実績以外のGAS連携は
+  // 引き続き使用する。
+
+  // ③ Supabaseへの保存は背景のバッチキューに積むだけ（サブ・失敗してもローカル記録には影響しない）。
+  // 1件ずつ独立して送信・失敗時は自動リトライ・サーキットブレーカーの仕組みを
+  // background.js側に持たせている（詳細はbackground.jsのコメント参照）
+  ;(async () => {
+    const ageNum = parseInt((info.age || '').replace(/[歳才]/g, '')) || null;
+    // 担当者名が空のまま記録されると「担当者×日」の集計から漏れる。記録自体は必ず残すが
+    // （消えるより良い）、実データではこの状態で一括数十件が記録された事故が複数回
+    // 起きているため、画面上にも警告を出して即座に気づけるようにする
+    if (!sharedRecruiter) {
+      console.warn('[Snow-we] 担当者名を特定できないまま記録します（要確認）:', candidateId, info.company || '');
+      try {
+        showAutoStatus('⚠️ 担当者名が未設定です。設定タブで担当者名を保存してください（このままだと担当者不明で記録されます）', 8000);
+      } catch (_) {}
+    }
+    const supabasePayload = {
+      candidateId,
+      data: {
+        platform,
+        platform_candidate_id: candidateId,
+        candidate_name: info.name || '',
+        candidate_age: ageNum,
+        candidate_industry: industry,
+        company_name: info.company || '',
+        university: info.univ || '',
+        // 以前は positionName が空のとき sharedCurrentPosition（拡張機能で
+        // 「選択中」とされていたポジション）で埋めていた。この値はポップアップを
+        // 開くたびに、画面に出していない選択欄の先頭項目で上書きされており、
+        // 実際に送ったポジションとは無関係だった。実データでdoda X・LinkedInの
+        // 記録が、送信画面のテンプレートではなくこの値になっていた。
+        // 誤った値を入れるより空欄のほうがよい（シート側に正しい値がある）
+        position_name: positionName,
+        recruiter_name: sharedRecruiter,
+        sent_at: new Date(now).toISOString(),
+        scout_message: templateRaw || '',
+        // どのバージョンの拡張機能が記録したかを残す。メンバーごとに更新の
+        // タイミングが揃わず、記録漏れの原因が「古いバージョンのままだから」
+        // なのか「まだ直っていないバグがあるから」なのか切り分けられない、
+        // という問題が実際に起きたため（8/16〜8/22の大量欠落の調査で判明）
+        ext_version: (() => {
+          try { return chrome.runtime.getManifest().version; } catch (_) { return ''; }
+        })(),
+      },
+    };
+    // 送信を試みる「前」に必ずページ側へ退避しておく。
+    // 以前は送信失敗のcatchの中で退避していたが、それだとcatchに入る前に例外が出た
+    // 場合や、呼び出し元の catch(_){} に吸われた場合に、記録ごと消えてしまう。
+    // 先に退避しておけば、この先どこで失敗しても記録は残り、次回の再送で拾える。
+    // 拡張機能から切り離されてもページ自身のlocalStorageは使えるため、退避先として
+    // 適している（実データで、ある担当者の1週間分176件が失われていた）
+    stashUnsentRecord(supabasePayload);
+    try {
+      await chrome.runtime.sendMessage({ type: 'queueSupabaseScout', payload: supabasePayload });
+      // background側のキューに積めた時点で、以降の送信とリトライはそちらの責任に移る。
+      // ここで退避を消さないと、次回の再送で二重に送られてしまう
+      unstashRecord(supabasePayload.candidateId);
+    } catch (e) {
+      // 拡張機能を更新・再読み込みすると、開いたままのタブの内容は拡張機能から
+      // 切り離され、ここが必ず失敗する。退避は済んでいるので記録は失われない
+      if (e.message?.includes('Extension context invalidated')) {
+        showExtensionInvalidatedBanner();
+      } else {
+        console.warn('[Snow-we] Supabase記録キューへの追加失敗:', e.message);
+      }
+    }
+  })();
+}
+
+// ── 送信できなかった記録の退避と再送 ──────────────────────────
+// 拡張機能との接続が切れている間の記録を、ページ側のlocalStorageに貯めておき、
+// ページを読み込み直したときにまとめて送り直す
+const UNSENT_KEY = 'snowwe_unsent_scouts';
+
+function stashUnsentRecord(payload) {
+  try {
+    const list = JSON.parse(localStorage.getItem(UNSENT_KEY) || '[]');
+    // 同じ候補者が既に退避済みなら重ねない
+    if (list.some(p => p?.candidateId === payload.candidateId)) return;
+    list.push(payload);
+    // 際限なく貯まらないよう上限を設ける（古いものから捨てる）
+    while (list.length > 500) list.shift();
+    localStorage.setItem(UNSENT_KEY, JSON.stringify(list));
+    // この関数は送信を試みる「前」に必ず呼ばれる（失敗しても記録が消えないように
+    // 先に控えを取る設計）。以前は失敗時の文言を出していたため、成功していても
+    // 毎回「送信できなかった」と表示され、切り分けの邪魔になっていた
+    console.log('[Snow-we] 記録の控えを取りました（送信できなければ次回の再読み込みで再送）:', payload.candidateId);
+  } catch (e) {
+    console.warn('[Snow-we] 一時保存に失敗:', e.message);
+  }
+}
+
+// 送信できた記録を退避から取り除く。消し損ねると次回の再送で二重に送られる
+function unstashRecord(candidateId) {
+  try {
+    const list = JSON.parse(localStorage.getItem(UNSENT_KEY) || '[]');
+    const next = list.filter(p => p?.candidateId !== candidateId);
+    if (next.length === list.length) return;
+    if (next.length === 0) localStorage.removeItem(UNSENT_KEY);
+    else localStorage.setItem(UNSENT_KEY, JSON.stringify(next));
+  } catch (_) {}
+}
+
+// 複数のタイミングから呼ばれるため、同時に走ると同じ記録を二重に送ってしまう
+let _resendInFlight = false;
+
+async function resendUnsentRecords() {
+  if (_resendInFlight) return;
+  _resendInFlight = true;
+  try {
+    await _resendUnsentRecordsInner();
+  } finally {
+    _resendInFlight = false;
+  }
+}
+
+async function _resendUnsentRecordsInner() {
+  let list;
+  try {
+    list = JSON.parse(localStorage.getItem(UNSENT_KEY) || '[]');
+  } catch (_) {
+    return;
+  }
+  if (!Array.isArray(list) || list.length === 0) return;
+  if (!isExtensionAlive()) return;
+
+  console.log(`[Snow-we] 未送信の記録が${list.length}件あります。再送します`);
+  const remaining = [];
+  for (const payload of list) {
+    try {
+      await chrome.runtime.sendMessage({ type: 'queueSupabaseScout', payload });
+    } catch (_) {
+      remaining.push(payload); // まだ送れない場合は次回に持ち越す
+    }
+  }
+  try {
+    if (remaining.length === 0) localStorage.removeItem(UNSENT_KEY);
+    else localStorage.setItem(UNSENT_KEY, JSON.stringify(remaining));
+  } catch (_) {}
+  const sent = list.length - remaining.length;
+  if (sent > 0) {
+    console.log(`[Snow-we] 未送信だった記録 ${sent}件を再送しました`);
+    try { showAutoStatus(`✅ 記録できていなかった${sent}件を送信しました`, 6000); } catch (_) {}
+  }
+}
+
+// 拡張機能との接続が生きているか（切れていると記録が一切保存されない）
+function isExtensionAlive() {
+  try {
+    return !!(chrome.runtime && chrome.runtime.id);
+  } catch (_) {
+    return false;
+  }
+}
+
+// 直近90日以内にスカウト済みかを返す
+function scoutStatus(history, candidateId) {
+  if (!candidateId) return { scouted: false };
+  const record = history[candidateId];
+  if (!record) return { scouted: false };
+  const daysAgo = Math.floor((Date.now() - record.date) / (1000 * 60 * 60 * 24));
+  return { scouted: true, daysAgo, reScoutable: daysAgo >= RESCOUNT_DAYS };
+}
+
+// カードから候補者の一意IDを取得（プロフィールURL を優先）
+// 「最終ログイン日」「更新日」等の日付は、候補者が再ログイン/プロフィール更新する
+// たびに値が変わる。カードテキストのフィンガープリントにこの手の行を含めてしまうと、
+// 同一人物が別IDとして扱われ、重複記録や自動修復（candidateId紐付け）が効かなくなる
+// 原因になるため、フィンガープリント計算からは除外する
+const stripVolatileLines = lines => lines.filter(l => !/\d{4}[\/年]\d{1,2}[\/月]\d{1,2}/.test(l));
+
+function getCandidateId(cardEl) {
+  // Green: カード内にプロフィールへのリンク(<a href>)が無く、候補者をクリックすると
+  // 同じページ内でURLのクエリパラメータ(?user_id=1225710)だけが変わってモーダルが開く
+  // 構造(実機DOM調査で確認)。このためfindProfileUrlによるリンク探索は機能せず、
+  // 安定ID取得に失敗してハッシュフォールバックに落ちていた(カード表示内容が少し
+  // 変わるだけで別IDになり、重複記録・記録漏れの原因になる)。クリック直後は
+  // このURLが既に更新されているため、そこから直接読み取るのが最も安定する
+  if (getPlatform() === 'green') {
+    const userId = new URLSearchParams(location.search).get('user_id');
+    if (userId) return `green_${userId}`;
+    // user_idがまだ反映されていない場合のみハッシュにフォールバック
+  }
+
+  // LinkedIn Recruiter: 候補者ごとに /talent/profile/<ID> のリンクがある（実機で確認）。
+  //   https://www.linkedin.com/talent/profile/AEMAAGznHsUBYRf86xaAzlmHrO5bVS1nq9yF4EA?project=21
+  // カード内のリンクを先に見て、無ければ開いているURLから取る
+  if (getPlatform() === 'linkedin') {
+    const a = cardEl && cardEl.querySelector && cardEl.querySelector('a[href*="/talent/profile/"]');
+    const fromCard = a && (a.getAttribute('href') || '').match(/\/talent\/profile\/([A-Za-z0-9_-]{10,})/);
+    if (fromCard) return `linkedin_${fromCard[1]}`;
+    const fromUrl = location.pathname.match(/\/talent\/profile\/([A-Za-z0-9_-]{10,})/)
+      || location.pathname.match(/\/profile\/([A-Za-z0-9_-]{10,})/);
+    if (fromUrl) return `linkedin_${fromUrl[1]}`;
+    // 候補者1人だけを開いている画面（作成中のメッセージ、候補者の詳細）では、
+    // 渡された塊にリンクが無くても、画面のどこかに1つだけプロフィールのリンクがある。
+    // 種類の違うIDを作らないよう、画面全体で1人に絞れるときだけ使う
+    try {
+      const ids = new Set();
+      for (const a of document.querySelectorAll('a[href*="/talent/profile/"]')) {
+        const m = (a.getAttribute('href') || '').match(/\/talent\/profile\/([A-Za-z0-9_-]{10,})/);
+        if (m) ids.add(m[1]);
+      }
+      if (ids.size === 1) return `linkedin_${[...ids][0]}`;
+    } catch (_) {}
+    // パイプラインで候補者を開くと /talent/hire/<案件>/manage/<候補者> になる（実機で確認）。
+    // この画面から送ると、プロフィールのIDが画面に出ておらず候補者を特定できず、
+    // 送信そのものが記録されなかった（実データで確認）。
+    // プロフィールのIDとは別系統の番号なので、取り違えないよう接頭辞を分けておく
+    const fromHire = location.pathname.match(/\/talent\/hire\/\d+\/manage\/(\d{6,})/);
+    if (fromHire) return `linkedin_hire_${fromHire[1]}`;
+    // 識別子が取れないまま記録すると、同じ人が別人として積み上がる。
+    // ハッシュに落とさず、特定できなかったことを残す
+    console.warn('[Snow-we] LinkedIn: 候補者の識別子を取れません');
+    return '';
+  }
+
+  // AMBI: hidden input.js_sid から候補者ID取得
+  if (getPlatform() === 'ambi') {
+    const sidInput = cardEl.querySelector('input.js_sid');
+    if (sidInput?.value) return `ambi_${sidInput.value}`;
+    // フォールバック: No.XXXXXXX テキスト
+    const m = (cardEl.innerText || '').match(/No\.(\d{5,})/);
+    if (m) return `ambi_${m[1]}`;
+    // 最終フォールバック: カードテキストハッシュ（先頭5行だと共通属性の候補者同士が
+    // 衝突しやすいため10行まで広げる。RDSで発覚した同種の問題への対応と同じ）
+    const lines = stripVolatileLines((cardEl.innerText || '').split('\n').map(l => l.trim()).filter(Boolean));
+    const fp = lines.slice(0, 10).join('|');
+    if (fp.length > 10) return `ambi_h${simpleHash(fp)}`;
+    return null;
+  }
+
+  // Bizreach: cardEl が ess-resume-list-item 自身（新セレクタ）または祖先に持つ場合
+  if (getPlatform() === 'bizreach') {
+    // 詳細パネル自身に表示されている会員番号(例:「BU3258517」)を最優先で使う。
+    // 以前はURLから候補者IDを取得していたが、BizreachはSPAルーティングのため
+    // 候補者を切り替えた瞬間にURLは即座に切り替わる一方、詳細パネルの表示内容
+    // (プロフィール)が追いつくまでにわずかな時間差がある。この間にボタンを
+    // クリックすると、IDだけ新しい候補者のものになり、一緒に記録される会社名・
+    // 年齢等のプロフィール内容は表示が追いついていない前の候補者のまま、という
+    // 事故が実機で確認された(会員IDで検索すると全く無関係な候補者名になっていた)。
+    // 詳細パネル自身のテキストから会員番号を取れば、プロフィール内容の抽出と
+    // 完全に同じタイミング・同じDOM要素からの取得になるためズレが起こらない
+    let buMatch = (cardEl.innerText || '').match(/\bBU(\d{5,})\b/);
+    if (!buMatch) {
+      // 詳細パネルの検出範囲が会員番号のヘッダー行を含まないことがあるため、
+      // 祖先を数階層遡って再検索する(リスト側の内容まで拾わないよう範囲は絞る)
+      let el = cardEl.parentElement;
+      for (let i = 0; i < 4 && el && !buMatch; i++) {
+        buMatch = (el.innerText || '').match(/\bBU(\d{5,})\b/);
+        el = el.parentElement;
+      }
+    }
+    // 会員番号は「BU02708454」と0で桁埋めされているが、一覧カードの要素IDは
+    // 「resume-2708454」で0が無い。そのままだと同じ人が経路によって2つのIDで
+    // 記録されるため、先頭の0を落として一覧側の形にそろえる（実機のHTMLで確認）
+    if (buMatch) return `bizreach_resume-${buMatch[1].replace(/^0+(?=\d)/, '')}`;
+    // 直接 id を持つ場合
+    if (cardEl.id && cardEl.id.startsWith('resume-')) return `bizreach_${cardEl.id}`;
+    // 子要素の bui-drawer-trigger に id がある（実際のBizreach構造）
+    const drawer = cardEl.querySelector('bui-drawer-trigger[id^="resume-"]');
+    if (drawer?.id) return `bizreach_${drawer.id}`;
+    // 祖先を探す（念のため）
+    let el = cardEl.parentElement;
+    for (let i = 0; i < 8; i++) {
+      if (!el) break;
+      if (el.id?.startsWith('resume-')) return `bizreach_${el.id}`;
+      el = el.parentElement;
+    }
+    // フォールバック：カードテキストのフィンガープリント。URLフォールバックより先に試す
+    // （下記の理由により、URLは「今このカードの」候補者IDとして信頼できないため）
+    const fpLines = stripVolatileLines((cardEl.innerText || '').split('\n').map(l => l.trim()).filter(l => l.length > 3));
+    const fp = fpLines.slice(0, 8).join('|');
+    if (fp.length > 20) return `bizreach_fp_${simpleHash(fp)}`;
+    // 最終手段としてのみURLを使う。location.pathnameはページ全体で共有される値であり、
+    // 一括判定ループが会員番号の見つからない複数の候補者カードを順に処理する間、
+    // 直前に開いた別候補者の詳細パネルのURLが残ったままになることがある。この状態で
+    // 未処理の候補者にまでURL由来のIDを割り当てると、全員が同じIDになって「処理済み」
+    // と誤認され、判定されずにまとめてスキップされる事故が実機で確認された
+    // （フィンガープリントで個別に識別できる場合はここに到達しない）
+    const urlMatch = location.pathname.match(/\/list\/(\d+)(?:[/?#]|$)/);
+    if (urlMatch) return `bizreach_resume-${urlMatch[1]}`;
+    return null;
+  }
+
+  const text = (cardEl.innerText || '');
+
+  // doda X: 同一人物なのに取得経路によって3種類のIDになり、重複記録の原因になっていた。
+  //   ・URL経由（React fiberから組み立て）: .../member_search/detail/705981 → 先頭ゼロなし
+  //   ・カードテキスト経由: dodax_00890205 → 先頭ゼロあり
+  //   ・ハッシュ: dodax_h...
+  // 候補者番号（8桁）を単独行として取得し、URL由来の番号もゼロ埋めして同じ形に揃える。
+  if (getPlatform() === 'dodax') {
+    // 誤って絞り込みフィルター欄等を渡された場合に、候補者ごとに変わらない文字列から
+    // IDを作ってしまうと、全候補者が同一IDに潰れる（実機ログで確認）。IDを作らない
+    if (DODAX_PAGE_CHROME_MARKERS.some(mk => text.includes(mk))) {
+      console.warn('[Snow-we] getCandidateId(dodax): 候補者カードではない要素のためIDを返しません');
+      return null;
+    }
+    // 一覧カードでは会員番号が専用のクラスに入っている（実機のHTMLで確認）:
+    //   <span class="txt-ellipsis user-name-line">00898993</span>
+    // 文字列の並びから探すより確実
+    const numEl = cardEl.querySelector && cardEl.querySelector('.user-name-line');
+    const numTxt = numEl ? (numEl.textContent || '').trim() : '';
+    if (/^\d{8}$/.test(numTxt)) return `dodax_${numTxt}`;
+    const lineNum = text.match(/(?:^|\n)\s*(\d{8})\s*(?=\n|$)/);
+    if (lineNum) return `dodax_${lineNum[1]}`;
+    const dodaxUrl = findProfileUrl(cardEl);
+    const urlNum = dodaxUrl && dodaxUrl.match(/\/member_search\/detail\/(\d+)/);
+    if (urlNum) return `dodax_${urlNum[1].padStart(8, '0')}`;
+    // 番号が単独行でなく「会員番号：00890205」のようにラベルと同じ行にある画面や、
+    // 氏名・会社名と連結されている画面がある（会社名への会員番号混入と同じ原因）。
+    // 以前はここで汎用の処理に落ち、6〜10桁の別の数字やハッシュになっていた（13/303件）
+    const labeled = text.match(/(?:会員番号|会員ID|候補者番号|求職者番号|No\.?)\s*[：:]?\s*(\d{8})(?!\d)/);
+    if (labeled) return `dodax_${labeled[1]}`;
+    const dataNum = (() => {
+      try {
+        for (const el of [cardEl, ...cardEl.querySelectorAll('[data-member-id],[data-candidate-id],[data-id]')]) {
+          const v = el.getAttribute && (el.getAttribute('data-member-id') || el.getAttribute('data-candidate-id') || el.getAttribute('data-id'));
+          if (v && /^\d{5,8}$/.test(v)) return v.padStart(8, '0');
+        }
+      } catch (_) {}
+      return '';
+    })();
+    if (dataNum) return `dodax_${dataNum}`;
+    // スカウト送信画面では、会員番号は左上の見出しと「宛先」欄にあり、
+    // 候補者情報を読む詳細パネルの中には無い（実機で確認。ハッシュIDに落ちていた）。
+    // ハッシュIDは表示内容が変わると別人扱いになり、突き合わせもできない。
+    // この画面に出ている候補者は1人だけなので、画面全体から拾っても取り違えない
+    if (isDodaxSingleCandidatePage()) {
+      const body = (document.body.innerText || '');
+      const atesaki = body.match(/宛先[\s　]*[：:]?[\s　]*\n?[\s　]*(\d{8})(?!\d)/);
+      if (atesaki) return `dodax_${atesaki[1]}`;
+      const nums = [...new Set((body.match(/(?:^|\n)[\s　]*\d{8}[\s　]*(?=\n|$)/g) || []).map(s => s.trim()))];
+      if (nums.length === 1) return `dodax_${nums[0]}`;
+    }
+    // ハッシュに落ちる前に、どんな形だったかを残す（値は残さない）
+    try {
+      if (Date.now() - (window.__snowweDodaxIdReportedAt || 0) < 30 * 60 * 1000) throw 0;
+      window.__snowweDodaxIdReportedAt = Date.now();
+      reportRecordFailure('doda Xの候補者番号を取れない', {
+        buttonText: (text.match(/\d{5,10}/g) || []).map(x => `${x.length}桁`).join(',').slice(0, 100),
+      });
+    } catch (_) {}
+  }
+
+  // RDSは候補者ごとの固定URLを持たないため、URLをIDに使うと事故る。実データでは
+  // 「https://ats.hrtech.rikunabi.com/client/setting/chatTemplate」（チャットテンプレートの
+  // 設定ページ）が候補者IDとして21件記録され、別人の候補者が全員この1つのIDに
+  // 潰れていた。RDSはカード上の会員ID・候補者番号の方が確実なので、URLより先に試す
+  const isRds = getPlatform() === 'rds';
+  if (!isRds) {
+    const url = findProfileUrl(cardEl);
+    if (url) return url.replace(/[?#].*$/, ''); // クエリ・ハッシュを除去
+  }
+
+  // RDS等：「会員ID：」ラベルの直後にある値は候補者ごとに固有かつ不変のIDのため、
+  // ハッシュフィンガープリント（タグ・コメント追加等でカード表示テキストが変わると
+  // 値が変わってしまい、同一人物が別IDとして重複記録される原因になる）より優先して使う
+  const memberIdMatch = text.match(/会員ID[：:]\s*\n?\s*([A-Za-z0-9]{10,})/);
+  if (memberIdMatch) return `${getPlatform()}_mid_${memberIdMatch[1]}`;
+
+  // フォールバック1：カードテキストから候補者番号を抽出
+  const m = text.match(/No\.(\d{5,})|^(\d{6,})\s/m) ||
+            text.match(/\b([0-9]{6,10})\b/);
+  if (m) return `${getPlatform()}_${m[1] || m[2]}`;
+
+  // フォールバック2：年齢+会社名+経歴先頭のハッシュ（RDS等URL取得不可の場合）
+  // RDSのカードは「最終ログイン日・年齢・年収・経験社数」等の共通情報が先頭に来やすく、
+  // 会社名・大学名が出てくる前の先頭5行だけだと同じ属性の別候補者が同一ハッシュに衝突し、
+  // 一方が「処理済み」として無言でスキップされる（バッジが一切つかない）原因になっていた。
+  // 会社名等の識別性の高い情報を含むよう先頭10行まで広げて衝突を減らす。
+  // RDSはここまでで会員ID・候補者番号が取れなかった場合に限り、最後の手段としてURLを試す
+  if (isRds) {
+    const rdsUrl = findProfileUrl(cardEl);
+    if (rdsUrl) return rdsUrl.replace(/[?#].*$/, '');
+  }
+
+  const lines = stripVolatileLines(text.split('\n').map(l => l.trim()).filter(Boolean));
+  const fingerprint = lines.slice(0, 10).join('|');
+  if (fingerprint.length > 10) {
+    // ハッシュフォールバックは「会員ID等の安定したIDが取れなかった」ケースであり、
+    // 表示内容が変わると同一人物でも別IDになりうる。頻度を把握できるよう記録しておく
+    console.warn(`[Snow-we] candidateId: 安定ID取得失敗、ハッシュにフォールバック platform=${getPlatform()}`);
+    return `${getPlatform()}_h${simpleHash(fingerprint)}`;
+  }
+
+  return null;
+}
+
+// 会社名の候補として採用してはいけない行を判定する。
+// 送信フォーム側のテキストを拾ってしまうと自社の署名文（「株式会社Snow-we.Inc代表の
+// 桝井と申します。」等）が、候補者カードの定型行を拾うと「男性」「転職回数：転職経験なし」
+// 等が、それぞれ会社名として記録される事故が実データで多数確認されたため、
+// 媒体ごとの抽出ロジックとは別に共通の除外条件として持つ
+// ポジションの表示名は「ファーム名｜ポジション名」形式。テンプレート名や
+// スカウトメール本文に現れるのはポジション名だけなので、照合するときは
+// ファーム名の部分を落として比べる（記録するのは元の表示名のまま）
+function stripFirmPrefix(s) {
+  return (s || '').replace(/^[^｜]{1,30}｜/, '').trim();
+}
+
+// 候補者の情報を、詳細パネルの再描画が落ち着いてから読み取る。
+// 同じ内容が2回続けて読めた時点でその値を採用する。読み取るたびに内容が変わる
+// 間は再描画の途中なので、確定するまで待つ（最大で約1秒）。
+// 読み取り対象の要素はReactに差し替えられることがあるため、切り離されていたら
+// 媒体ごとの詳細パネルを取り直す
+async function readCandidateWhenStable(card) {
+  const platform = getPlatform();
+  const refind = () => {
+    if (platform === 'rds') return findRDSDetailPanel();
+    if (platform === 'dodax') return findDodaxProfilePane() || findDodaxDetailPanel();
+    if (platform === 'bizreach') return findBizreachDetailPanel();
+    if (platform === 'ambi') return findAMBIDetailPanel();
+    return null;
+  };
+  const started = Date.now();
+  let prevKey = null;
+  let last = { id: '', info: {} };
+  for (let i = 0; i < 8; i++) {
+    const el = (card && document.contains(card)) ? card : (refind() || card);
+    if (!el) break;
+    const id = getCandidateId(el);
+    const info = extractBasicInfo(el);
+    const key = `${id}|${info.company || ''}|${info.univ || ''}|${info.age || ''}`;
+    last = { id, info };
+    if (key === prevKey) break;   // 2回続けて同じ内容 → 再描画は終わっている
+    prevKey = key;
+    await sleep(120);
+  }
+  return { ...last, waitedMs: Date.now() - started };
+}
+
+// 会社名の欄に入ってはいけない値かどうか。学歴・部署役職・画面のラベルを弾く。
+// 法人格（株式会社・大学法人等）が付いている場合は、学校法人や「〇〇大学」を名乗る
+// 企業もあるため弾かない
+function isNotCompanyName(s) {
+  const v = (s || '').trim();
+  if (!v) return true;
+  // 画面の箇条書き・見出し・テンプレート名が会社名として記録されていた実例への対処。
+  // 実データで確認したもの：
+  //   「・ERP・グループ共通システムの導入・刷新」（募集要項の箇条書き）
+  //   「2026」（年）「すべて展開」（画面のボタン）「DTC)保険コンサル」（テンプレート名）
+  // 会社名キーワードの判定より先に落とす（箇条書きの中に「株式会社」が
+  // 入っていても、それは会社名ではなく文章の一部のため）
+  if (/^[・※■◆●▼]/.test(v)) return true;
+  if (/^\d{1,4}$/.test(v)) return true;
+  if (/^[A-Z]{2,4}[)）]/.test(v)) return true;
+  if (/^(すべて展開|もっと見る|続きを読む|詳細|一覧)$/.test(v)) return true;
+  // 法人格だけが残った断片は会社名として使えない。実データでLinkedInから
+  // 「K.K.」がそのまま記録されていた（社名の前半を落としている）
+  if (/^(?:K\.?K\.?|G\.?K\.?|Inc\.?|Co\.?|Corp\.?|Ltd\.?|LLC|LLP|GmbH|PLC|Pte\.?|Pty\.?|S\.A\.|B\.V\.)$/i
+      .test(v.replace(/[,，、.]+$/, '').trim() + (/[.]$/.test(v) ? '.' : ''))) return true;
+  if (/(株式会社|有限会社|合同会社|㈱|法人|Inc|Co\.|Corp|Ltd|LLC|銀行|省|庁)/i.test(v)) return false;
+  if (/(大学|大学院|学部|学科|高等専門学校|専門学校|高校)/.test(v)) return true;
+  if (/(部長|課長|係長|次長|室長|本部長|グループ長|リーダー|マネージャー|代理|担当)\s*$/.test(v)) return true;
+  if (/(推進部|企画部|営業部|開発部|管理部|事業部|統括部|本部|支店|部署)/.test(v) && !/会社/.test(v)) return true;
+  if (/^(基本情報|希望条件|職歴|職務経歴|経歴|現職|前職|プロフィール|在籍企業)$/.test(v)) return true;
+  if (v.length <= 1) return true;   // 「物」のような壊れた1文字
+  return false;
+}
+
+function isMessageLine(line) {
+  const l = (line || '').trim();
+  if (!l) return true;
+  // 全角で書かれていると半角前提の判定をすり抜ける。実データで
+  // 「株式会社Ｓｎｏｗ‐ｗｅ．Ｉｎｃ」が自社名の判定に引っかからず、
+  // 候補者の会社名として記録されていた。比較用に半角へ揃えておく
+  const flat = (() => {
+    try { return l.normalize('NFKC'); } catch (_) { return l; }
+  })();
+  // スカウトメール本文・挨拶文（自社の署名がこの経路で混入する）
+  if (/と申します|拝見し|ご経歴|ご連絡|お世話になり|よろしくお願い|いたします|ください|ませんか/.test(flat)) return true;
+  // 句点を含む値は文章であって会社名ではない。上の語のどれにも当たらない
+  // 言い回しが実データで会社名として記録されていた
+  // （「セイコーエプソン株式会社の杉山達彦です。」）
+  if (flat.includes('。')) return true;
+  // 自社名。候補者の勤務先としてはありえず、混入経路はスカウト文面の署名しかない
+  // （実データで「株式会社Snow-we.Inc」が候補者の会社名として記録されていた）
+  if (/snow[\-‐–—]?we/i.test(flat)) return true;
+  // 候補者カードの定型行（会社名ではありえない）
+  if (/^(男性|女性|非公開|現職|前職)$/.test(l)) return true;
+  if (/^転職回数|^最終ログイン|^職務経歴書|以内のスカウト|^スカウト送信済/.test(l)) return true;
+  return false;
+}
+
+// カードから基本情報を抽出（履歴保存用）
+// LinkedIn の職歴一覧から、いまの勤務先を読む。同じ会社で役職が複数ある人は
+// 会社ごとにまとめて表示され、会社名は data-test-grouped-position-entity-company-name
+// に入る。まとめていない職歴は会社のページへのリンクで会社名を出す。
+// 並びは新しい順だが、期間に「現在」を含むものを優先する（副業・兼務が先に来ることがある）
+function readLinkedinCurrentCompany(root) {
+  try {
+    const list = root && root.querySelector('.experience-card ul');
+    if (!list) return '';
+    const entries = [...list.children];
+    const isCurrent = li => /(現在|Present)/i.test(li.innerText || li.textContent || '');
+    const ordered = entries.filter(isCurrent).concat(entries.filter(li => !isCurrent(li)));
+    for (const li of ordered) {
+      const g = li.querySelector('[data-test-grouped-position-entity-company-name]');
+      const gv = g ? g.textContent.trim() : '';
+      if (gv) return gv;
+      const link = [...li.querySelectorAll('a[href*="/company/"]')]
+        .map(a => (a.textContent || '').replace(/\s+/g, ' ').trim()).find(Boolean);
+      if (link) return link;
+    }
+  } catch (_) {}
+  return '';
+}
+
+// doda X で、画面に候補者が1人だけ出ているページ（スカウト送信画面・レジュメ画面）。
+// これらの画面では、会員番号と年齢が読み取り元のパネルの外（見出し）にしか無いため、画面全体から読む
+function isDodaxSingleCandidatePage(pathname) {
+  return /\/scout\/sent|\/member\/resume\//.test(pathname || location.pathname);
+}
+
+function extractBasicInfo(cardEl) {
+  const text = (cardEl.innerText || '');
+  let ageMatch = text.match(/(\d{2,3})歳/);
+  // AMBI: 送信スライドパネルのプロフィール本文(.leftCell)には年齢が含まれず、
+  // 年齢はその外側のヘッダー部分にしかない。カード側で見つからなければ
+  // スライドパネル全体からも探す（送信時点の詳細パネル復元フォールバック用）
+  if (!ageMatch && getPlatform() === 'ambi') {
+    const slide = document.querySelector('.slide_desc_scout');
+    if (slide) ageMatch = (slide.innerText || '').match(/(\d{2,3})歳/);
+  }
+  // doda-Xのスカウト送信画面では、候補者の年齢は左上の見出しにしかない。
+  // 読み取り元の詳細パネルには年齢の欄が無く、代わりに職務要約・職務経歴の
+  // 文章が長く入っている。そこに出てくる年齢（「32歳で転職し」等）を
+  // 最初の「◯歳」として拾ってしまい、実機で画面に59歳と出ている候補者を
+  // 32歳と読み取っていた。
+  // 見出しは「会員番号 → 年齢」の並びなので、8桁の会員番号の直後にある
+  // ものを年齢とする。パネル側で何か見つかっていても、こちらを優先する
+  // （パネル側で見つかるのは文章中の年齢で、候補者の年齢ではないため）
+  // レジュメ画面（/member/resume/）も同じで、読み取り元のパネルに年齢も会員番号も無い。
+  // 1.90.0 で doda X の年齢が空になった4件は、すべてこの画面からの送信だった（11/9）
+  if (getPlatform() === 'dodax' && isDodaxSingleCandidatePage()) {
+    const bodyText = document.body.innerText || '';
+    const header = bodyText.match(/\b\d{8}\b[\s\S]{0,60}?(\d{2,3})歳/);
+    if (header) ageMatch = header;
+    else if (!ageMatch) {
+      // 見出しに会員番号が無い形でも、「34歳」だけの行が1つなら、それが候補者の年齢
+      const only = [...new Set((bodyText.match(/(?:^|\n)[\s　]*\d{2,3}歳[\s　]*(?=\n|$)/g) || []).map(x => x.trim()))];
+      if (only.length === 1) ageMatch = only[0].match(/(\d{2,3})歳/);
+    }
+  }
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+
+  // doda X の候補者検索結果の一覧カードは、項目ごとに専用のクラスが付いている
+  // （実機のHTMLで確認）:
+  //   <span class="company-name">日本アイ・ビー・エム株式会社</span>
+  //   <ul class="pipe-line title-box">
+  //     <li><span class="user-name-line">00898993</span></li><li>59歳</li>…
+  //   <dt>学歴</dt><dd><p>大学卒 <span>千葉大学</span> <span>工学部合成科学科</span></p></dd>
+  // 文字列の並びから推測する必要がない。一括送信はこのカードから控えるため、
+  // ここが正確であることが doda X の記録の質を決める
+  let dodaxCard = null;
+  if (getPlatform() === 'dodax' && cardEl.querySelector) {
+    const numEl = cardEl.querySelector('.user-name-line');
+    if (numEl && /^\d{8}$/.test((numEl.textContent || '').trim())) {
+      const cEl = cardEl.querySelector('.company-name');
+      const ageTxt = Array.from(cardEl.querySelectorAll('ul.title-box li'))
+        .map(li => (li.textContent || '').trim())
+        .find(t => /^\d{2,3}歳$/.test(t)) || '';
+      let u = '';
+      for (const dt of cardEl.querySelectorAll('dt')) {
+        if ((dt.textContent || '').trim() !== '学歴') continue;
+        // 「大学卒  千葉大学  工学部合成科学科」。学校名は最初のspan
+        const sp = dt.nextElementSibling && dt.nextElementSibling.querySelector('span');
+        if (sp) u = (sp.textContent || '').trim();
+        break;
+      }
+      dodaxCard = {
+        company: cEl ? (cEl.textContent || '').trim() : '',
+        age: ageTxt,
+        univ: u,
+      };
+    }
+  }
+
+  // ビズリーチも、一覧カード・詳細パネルとも項目ごとに属性が付いている
+  // （実機のHTMLで確認）:
+  //   一覧カード ess-resume-list-item
+  //     <li data-age> 41歳 </li>
+  //     <div data-company-name><h2> 三菱商事株式会社 </h2>…</div>
+  //     <p data-education><span class="item-label">学歴：</span>大学院卒（修士） / ブリストル大学 </p>
+  //   詳細パネル ess-resume-pane
+  //     .resume-pane-header-top <li data-age> 41歳 </li>
+  //     .company-list の最初の li の .company-name（現職）
+  //     最初の .education-name（一覧カードの学歴と同じ学校）
+  // 一覧カードの <p data-position-name> は候補者自身の部署なので使わない
+  // （こちらが送るポジションとは無関係）
+  let bizreachCard = null;
+  // 一覧全体のような、複数の候補者を含む要素を渡されたときは使わない
+  // （最初の候補者の値を拾ってしまうため）
+  if (getPlatform() === 'bizreach' && cardEl.querySelector
+      && !cardEl.querySelector('ess-resume-list-item')) {
+    const txt = el => (el ? (el.textContent || '').replace(/\s+/g, ' ').trim() : '');
+    const ageEl = cardEl.querySelector('.resume-pane-header-top [data-age]')
+      || cardEl.querySelector('[data-age]');
+    const ageTxt = (txt(ageEl).match(/^(\d{2,3})歳$/) || [])[0] || '';
+    let comp = txt(cardEl.querySelector('[data-company-name] h2'));
+    if (!comp) {
+      const ce = cardEl.querySelector('.company-list > li .company-name');
+      comp = txt(ce && (ce.querySelector('a span') || ce));
+    }
+    let u = '';
+    const eduEl = cardEl.querySelector('[data-education]');
+    if (eduEl) {
+      // 「学歴：大学院卒（修士） / ブリストル大学」。学校名は「 / 」の後ろ
+      const parts = txt(eduEl).replace(/^学歴[：:]\s*/, '').split(/\s*\/\s*/);
+      if (parts.length >= 2) u = parts.slice(1).join(' / ').trim();
+    }
+    if (!u) u = txt(cardEl.querySelector('.education-name'));
+    if (ageTxt || comp || u) bizreachCard = { company: comp, age: ageTxt, univ: u };
+  }
+
+  // 大学名を抽出（学歴セクション優先）
+  let univ = '';
+  // 「4年制大学」「国公立大学」等、応募資格・学歴要件としての一般名詞であり
+  // 実際の大学名ではないものを除外する（実在の大学名は固有名詞を含むため、
+  // 「年制」「公立」「私立」等の一般語のみで構成されるものはここで弾く）
+  // 「学歴：大学卒 / 広島国際大学」のような文字列では、正規表現のバックトラックにより
+  // 本来拾うべき「広島国際大学」より先に「学歴：大学」（「歴：大学」の部分が偶然
+  // "(?:大学院|大学)"にマッチしてしまう）が誤って抽出されることが実機で確認された。
+  // 実在の大学名に「学歴」という文字列が含まれることはないため、これを含む候補は除外する
+  const isGenericUnivPhrase = s => /^(?:[0-9０-９]{1,2}|[一二三四五六七八九十]{1,2})年制(?:大学院|大学)?$/.test(s)
+    || /^(?:国公立|国立|公立|私立|有名|難関|一般)(?:大学院|大学)$/.test(s)
+    || s.includes('学歴')
+    // 学校名ではなく、大学に言及しただけの文をそのまま拾っていた。
+    // 実データで「学生時代にはイギリスの大学」が大学名として記録されていた
+    || /(学生時代|時代に|留学|卒業後|在学中|その後|海外の|国内の|などの|といった|における)/.test(s)
+    || /^(?:の|は|に|で|を|と|も|や)/.test(s);
+  // 海外の大学は「大学」の字を含まないため、日本語の規則では一切拾えず、
+  // 学歴が画面に出ていても空欄になっていた（実機で「Northwestern University」
+  // 「Santa Barbara City College」を確認）。会社名を誤って拾わないよう、
+  // 学校であることが語尾から確実に言えるものだけに限る
+  const extractEnglishUniv = (t) => {
+    const m = t.match(/\bUniversity of [A-Z][A-Za-z.&'-]+(?:\s+[A-Z][A-Za-z.&'-]+)?/)
+      || t.match(/\b[A-Z][A-Za-z.&'-]+(?:\s+[A-Z][A-Za-z.&'-]+){0,3}\s+(?:University|College|Polytechnic|Institute of Technology)\b/);
+    return m ? m[0].trim() : '';
+  };
+  const extractUnivFromText = (t) => {
+    // 「学歴」「最終学歴」セクション以降から優先的に抽出
+    const eduIdx = t.search(/学歴|最終学歴/);
+    if (eduIdx >= 0) {
+      const eduSection = t.substring(eduIdx, eduIdx + 300);
+      const m = (eduSection.match(/([^\s\n　]{2,20}(?:大学院|大学校|大学|高専|専門学校))/g) || [])
+        .map(cleanUnivName).find(s => !isGenericUnivPhrase(s));
+      if (m) return m;
+      const en = extractEnglishUniv(eduSection);
+      if (en) return en;
+      // 高校。シートには書かれているのに空欄で記録されていた（実データで確認）。
+      // 「高校」は職務経歴の文章にも出てくるため、学歴欄の中に限る
+      const other = (eduSection.match(/([^\s\n　]{2,20}(?:高等学校|高校))/g) || [])
+        .map(cleanUnivName).find(s => !isGenericUnivPhrase(s));
+      if (other) return other;
+      // RDSは「種別 学校名」の形で、専門学校は学校名の側に「専門学校」が付かない
+      // （「専門学校 名古屋スクール・オブ・ビジネス」）。種別を付けて残す
+      const labeled = eduSection.match(/(?:^|\n)\s*(専門学校|高等学校|高校|短期大学|専門職短期大学|その他)[ 　]+([^\n]{2,30})/);
+      if (labeled) {
+        const name = labeled[2].trim();
+        return /(大学院|大学|高専|専門学校|高等学校|高校)/.test(name) ? cleanUnivName(name) : `${labeled[1]} ${name}`;
+      }
+    }
+    // 学歴セクションがない場合は全体から抽出（会社名候補・応募資格の一般語を除外）
+    const m = t.match(/([^\s\n　]{2,20}(?:大学院|大学|高専|専門学校))/g) || [];
+    const companyWords = /株式会社|合同会社|有限会社|法人|グループ|ホールディングス/;
+    const candidate = m
+      .filter(s => !companyWords.test(s))
+      .map(cleanUnivName)
+      .find(s => !isGenericUnivPhrase(s));
+    return candidate || extractEnglishUniv(t);
+  };
+  univ = extractUnivFromText(text);
+  // RDS/AMBI/Greenはカードに大学名が出ないため、詳細パネルからも取得を試みる
+  if (!univ) {
+    const platform = getPlatform();
+    let panel = null;
+    if (platform === 'rds') panel = findRDSDetailPanel();
+    else if (platform === 'dodax') panel = findDodaxDetailPanel();
+    else if (platform === 'green') panel = findGreenDetailPanel();
+    else panel = findAMBIDetailPanel();
+    if (panel) {
+      univ = extractUnivFromText(panel.innerText || '');
+    }
+  }
+  // 学校名の体をなしていない値は残さない。実データで「物」という1文字が
+  // 大学名として記録されていた（誤った値を残すより空欄の方が後から補いやすい）
+  if (univ && !/(大学院|大学|高専|高等専門学校|専門学校|高等学校|高校|学院|カレッジ|College|University)/i.test(univ)) {
+    console.warn('[Snow-we] 大学名として不適切な値のため空欄にします:', univ);
+    univ = '';
+  }
+
+  // 会社名を抽出
+  let company = '';
+  if (getPlatform() === 'ambi') {
+    // 詳細パネル(.leftCell、「在籍企業」ラベルの次の行が会社名)は、リストカード
+    // (「業界 / 部署」行の直前が会社名)と全く違う構造をしている。送信時点の詳細
+    // パネルから候補者情報を復元するフォールバック経由だとリストカードではなく
+    // こちらの構造で渡ってくるため、性別や職歴等の無関係な行を会社名として誤って
+    // 拾ってしまっていた（実データで確認）。このラベルがあれば最優先で使う
+    // ラベルと値が同一行に出る場合（「在籍企業：株式会社X」等）があり、完全一致だと
+    // 必ず取りこぼして下のフォールバックに落ちるため、前方一致で判定して同一行の値も拾う
+    const companyLabelIdx = lines.findIndex(l => l.startsWith('在籍企業'));
+    if (companyLabelIdx >= 0) {
+      const sameLineValue = lines[companyLabelIdx].replace(/^在籍企業[^\S\n]*[：:]?[^\S\n]*/, '').trim();
+      if (sameLineValue) company = sameLineValue;
+      else if (companyLabelIdx + 1 < lines.length) company = lines[companyLabelIdx + 1];
+    }
+    // AMBIカード: 「業界 / 部署」行の直前が会社名
+    if (!company) {
+      const industryIdx = lines.slice().reverse().findIndex(l => l.includes(' / '));
+      if (industryIdx >= 0) {
+        const realIdx = lines.length - 1 - industryIdx;
+        // 直前の行を無条件に採用していたため、そこが性別欄や転職回数欄だと
+        // 「男性」「転職回数：転職経験なし」がそのまま会社名になっていた（実データで確認）
+        if (realIdx > 0 && !isMessageLine(lines[realIdx - 1])) company = lines[realIdx - 1];
+      }
+    }
+    // 「バックエンドエンジニア / 4年以上」「一般事務・営業事務 / 3年以上」のように
+    // 「A / B」形式の行が複数続く場合、その直前もまた「A / B」形式の行であり、
+    // 会社名ではない値が採用されていた（実データで確認）。会社名にこの形式が
+    // 使われることはないため、採用せず後続のフォールバックに任せる
+    if (company && / \/ /.test(company)) {
+      company = '';
+    }
+    // フォールバック: 株式会社等を含む行
+    if (!company) {
+      company = lines.find(l => /株式会社|合同会社|有限会社|LLC|Inc\.|Co\.,/.test(l)) || '';
+    }
+  } else if (getPlatform() === 'rds') {
+    const idx = lines.findIndex(l => l === '現職' || l === '前職');
+    const companyRe = /株式会社|合同会社|有限会社|LLC|Inc\.|Co\.,|ホールディングス|グループ|銀行|証券|保険|大学|病院/;
+    // companyRe は「◯◯大学病院」等の会社名も拾えるよう「大学」「病院」を含むが、
+    // 候補者自身の学歴欄（「◯◯大学院 修了」等）も同じキーワードに誤ってヒットし
+    // 会社名として拾われてしまう不具合が doda-X 側で実際に発生したため、同じ形の
+    // 危険箇所であるRDS側にも予防的に卒業・修了行の除外を入れる
+    // 「東京大学大学院（学部なし）人文社会系研究科西洋史学専攻」のように、卒業・修了等の
+    // 語を含まない学歴表記（研究科・専攻名）も会社名として誤って拾われる不具合が実データで
+    // 確認されたため、これらの語を含む行も学歴行として除外する
+    const isEduLine = l => /卒業|修了|在学|入学|研究科|専攻/.test(l);
+    if (idx >= 0) {
+      // 現職/前職の前後5行から会社名を探す。「会社名／職種」形式の行（／を含む）は
+      // 職種名だけの単独行より確実に会社名を含むため優先する。優先度を分けずに
+      // 単純な最近傍を取ると、職種名だけの行（例:「証券法人営業」）と本来の
+      // 「みずほ証券株式会社／証券法人営業」行が同じ距離にある場合、キーワード一致の
+      // 判定順で職種名だけの行が先に採用されてしまう不具合があった
+      let bestSlashLine = '', bestSlashDist = Infinity;
+      let bestPlainLine = '', bestPlainDist = Infinity;
+      for (let i = Math.max(0, idx - 5); i < Math.min(lines.length, idx + 5); i++) {
+        if (i === idx) continue;
+        const line = lines[i];
+        if (!line || line.length < 2) continue;
+        if (isEduLine(line) || isMessageLine(line)) continue;
+        const dist = Math.abs(i - idx);
+        if (line.includes('／') && line.length > 4) {
+          if (dist < bestSlashDist) { bestSlashDist = dist; bestSlashLine = line; }
+        } else if (companyRe.test(line)) {
+          if (dist < bestPlainDist) { bestPlainDist = dist; bestPlainLine = line; }
+        }
+      }
+      const bestLine = bestSlashLine || bestPlainLine;
+      if (bestLine) company = bestLine.split(/[／/]/)[0].trim();
+    }
+    if (!company) {
+      // フォールバック：ページ全体で会社名キーワードを含む行。
+      // このフォールバックは検索範囲がパネル全体に及ぶため、送信フォーム側のスカウト
+      // 本文（自社の署名文）が最初にヒットしてしまう事故が実データで多数確認された
+      company = lines.find(l => !isEduLine(l) && !isMessageLine(l) && companyRe.test(l))?.split(/[／/]/)[0].trim() || '';
+    }
+  } else if (getPlatform() === 'dodax') {
+    // 送信画面のモーダルには「在籍企業」というラベルがあり、その下が
+    //   公益社団法人SVリーグ        ← 会社名
+    //   経営基盤本部広報グループ…    ← 部署名
+    //   共同ピーアール株式会社       ← 1つ前の勤務先
+    // という並びになる（実機で確認）。近さだけで探すと部署名を拾い、
+    // 会社名として不適切と判定されて空欄になっていた。ラベルの直後を最優先する
+    const zaisekiIdx = lines.findIndex(l => l === '在籍企業' || l === '在籍企業名');
+    if (zaisekiIdx >= 0) {
+      for (let k = zaisekiIdx + 1; k < Math.min(lines.length, zaisekiIdx + 4); k++) {
+        const v = lines[k].split(/[／/]/)[0].trim();
+        if (v && !isNotCompanyName(v) && !isMessageLine(v)) { company = v; break; }
+      }
+    }
+    // スカウト送信画面の詳細パネルでは、ラベルと値が同じ行にまとまって出る（実機で確認）:
+    //   在籍企業 enechain   リスク管理 2024年11月 ～ 在職中  学歴 東京大学大学院 電気 …
+    // ラベルの完全一致では見つからず、「enechain」のように会社名キーワードを
+    // 含まない社名だと以降の規則にも掛からないため、会社名が空欄になっていた
+    if (!company) {
+      const inline = lines.find(l => /^在籍企業(?:名)?[\s　]/.test(l));
+      if (inline) {
+        let after = inline.replace(/^在籍企業(?:名)?[\s　]*[：:]?[\s　]*/, '');
+        // 同じ行に次の項目まで入っているため、項目名・在籍期間・空白2つ以上で切る
+        after = after.split(/学歴|職務要約|スキル|直近の職務経歴|経験職種|経験業種|マネジメント経験|言語/)[0];
+        after = after.split(/[\s　]{2,}/)[0];
+        after = after.split(/[\s　]*\d{4}年/)[0];
+        const v = after.split(/[／/]/)[0].trim();
+        if (v && !isNotCompanyName(v) && !isMessageLine(v)) company = v;
+      }
+    }
+
+    // doda-X: 「現職」「在籍」の近くか、会社名キーワードを含む行を優先
+    const companyRe2 = /株式会社|合同会社|有限会社|LLC|Inc\.|Co\.,|ホールディングス|グループ|銀行|証券|保険|大学|病院/;
+    // companyRe2は「◯◯大学病院」のような会社名も拾えるよう「大学」「病院」を含むが、
+    // 候補者自身の学歴欄（「◯◯大学院 修了」「◯◯大学 卒業」等）も同じキーワードに
+    // 誤ってヒットし、会社名として拾われてしまう不具合があった（実際に発生を確認）。
+    // 卒業・修了等の学歴特有の語を含む行は会社名候補から除外する
+    // 「東京大学大学院（学部なし）人文社会系研究科西洋史学専攻」のように、卒業・修了等の
+    // 語を含まない学歴表記（研究科・専攻名）も会社名として誤って拾われる不具合が実データで
+    // 確認されたため、これらの語を含む行も学歴行として除外する
+    const isEduLine = l => /卒業|修了|在学|入学|研究科|専攻/.test(l);
+    const idx2 = company ? -1 : lines.findIndex(l => l === '現職' || l.includes('在籍'));
+    if (idx2 >= 0) {
+      for (let i = Math.max(0, idx2 - 3); i < Math.min(lines.length, idx2 + 3); i++) {
+        if (i === idx2) continue;
+        if (isEduLine(lines[i])) continue;
+        if (companyRe2.test(lines[i]) || (lines[i].includes('／') && lines[i].length > 4)) {
+          company = lines[i].split(/[／/]/)[0].trim(); break;
+        }
+      }
+    }
+    if (!company) company = lines.find(l => !isEduLine(l) && companyRe2.test(l))?.split(/[／/]/)[0].trim() || '';
+    // 会社名に「株式会社」等の判定キーワードを含まない場合（例:「JFEエンジニアリング」）は
+    // 上のキーワード一致方式では見つからない（実際に発生を確認）。doda-Xのカードは
+    // 「職務経歴書 メッセージ 進捗状況」という固定ラベル行の直後に必ず「会社名 部署名」の
+    // 行が続く構造になっているため、それを直接使う（会社名と部署名の間の最初の空白で区切る）
+    if (!company) {
+      const toolbarIdx = lines.findIndex(l => l === '職務経歴書 メッセージ 進捗状況');
+      const nextLine = toolbarIdx >= 0 ? lines[toolbarIdx + 1] : '';
+      if (nextLine && !isEduLine(nextLine)) {
+        const spaceIdx = nextLine.search(/[ 　]/);
+        company = (spaceIdx > 0 ? nextLine.substring(0, spaceIdx) : nextLine).trim();
+      }
+    }
+    // doda-Xは詳細パネルからも会社名を取得試み
+    if (!company) {
+      const p = findDodaxDetailPanel();
+      if (p) {
+        const pLines = (p.innerText || '').split('\n').map(l => l.trim()).filter(Boolean);
+        company = pLines.find(l => !isEduLine(l) && companyRe2.test(l))?.split(/[／/]/)[0].trim() || '';
+      }
+    }
+    // doda-Xでは「氏名｜会社名」「会員番号｜会社名」の形で1行に入る。
+    // 以前は区切りがinnerTextに出ず連結されていたが（程 謙富士通株式会社）、
+    // 媒体側の作りが変わって区切り文字が見えるようになった（程 謙|富士通株式会社）。
+    // 区切りが見えているなら、後ろ側が会社名だと確実に言える。実データで確認:
+    //   程 謙|富士通株式会社 / 00930054|三菱ＵＦＪ信託銀行株式会社 / |三菱ＵＦＪ信託銀行株式会社
+    // これが原因で、ある担当者のdoda X 36件中35件が、シートと突き合わせできない
+    // 状態になっていた（送信自体は記録できていた）
+    if (/[|｜]/.test(company)) {
+      const parts = company.split(/[|｜]/).map(x => x.trim()).filter(Boolean);
+      if (parts.length) company = parts[parts.length - 1];
+    }
+    // doda-Xでは会員番号と会社名が区切り文字なしで1行に連結される。innerTextは
+    // 隣り合うインライン要素の間に改行も空白も入れないため、実データで
+    // 「00881769ソフトバンク株式会社」「00924245富士通株式会社」のように
+    // 会員番号付きで記録されていた。シート側の会社名と一致せず突き合わせが
+    // できないため、先頭の会員番号を落とす。
+    // 6桁以上の数字が非数字の直前にある場合だけに限る（「7-Eleven」のように
+    // 数字で始まる社名を壊さないため）
+    const memberNo = company.match(/^\d{6,}(?=\D)/);
+    if (memberNo) company = company.slice(memberNo[0].length).trim();
+    // 同じ理由で「氏名＋会社名」も連結される（「佐々木 貴紀株式会社SHIFT」
+    // 「栗原 裕也日本メドトロニック株式会社」）。こちらは姓名の区切りが
+    // 社名側に無いため、どこまでが名前なのかを文字列からは決められない。
+    // 推測で切ると「栗原 裕也日本」まで落として「メドトロニック株式会社」に
+    // してしまう（実際にそうなる分割規則を検討して破棄した）。
+    // 誤った社名を作るより、連結されたまま残して報告し、画面の構造を
+    // 確認してから直す（reportDodaxNameInCompany）
+  } else if (getPlatform() === 'linkedin') {
+    // LinkedIn Recruiter。一覧・パイプラインの行は、クラス名ではなくテキストの
+    // 並びで出る（実機で確認）:
+    //   小久保 慎平 / 3次コンタクト / ソーシング
+    //   Digital Transformation Acceleration, KPMGコンサルティング株式会社  ← 役職, 会社名
+    //   日本 · ビジネスコンサルティング・サービス
+    //   職歴  KPMGジャパン／KPMG Japanのマネージャー · 2023年 – 現在
+    //   教育  名古屋大学、大学院工学研究科 · 2003年 – 2005年
+    //
+    // 検索一覧は「｜」区切り、パイプラインは「,」区切りで、どちらも会社名が最後にくる。
+    // 肩書きが先、勤務先が後という並びはLinkedInの見出しの書き方として共通している
+    // 見出し行は候補者名のすぐ下にあり、「職歴」「教育」等の見出しより前にしか
+    // 現れない。以前はカード全体から「区切り文字＋会社名キーワード」を含む行を
+    // 探していたため、プロフィール画面では過去の職歴の行
+    // （例「Software Engineer, Toyota Motor Corporation · 2016年 – 2018年」。
+    // 「Corp」がキーワードに一致する）が見出しより先に見つかり、現職ではなく
+    // 前職が会社名として記録される事故が実機で確認された。
+    // 探す範囲を見出しより前に限る
+    const sectionIdx = lines.findIndex(l =>
+      /^(職歴|教育|学歴|資格|スキル|受賞|推薦|ボランティア|プロジェクト)/.test(l)
+      || /^(Experience|Education|Skills|Licenses|Certifications|Volunteer)/i.test(l));
+    const headLines = sectionIdx >= 0 ? lines.slice(0, sectionIdx) : lines;
+    // 在籍期間（「2016年 – 2018年」「2016 - 2018」）を含む行は職歴の明細であって
+    // 見出しではない。見出しが見つからない画面（英語UI等）での保険
+    const hasPeriod = l => /\d{4}年?\s*[-–—〜~]/.test(l);
+    // まず画面の部品から読む。メッセージ作成画面の宛先プロフィールには職歴の
+    // 一覧（.experience-card）があり、会社名は専用の要素に入っている（保存した
+    // HTMLで確認）。見出しの書き方は人によってばらばらで、文字の並びからの推測では
+    // 「Toyota Motor Corporation - Group Manager」や、同じ会社で役職が複数ある人の
+    // 「トヨタ自動車株式会社 / 19年7ヶ月」から会社名を取れず、空欄で記録されていた
+    company = readLinkedinCurrentCompany(cardEl)
+      || readLinkedinCurrentCompany(document.querySelector('.recipient-profile'));
+    const headline = company ? null : headLines.find(l => /[|｜,，]/.test(l)
+      && !hasPeriod(l)
+      && /(株式会社|合同会社|有限会社|Inc\.?|Corp|Ltd|LLC|GmbH)/i.test(l));
+    if (headline) {
+      company = headline.split(/[|｜,，]/).map(x => x.trim()).filter(Boolean).pop() || '';
+    }
+    // 英語の見出しは区切り文字ではなく「役職 at 会社名」と書く（LinkedInの標準）。
+    // 実データで「Market Data Analyst at Nissan Motor Corporation」から会社名を
+    // 取れず、記録が空欄になっていた。最後の「 at 」より後ろを会社名とみなす
+    if (!company) {
+      for (const l of headLines) {
+        if (hasPeriod(l)) continue;
+        const m = l.match(/^.+\s+at\s+(.+)$/);
+        if (!m) continue;
+        const v = m[1].trim().replace(/[.,、。]+$/, '');
+        // 「… at scale」のような文章の一部を拾わないよう、長さと中身で絞る
+        if (!v || v.length > 60) continue;
+        if (isNotCompanyName(v)) continue;
+        if (!/^[A-Z0-9]|[ぁ-んァ-ヶ一-鿿]/.test(v)) continue;
+        company = v;
+        break;
+      }
+    }
+    // 「職歴」の数行先から。見出しの直後には読み上げ用のラベル行が入るため、
+    // 次の行だけを見ると外す（実機で確認）:
+    //   職歴 / プロフィールの職歴です / toyotaのSoftware Engineer · 2016年 – 2018年
+    // 実体は「〈会社〉の〈役職〉 · 期間」という形。最初に出てくるものが直近の職歴
+    if (!company) {
+      const i = lines.findIndex(l => l === '職歴' || /^Experience$/i.test(l));
+      if (i >= 0) {
+        const hits = [];
+        for (let k = i + 1; k < Math.min(lines.length, i + 20); k++) {
+          const m = lines[k].match(/^(.+)の[^の]+?\s*[·・]/);
+          if (m) hits.push({ value: m[1].trim(), line: lines[k] });
+        }
+        // 「2016年 – 2018年」で終わる過去の職歴ではなく、「– 現在」の現職を選ぶ。
+        // 並び順が常に新しい順とは限らないため、期間の表記で判断する
+        const current = hits.find(h => /(現在|Present)/i.test(h.line));
+        company = ((current || hits[0]) || {}).value || '';
+      }
+    }
+    // プロフィール画面ではクラスで取れる。subtitle は職歴にも学歴にも付くので、
+    // 学校へのリンクを含む塊は飛ばす
+    if (!company) {
+      // ここも「最初に見つかったもの」では前職を拾う。期間に「現在」を含む塊を優先する
+      let first = '';
+      for (const sub of cardEl.querySelectorAll('.background-entity__summary-definition--subtitle')) {
+        const block = sub.closest('li, section, article, div');
+        if (block && block.querySelector('.background-entity__school-link')) continue;
+        const v = (sub.textContent || '').trim();
+        if (!v) continue;
+        if (!first) first = v;
+        if (block && /(現在|Present)/i.test(block.textContent || '')) { company = v; break; }
+      }
+      if (!company) company = first;
+    }
+    // 大学は「教育」の次の行。「名古屋大学、大学院工学研究科」のように
+    // 「、」の前が学校名になる
+    // 「教育」の数行先から。ここにも読み上げ用のラベル行が入る（実機で確認）:
+    //   教育 / プロフィールの学歴です / 立命館大学、Master's degree · 2006年 – 2008年
+    // 学校名は「、」の前
+    const eduIdx = lines.findIndex(l => l === '教育' || l === '学歴');
+    let eduLine = '';
+    if (eduIdx >= 0) {
+      for (let k = eduIdx + 1; k < Math.min(lines.length, eduIdx + 7); k++) {
+        if (/(大学|大学院|高専|College|University)/i.test(lines[k])) { eduLine = lines[k]; break; }
+      }
+    }
+    if (!eduLine) eduLine = lines.find(l => /(大学|大学院|高専|College|University)/i.test(l)) || '';
+    if (eduLine) {
+      const u = eduLine.split(/[、,，·・]/)[0].trim();
+      if (/(大学|大学院|高専|College|University)/i.test(u)) univ = u;
+    }
+    if (!univ) {
+      const school = cardEl.querySelector('a.background-entity__school-link');
+      if (school) univ = (school.textContent || '').trim();
+    }
+    // LinkedInには年齢が無い。空のままにする（突き合わせは会社名と大学で行う）
+  } else if (getPlatform() === 'bizreach') {
+    // Bizreachのカードは 年齢/新着タグ → 都道府県 → 年収 → 経過時間 → 送信通数(N通) →
+    // 会社名 → 部署名 → 学歴… という固定順序で並ぶ(実機で確認)。以前は company = lines[0]
+    // という汎用フォールバックを使っていたため、会社名ではなく「38歳」「新着」といった
+    // 先頭行がそのまま会社名として記録されていた
+    const isEduLine3 = l => /学歴|卒業|修了|在学|入学/.test(l);
+    // カード上の定型行が会社名として記録されてしまう事故が実データで複数確認された。
+    // ・「金融 / 証券」「保険 / 損害保険」等の業種表記が、下のキーワードの
+    //   「証券」「保険」に一致して会社名として採用されていた
+    // ・「29歳」のような年齢行がそのまま会社名になっていた
+    // これらは会社名ではありえないため、候補から明示的に除外する
+    const isNoiseLine3 = l =>
+      /\s[/／]\s/.test(l)              // 「業種 / 職種」形式
+      || /^\d{1,3}歳$/.test(l)
+      || /^\d+通$/.test(l)
+      || /^新着/.test(l)
+      || /^[\d,.]+\s*万円/.test(l)
+      || /^[\d,]+$/.test(l);
+    // 「證券」は旧字体表記の会社名（例:「野村證券」）で実際に使われており、
+    // 「証券」だけではキーワードに一致しなかった（実データで確認）
+    const companyRe3 = /株式会社|合同会社|有限会社|LLC|Inc\.|Co\.,|ホールディングス|グループ|銀行|証券|證券|信託|保険/;
+    // 実際にextractBasicInfoへ渡されるのは一覧カードではなく詳細パネルであることが
+    // ほとんどで、詳細パネルには「在籍企業名」ラベルがある。キーワード一致に頼ると
+    // 「JFEエンジニアリング」「ソニー」のように株式会社等を含まない社名が必ず空欄に
+    // なり、かつ職務経歴中の過去在籍企業を現職として拾う危険もあるため、ラベルを最優先する
+    const bizLabelIdx = lines.findIndex(l => l.startsWith('在籍企業名'));
+    if (bizLabelIdx >= 0) {
+      const sameLine = lines[bizLabelIdx].replace(/^在籍企業名[^\S\n]*[：:]?[^\S\n]*/, '').trim();
+      const nextLine = lines[bizLabelIdx + 1] || '';
+      const candidate = sameLine || nextLine;
+      if (candidate && !isEduLine3(candidate) && !isNoiseLine3(candidate) && !isMessageLine(candidate)) {
+        company = candidate;
+      }
+    }
+    if (!company) company = lines.find(l => !isEduLine3(l) && !isNoiseLine3(l) && !isMessageLine(l) && companyRe3.test(l)) || '';
+    if (!company) {
+      // キーワードに一致しない会社名表記（例:「JFEエンジニアリング」）の場合、
+      // 「N通」行の直後の行を会社名として採用する
+      const sentIdx = lines.findIndex(l => /^\d+通$/.test(l));
+      const next = sentIdx >= 0 ? lines[sentIdx + 1] : '';
+      if (next && !isEduLine3(next) && !isNoiseLine3(next)) {
+        company = next;
+      }
+    }
+  } else if (getPlatform() === 'green') {
+    // Greenの一覧カードには「現（前）勤務先」ラベルがあり、その次の行が
+    // 「DockYard正社員2022年09月〜2026年05月」のように
+    // 会社名＋雇用形態＋在籍期間が区切り無しで連結されている(実機で確認)。
+    // モーダルを開いていなくても取れるため、これを最優先で使う
+    const employmentType = /(正社員|契約社員|派遣社員|業務委託|アルバイト|パート|インターン|嘱託|役員)/;
+    const cleanGreenCompany = (s) => {
+      if (!s) return '';
+      let v = s.trim();
+      const m = v.match(employmentType);
+      if (m && m.index > 0) v = v.slice(0, m.index);
+      // 雇用形態が無い表記のために、末尾の在籍期間(2023年01月〜…)も落とす
+      v = v.replace(/\d{4}年\d{1,2}月.*$/, '');
+      return v.trim();
+    };
+
+    const workIdx = lines.findIndex(l => l.includes('現（前）勤務先') || l.includes('現(前)勤務先'));
+    if (workIdx >= 0 && workIdx + 1 < lines.length) {
+      company = cleanGreenCompany(lines[workIdx + 1]);
+    }
+
+    // 送信時フォールバック等でモーダルが渡された場合は、そちらのラベルから拾う。
+    // 「【会社名】」は職務要約の自由記述内にあるため候補者によっては存在せず、
+    // その場合は「経験企業」セクションの一番上(＝在籍期間が最も新しい勤務先)を使う
+    if (!company) {
+      const panel = findGreenDetailPanel();
+      const panelLines = (panel ? (panel.innerText || '') : text)
+        .split('\n').map(l => l.trim()).filter(Boolean);
+
+      const labelLine = panelLines.find(l => l.includes('【会社名】'));
+      if (labelLine) company = labelLine.replace('【会社名】', '').trim();
+
+      if (!company) {
+        const expIdx = panelLines.findIndex(l => l === '経験企業');
+        if (expIdx >= 0 && expIdx + 1 < panelLines.length) {
+          company = cleanGreenCompany(panelLines[expIdx + 1]);
+        }
+      }
+    }
+  } else {
+    company = lines[0] || '';
+  }
+
+  // company抽出は「大学」「病院」も会社名キーワードとして許容している（「◯◯大学病院」の
+  // ような実在の勤務先を拾うため）。しかし学歴欄に単独で「京都大学」とだけ書かれている行
+  // （卒業・修了等の語句が同じ行に無く、isEduLineの除外をすり抜ける）が誤って会社名として
+  // 拾われる事故を実機で確認した（company="京都大学", univ="京都大学"の重複＝会社名不明の
+  // まま大学名で埋まってしまい、後続のRPA検索が誤った候補者に一致・誤送信する原因になった）。
+  // 「大学」「大学院」で終わり、かつ「病院」を含まない＝実在の勤務先ではなく単なる大学名
+  // だけの場合は、会社名として採用しない（空欄のままにする方が、誤った値を使うより安全）
+  if (/(?:大学院|大学)$/.test(company) && !company.includes('病院')) {
+    company = '';
+  }
+
+  // 職務経歴の要約文がまるごと会社名として記録される事故が実データで確認された
+  // （「MDロジス株式会社に新卒入社。国内物流センターの…」のような250文字超の文章。
+  // 「株式会社」を含むため会社名キーワードの判定を通ってしまう）。実在の会社名が
+  // この長さになることはまずないため、文章の場合は先頭の会社名部分だけを取り出す。
+  // 取り出せない場合は空欄にする（誤った長文を残すより安全）
+  // 媒体ごとの抽出をすり抜けたスカウト本文・定型行を最後に落とす。実データでは
+  // 「ハイクラス転職エージェント、株式会社Snow-we.Inc代表の桝井と申します。」が
+  // ちょうど40文字で下の長文ガード(>40)を通過し、会社名として記録され続けていた
+  if (company && isMessageLine(company)) company = '';
+
+  // 会社名の欄に、会社名でないものが入っていた実例への対処。
+  // 実データで確認したもの：
+  //   「東京外国語大学 国際社会学部国際社会学科」「大阪大学 経済学部 経済・経営学科」（学歴欄を拾った）
+  //   「運用企画部部長代理 責任投資推進室 グループ長」「ソリューション推進部　戦略G グループリーダー」（部署・役職欄を拾った）
+  //   「基本情報」（画面のラベルそのもの）
+  // 社名として使えない以上、誤った値を残すより空欄にする方が安全（後から手で補える）
+  // 一覧カードからクラスで取れていれば、それを最優先にする（上のコメントの理由）
+  if (dodaxCard) {
+    if (dodaxCard.company) company = dodaxCard.company;
+    if (dodaxCard.univ) univ = dodaxCard.univ;
+    if (dodaxCard.age) ageMatch = [dodaxCard.age, dodaxCard.age.replace('歳', '')];
+  }
+  if (bizreachCard) {
+    if (bizreachCard.company) company = bizreachCard.company;
+    if (bizreachCard.univ) univ = bizreachCard.univ;
+    if (bizreachCard.age) ageMatch = [bizreachCard.age, bizreachCard.age.replace('歳', '')];
+  }
+
+  if (company && isNotCompanyName(company)) {
+    console.warn('[Snow-we] 会社名として不適切な値のため空欄にします:', company);
+    company = '';
+  }
+
+  if (company.length > 30) {
+    const head = company.match(/^[^\s　。、]{2,40}?(?:株式会社|合同会社|有限会社|ホールディングス)/)
+      || company.match(/^(?:株式会社|合同会社|有限会社)[^\s　。、]{1,20}/);
+    company = head ? head[0] : '';
+    // 「株式会社資生堂に新卒入社」のように、社名の直後が句読点で区切られず
+    // 動詞へ続く場合があるため、入社・勤務を表す語以降を落とす
+    company = company.replace(/(?:に新卒入社|に入社|へ入社|に転職|に勤務|にて).*$/, '');
+  }
+
+  return {
+    age: ageMatch ? `${ageMatch[1]}歳` : '',
+    company,
+    univ,
+    name: '',
+  };
+}
+
+/**
+ * ボタンの表示文字列を読む。媒体によって読める場所が違うため順に試す。
+ * ・Greenの送信は紙飛行機アイコンだけで、aria-labelにしか文字が無い
+ * ・LinkedInの送信は <span aria-hidden="true">送信</span> で、innerTextにも
+ *   aria-labelにも出ず、textContentでしか読めない
+ */
+function readButtonLabel(btn) {
+  let text = (btn.innerText || '').trim();
+  if (!text) text = (btn.getAttribute('aria-label') || btn.getAttribute('title') || '').trim();
+  if (!text) text = (btn.textContent || '').trim();
+  // AMBIの送信ボタンは「送 信」のように字間が空くため、空白を除いて比較する。
+  // さらに、アイコンのテキスト化・ゼロ幅文字などを吸収するため日本語以外を落とす
+  const textCompact = text.replace(/[\s　]/g, '');
+  const textCore = textCompact.replace(/[^぀-ヿ一-鿿]/g, '');
+  return { text, textCompact, textCore };
+}
+
+/**
+ * そのボタンを押したら記録処理のどこに入るかを判定する。
+ * 記録する側（クリック処理）と診断とで別々に書いていたため、診断が「○」と出した
+ * ボタンが実際には対象外、ということが起きていた。同じ関数を両方から使う
+ */
+function classifyScoutButton(btn, text, textCore) {
+  const platform = getPlatform();
+  // Greenには候補者ごとの開始ボタンが無く、画面上部ナビの「スカウト」タブが
+  // 誤ってヒットしていた（実機のログで確認）
+  const isGreen = platform === 'green';
+  // LinkedIn Recruiterには「スカウト」という語が無く、一覧の封筒アイコンか、
+  // パイプラインの行の「メッセージ」から作成画面が開く（実機で確認）
+  const isLinkedinStart = platform === 'linkedin' && (() => {
+    try {
+      if (btn.closest('[data-test-component="message-icon-btn"], [data-live-test-component="message-icon-btn"]')) return true;
+    } catch (_) {}
+    if (textCore === 'メッセージ') return true;
+    return /さんにメッセージを送信/.test(text);
+  })();
+  const isStart = !isGreen && (textCore === 'スカウト' || textCore === '再スカウト'
+    || text.includes('スカウトを送る') || text.includes('スカウトする')
+    || text.includes('スカウトを作成') || isLinkedinStart);
+  // LinkedInの作成画面の送信ボタンは、読み上げ用の「このメッセージを送信」と表示上の
+  // 「送信」が両方テキストに出るため「このメッセージを送信送信」になり、完全一致では
+  // 拾えなかった（実機で確認。実際に送った1件が記録されなかった）
+  const isLinkedinSend = platform === 'linkedin' && !isLinkedinStart
+    && /メッセージを送信/.test(textCore);
+  // Bizreachのモーダル内の最終送信は「スカウトを送信」で、単独の「送信」と一致しない
+  const isSend = textCore === '送信' || textCore === '送信する'
+    || textCore === 'スカウトを送信' || isLinkedinSend;
+  return {
+    isStart,
+    isSend,
+    isConfirm: textCore === '確認',
+    isTemplateConfirm: textCore === '確定',
+    isLinkedinStart,
+  };
+}
+
+// スカウトボタンのクリックを検知して履歴に記録
+document.addEventListener('click', e => {
+  // 最新インスタンスのみ処理（古いVMインスタンスはスキップ）
+  if (document.documentElement.getAttribute('data-snow-we-id') !== _INSTANCE_ID) return;
+
+  // Greenのテンプレート選択を追跡する。チップ自体は<div role="button">でボタン/リンク
+  // ではないため、下のbtn判定（button/aのみ対象）より前で拾う必要がある。
+  // チップの表示は選択後も「テンプレート」のまま変わらないため、送信時にDOMを読むだけ
+  // では選択済みテンプレートが分からない（実機で確認）。「テンプレート」チップを押した
+  // 直後（8秒以内）に選ばれたメニュー項目を、選択されたテンプレート名として記憶する
+  if (getPlatform() === 'green') {
+    const chip = e.target.closest('[role="button"], .MuiChip-root');
+    if (chip && (chip.innerText || '').trim() === 'テンプレート' && chip.closest('.MuiModal-root, .MuiDialog-root')) {
+      _greenTemplatePickerOpenTs = Date.now();
+    }
+    const menuItem = e.target.closest('li[role="menuitem"]');
+    // 8秒では、一覧を見比べてから選ぶと間に合わず、選んだのに空欄で記録されていた
+    if (menuItem && _greenTemplatePickerOpenTs && Date.now() - _greenTemplatePickerOpenTs < 60000) {
+      const name = (menuItem.innerText || '').trim();
+      if (name && name !== '＋テンプレートを作成') {
+        _cachedGreenTemplate = name;
+        try { sessionStorage.setItem('snowweGreenTemplate', name); } catch (_) {}
+        console.log('[Snow-we] green: テンプレート選択を検知:', name);
+      }
+      _greenTemplatePickerOpenTs = 0;
+    }
+  }
+
+  const btn = e.target.closest('button, a');
+  if (!btn) return;
+  // 表示文字列の読み取りは記録側と診断側で同じものを使う（readButtonLabel）
+  const { text, textCore } = readButtonLabel(btn);
+
+  // 押されたボタンを覚えておく。送信の通信を検知したときに、直前に何が押されたかを
+  // 失敗の報告に添えるため。これが無いと「認識できなかった」ことしか残らず、
+  // 何を認識対象に加えればよいかが分からない
+  if (textCore) {
+    _lastButtonText = textCore.slice(0, 60);
+    _lastButtonAt = Date.now();
+  }
+
+  // doda Xの一括送信は、通信の中身に候補者の識別子が入っていない。
+  // 選択された候補者は画面に出ているので、一括送信に関わるボタンを押した時点で控える。
+  // 一覧から送信画面へ進むと一覧が消えることがあるため、0件のときは前の控えを残す
+  if (getPlatform() === 'dodax' && /一括|送信/.test(textCore)) {
+    const picked = captureSelectedCandidateIds();
+    if (picked.length > 0) {
+      _pendingBulkIds = picked;
+      _pendingBulkAt = Date.now();
+      console.log(`[Snow-we] 一括送信の対象として${picked.length}件を控えました`);
+    }
+  }
+
+  // AMBI: 「送信」を押した後に「スカウトを送信しますか？」という確認ダイアログが
+  // 出ることがある(実機で確認)。pendingScoutConfirmが無い場合は無関係な別のダイアログの
+  // 可能性が高いので何もしない(はい/いいえは他の場面でも使われがちな一般的な文言のため)
+  if ((textCore === 'はい' || textCore === 'いいえ') && getPlatform() === 'ambi') {
+    const confirmRaw = sessionStorage.getItem('pendingScoutConfirm');
+    if (confirmRaw) {
+      sessionStorage.removeItem('pendingScoutConfirm');
+      if (textCore === 'はい') {
+        (async () => {
+          try {
+            const pending = JSON.parse(confirmRaw);
+            if (pending && pending.id && Date.now() - (pending.confirmTs || 0) < 5 * 60 * 1000) {
+              console.log('[Snow-we] AMBI: 送信確認「はい」→ recordScoutSent 呼び出し id:', pending.id, '/ template:', pending.templateName || 'なし');
+              recordScoutSent(pending.id, pending.info || {}, pending.templateName || '', pending.bodyText || '', pending.fallbackPosition || '');
+            }
+          } catch (_) {}
+        })();
+      } else {
+        console.log('[Snow-we] AMBI: 送信確認「いいえ」でキャンセルされたため記録しません');
+      }
+      return;
+    }
+  }
+
+  // どのボタンが何に当たるかの判定は、診断と同じ関数を使う（classifyScoutButton）。
+  // 以前は記録側と診断側に同じ判定を2つ書いており、診断が「認識対象」と出した
+  // ボタンが実際には対象外、ということが起きていた
+  const kind = classifyScoutButton(btn, text, textCore);
+  const isScoutBtn           = kind.isStart;
+  const isConfirmBtn         = kind.isConfirm;
+  const isSendBtn            = kind.isSend;
+  const isTemplateConfirmBtn = kind.isTemplateConfirm;
+  if (!isScoutBtn && !isConfirmBtn && !isSendBtn && !isTemplateConfirmBtn) {
+    // スカウト関連らしきボタンなのに上の固定パターンに一致しないものを検知する診断ログ
+    // （記録漏れの原因調査用。ここではpendingScoutの状態には一切手を触れない）
+    if (/スカウト|送信|確認|確定/.test(textCore) && textCore.length < 30) {
+      console.log('[Snow-we] 未認識のスカウト系ボタン（記録トリガー対象外）:', JSON.stringify(text));
+      // コンソールに出すだけでは誰も気づけない。実データで、ある担当者のRDSだけ
+      // 36%の送信が記録されていなかったのに、画面上は何の変化も無かった。
+      // 送信に当たるボタンが認識できていない場合は、その場で知らせる
+      // 「スカウト」を含むだけで拾うと、ボタンですらない表示まで失敗として
+      // 記録される。実データで「スカウト履歴あり」「スカウトルーム一覧」
+      // 「このスカウトルームで探す」が大量に入り、本物の失敗が埋もれた。
+      // 送信を表す語を含み、かつ一覧・検索・履歴の語を含まないものに限る
+      // 「送信済み」は送った後の状態の表示で、送信ボタンではない（doda X の一覧・テンプレート画面。11/11 の報告で確認）
+      const looksLikeSend = /送信|送る/.test(textCore)
+        && !/履歴|一覧|探す|検索|条件|設定|テンプレート|済/.test(textCore);
+      if (looksLikeSend) {
+        reportRecordFailure('送信に当たるボタンを認識できない', { buttonText: textCore });
+        // ボタンを認識できていない場合こそ、通信から送信を検知できるようにしたい。
+        // 直後の通信を控えて報告する（認識できた場合と同じ扱い）
+        if (!SEND_REQUESTS[getPlatform()]) {
+          _sendDiscoveryUntil = Date.now() + 20 * 1000;
+          _sendDiscoveryCount = 0;
+          _sendDiscoveryButton = textCore.slice(0, 60);
+        }
+        try {
+          showAutoStatus(
+            `⚠️ 「${textCore}」は記録対象として認識できていません。`
+            + `この画面から送ったスカウトは記録されません。管理者にこの文言を伝えてください`,
+            12000,
+          );
+        } catch (_) {}
+      }
+    }
+    return;
+  }
+
+  console.log('[Snow-we] スカウト系ボタン検知:', JSON.stringify(text));
+  if (isSendBtn) {
+    _lastRecognizedSendAt = Date.now();
+    // 送信APIが分かっていない媒体では、この直後の通信を控えて報告する。
+    // 一度これを拾えばSEND_REQUESTSに登録でき、ボタンの文言に依存しなくなる
+    if (!SEND_REQUESTS[getPlatform()]) {
+      _sendDiscoveryUntil = Date.now() + 20 * 1000;
+      _sendDiscoveryCount = 0;
+      _sendDiscoveryButton = textCore.slice(0, 60);
+    }
+  }
+
+  // 拡張機能との接続が切れていると、この先の記録処理は必ず失敗する。
+  // 送信してから失敗に気づいても手遅れ（記録は復元できない）なので、
+  // スカウト操作を始めた時点で警告を出す
+  if (!isExtensionAlive()) {
+    showExtensionInvalidatedBanner();
+  }
+
+  // ── スカウトボタン：候補者カードを特定して保存 ──
+  if (isScoutBtn) {
+    const cards = findCandidateCardsByPlatform();
+    let card = cards.find(c => c.contains(btn) || c === btn.closest('[class*="card"],[class*="row"],li,article'));
+
+    // RDS: ボタンが詳細パネル内にある場合は詳細パネルを優先（リストカードと混同しない）
+    if (getPlatform() === 'rds') {
+      const detailPanel = findRDSDetailPanel();
+      if (detailPanel && detailPanel.contains(btn)) {
+        card = detailPanel;
+      }
+    }
+
+    // doda X / AMBI: RDS・Bizreachと同じ理由（ボタンが詳細パネル内にあり、リストカード
+    // 側では見つからないケースがあると_selectedCardのフォールバックに落ち、候補者切り替え
+    // 直後だと別候補者の情報を誤って記録する事故につながる）で、詳細パネルを優先する
+    if (getPlatform() === 'dodax') {
+      const detailPanel = findDodaxDetailPanel();
+      if (detailPanel && detailPanel.contains(btn)) {
+        card = detailPanel;
+      }
+    }
+    if (getPlatform() === 'ambi') {
+      const detailPanel = findAMBIDetailPanel();
+      if (detailPanel && detailPanel.contains(btn)) {
+        card = detailPanel;
+      }
+    }
+    if (getPlatform() === 'mynavi') {
+      const detailPanel = findMynaviDetailPanel();
+      if (detailPanel && detailPanel.contains(btn)) {
+        card = detailPanel;
+      }
+    }
+
+    // Bizreach: 「スカウトを作成」ボタンは常に右側の詳細パネル内にあり、左のリストカード
+    // には含まれない（cards.find(c => c.contains(btn))が常に失敗する）。以前はこの場合
+    // 直前にリストでクリックした_selectedCardにフォールバックしていたが、Bizreachでは
+    // 候補者間の切り替えがリストの再クリックを伴わないこともあり、_selectedCardが古い
+    // ままだと無関係な別候補者の会社名・年齢等を誤って記録してしまう事故が実機で確認
+    // された（プロフィール本文は正しい候補者のものなのに、会社名だけ別人になっていた）。
+    // 詳細パネルを会社名・年齢等の抽出元として使う（候補者IDはURLベースで別途特定する）
+    if (getPlatform() === 'bizreach') {
+      const detailPanel = findBizreachDetailPanel();
+      if (detailPanel && detailPanel.contains(btn)) {
+        card = detailPanel;
+      }
+    }
+
+    if (!card) {
+      if (_selectedCard) {
+        card = _selectedCard;
+      } else {
+        const btnRect = btn.getBoundingClientRect();
+        const btnCenter = btnRect.top + btnRect.height / 2;
+        let minDist = Infinity;
+        for (const c of cards) {
+          const r = c.getBoundingClientRect();
+          const dist = Math.abs((r.top + r.height / 2) - btnCenter);
+          if (dist < minDist) { minDist = dist; card = c; }
+        }
+        if (minDist > 300) card = null;
+      }
+    }
+
+    // LinkedIn: 一覧の各行が候補者。封筒アイコンの祖先をたどって、
+    // /talent/profile/ のリンクを持つ最小の塊をその候補者の行とみなす
+    if (!card && getPlatform() === 'linkedin') {
+      // 実機で確認: 封筒アイコンから11段上の div.row__top-section に
+      // /talent/profile/ のリンクがある。余裕をみて15段まで遡る
+      let el = btn;
+      for (let i = 0; el && i < 15; i++, el = el.parentElement) {
+        if (el.querySelector && el.querySelector('a[href*="/talent/profile/"]')) { card = el; break; }
+      }
+    }
+
+    // Bizreachの「スカウトを作成」は履歴書パネル(ess-resume-detail)の外、下部のバーに
+    // 置かれているため contains(btn) が成立しない。実機のログで
+    // 「カード検出: なし / _selectedCard: なし」を確認した。
+    // カードが決まらないと pendingScout が作られず、送信時のフォールバックに頼ることに
+    // なる。フォールバックでも会社名は取れるが、パネルの再描画待ち
+    // (readCandidateWhenStable) を通らないため、前の候補者の情報を拾う余地が残る。
+    // 表示されている履歴書パネルがあれば、それを候補者の情報源として使う
+    if (!card && getPlatform() === 'bizreach') {
+      const panel = findBizreachDetailPanel();
+      if (panel) {
+        const r = panel.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) card = panel;
+      }
+    }
+
+    console.log('[Snow-we] カード検出:', card ? 'あり' : 'なし', '/ _selectedCard:', _selectedCard ? 'あり' : 'なし', '/ カード総数:', cards.length);
+
+    if (card) {
+      // 詳細パネルの再描画が間に合っていないまま読み取ると、前の候補者の会社名・大学・
+      // 年齢をそのまま記録してしまう。シートの手入力と突き合わせたところ、RDSで約15%・
+      // doda-Xで約15%の記録が「1つ前の候補者の会社名」になっていた（候補者IDはURLから
+      // 取れるため新しい候補者のものになり、プロフィールだけが古いという混ざった記録に
+      // なる。Greenは0件、Bizreachは3件で、再描画の遅い媒体に集中している）。
+      // 同じ内容が2回続けて読めるまで待ってから確定させる
+      // fallbackPositionは、候補者が高速に連続処理されても取り違えないよう、
+      // 同期的に読めるキャッシュ値をこの時点で確定させる
+      const fallbackPosition = _cachedCurrentPosition;
+      (async () => {
+        let stable = await readCandidateWhenStable(card);
+        // 送ったばかりの候補者と同じに見えるときは、画面がまだ切り替わっていない可能性が高い。
+        // 少し待って別の候補者に変わればそちらを使う（続けて送ったときの取り違え・記録漏れの対策）
+        if (stable.id && judgeRepeatedSendRequest(stable.id, _lastSendRequest, Date.now()) !== 'new') {
+          const fresh = await readChangedCandidate(getPlatform(), stable.id, 2000);
+          if (fresh) stable = { ...stable, id: fresh.id, info: fresh.info };
+        }
+        const id = stable.id;
+        console.log('[Snow-we] 1回目クリック candidateId:', id,
+          stable.waitedMs ? `/ パネル確定まで${stable.waitedMs}ms待機` : '');
+        console.log('[Snow-we] カードテキスト行:', (card.innerText || '').split('\n').map(l => l.trim()).filter(Boolean).slice(0, 40));
+        if (id) {
+          sessionStorage.setItem('pendingScout', JSON.stringify({
+            id, info: stable.info, ts: Date.now(), fallbackPosition
+          }));
+          console.log('[Snow-we] pendingScout を sessionStorage に保存しました (fallbackPosition:', fallbackPosition || 'なし', ')');
+        } else {
+          console.log('[Snow-we] candidateId が取得できなかったため保存スキップ');
+        }
+      })();
+    }
+    return;
+  }
+
+  // ── 確定ボタン：テンプレート選択モーダルからポジション照合（RDS等） ──
+  if (isTemplateConfirmBtn) {
+    const raw = sessionStorage.getItem('pendingScout');
+    if (!raw) return;
+
+    // ★ モーダルが閉じる前に同期的にテンプレート名を取得する（非同期にすると消える）
+    // 実機のDOM調査で確認した確実な手がかりを優先して使う：
+    // 選択中の行には data-selected="true" が付き、テンプレート名のセルには
+    // クラス名に"template-name"を含む要素がある。ラジオボタン(input[type=radio])
+    // から祖先のtr/liを遡ってセルを総当たりする方式は、実際のRDS画面で毎回
+    // 取得に失敗していた（原因不明。行の実構造とは一致しない挙動だった）ため、
+    // より直接的なこちらを優先し、旧方式はフォールバックとして残す。
+    let tmplName = '';
+    const selectedRow = document.querySelector('[data-selected="true"]');
+    if (selectedRow) {
+      const nameCell = selectedRow.querySelector('[class*="template-name"]');
+      if (nameCell) tmplName = (nameCell.textContent || '').trim();
+    }
+    if (!tmplName) {
+      const checkedRadio = document.querySelector('input[type="radio"]:checked');
+      if (checkedRadio) {
+        const row = checkedRadio.closest('tr, [role="row"]') || checkedRadio.closest('li, [class*="row"], [class*="item"]');
+        if (row) {
+          for (const cell of row.querySelectorAll('td, [role="cell"]')) {
+            if (cell.querySelector('input')) continue;
+            const t = cell.textContent?.trim() || '';
+            if (t.length > 3) { tmplName = t; break; }
+          }
+          if (!tmplName) {
+            for (const el of row.querySelectorAll('div, span, p')) {
+              if (el.querySelector('input, button')) continue;
+              const t = el.textContent?.trim() || '';
+              if (t.length > 3 && t.length < 80) { tmplName = t; break; }
+            }
+          }
+        }
+      }
+    }
+    if (!tmplName) return;
+    console.log('[Snow-we] テンプレート名検出 (同期取得):', tmplName);
+
+    (async () => {
+      try {
+        const pending = JSON.parse(raw);
+        // 同じテンプレートでの重複検知（同一クリックでハンドラが二重発火するケース）はスキップするが、
+        // 一度「確定」した後にテンプレートを選び直して再度「確定」した場合は、新しい選択で上書きする
+        // （以前はtemplateNameが一度セットされると以降は一切更新されず、最初に選んだテンプレートが
+        // 送信時までそのまま使われてしまっていた）
+        if (pending.templateRaw === tmplName) return;
+
+        // AC）/ BC( で始まるテンプレート名はポジション名そのもの（スプレッドシートのドロップダウンと同形式）
+        if (/^[AB]C[）(]/.test(tmplName)) {
+          pending.templateRaw = tmplName;
+          pending.templateName = tmplName;
+          console.log('[Snow-we] AC/BC形式テンプレートを直接採用:', tmplName);
+          sessionStorage.setItem('pendingScout', JSON.stringify(pending));
+          return;
+        }
+
+        const res = await chrome.runtime.sendMessage({ type: 'getPositionList' });
+        const positionList = res?.positions || [];
+        const normT = s => stripFirmPrefix(s)
+          .replace(/^[A-Za-z]+[）)]\s*/u, '')
+          .replace(/[（]/g, '(').replace(/[）]/g, ')')
+          .replace(/　/g, ' ').replace(/\s*[-－–—]\s*/g, '-')
+          .trim().toLowerCase();
+        // 末尾の部署コード・チーム名を除去（大文字小文字・日本語対応）
+        const stripSuffix = p => p
+          .replace(/\s*[-–—－]\s*[A-Za-z]{2,}[\s）)]*$/, '')
+          .replace(/\s*[-–—－]\s*[゠-ヿ一-鿿]{2,}[\s）)]*$/, '')
+          .trim();
+
+        const sorted = [...positionList].sort((a, b) => b.length - a.length);
+        // 完全一致 → サフィックス除去後一致（一意の場合のみ）の順で照合
+        const exactHits = sorted.filter(p => p && normT(tmplName) === normT(p));
+        const stripHits = exactHits.length === 0
+          ? sorted.filter(p => { const t = stripSuffix(p); return t.length >= 8 && normT(tmplName) === normT(t); })
+          : [];
+        // 候補が複数ある場合は誤マッチを避けるため採用しない
+        const candidates = exactHits.length > 0 ? exactHits : stripHits;
+        const matched = candidates.length === 1 ? candidates[0] : '';
+        console.log('[Snow-we] テンプレート照合試行: tmplName=', tmplName, '/ matched=', matched || 'なし（templateRawを使用）');
+
+        pending.templateRaw = tmplName;
+        if (matched) {
+          pending.templateName = matched;
+          console.log('[Snow-we] テンプレート名からポジション照合成功:', matched);
+        } else {
+          // マスターリストと一致しなくても、実際に選択されたテンプレート名の方が
+          // 無関係な古いドロップダウン値（fallbackPosition）より正しい記録になるため、
+          // 生のテンプレート名をそのまま採用する
+          pending.templateName = tmplName;
+          console.log('[Snow-we] テンプレート名照合失敗。生のテンプレート名をそのまま採用:', tmplName);
+        }
+        sessionStorage.setItem('pendingScout', JSON.stringify(pending));
+      } catch (err) {
+        console.log('[Snow-we] 確定ハンドラエラー:', err);
+      }
+    })();
+    return;
+  }
+
+  // ── 確認ボタン：メール本文からポジションを照合 ──
+  if (isConfirmBtn) {
+    const raw = sessionStorage.getItem('pendingScout');
+    if (!raw) return;
+    (async () => {
+      try {
+        const pending = JSON.parse(raw);
+        // スカウトメール作成モーダル内だけを検索（スカウト履歴パネルを除外するため）
+        const modal = document.querySelector('[role="dialog"]') ||
+                      document.querySelector('[class*="modal" i]') ||
+                      document.querySelector('[class*="dialog" i]');
+        const searchRoot = modal || document.body;
+        const bodyEl = searchRoot.querySelector('textarea') ||
+                       searchRoot.querySelector('[contenteditable="true"]');
+        let bodyText = '';
+        if (bodyEl) {
+          bodyText = bodyEl.value || bodyEl.innerText || '';
+        } else {
+          // モーダルが見つからない場合はページ全体から「スカウト履歴」以降を除外して使用
+          const rawPageText = searchRoot.innerText || '';
+          const histIdx = rawPageText.indexOf('スカウト履歴');
+          bodyText = histIdx > 50 ? rawPageText.substring(0, histIdx) : rawPageText;
+        }
+
+        // テンプレート名は「確定」ボタン押下時点（テンプレート選択モーダルがまだ
+        // 開いている間）に既に正しく取得できているはずなので、それを最優先で使う。
+        // この確認画面には本来のテンプレート名はもう表示されておらず、ここで独自に
+        // 探そうとすると候補者プロフィール欄の見出し等、無関係なテキストを誤って
+        // 拾ってしまっていた（実機調査で確認済み）。
+        let tmplRaw = pending.templateRaw || '';
+        if (!tmplRaw) {
+          const tmplSel = searchRoot.querySelector('select');
+          if (tmplSel) {
+            const selText = (tmplSel.options[tmplSel.selectedIndex]?.text || '').trim();
+            if (selText && selText.length > 3) tmplRaw = selText;
+          }
+        }
+        if (!tmplRaw) {
+          // テンプレート名ラベルを探す（selected/active な行のタイトル等）。
+          // このセレクタは汎用的すぎて、RDSの候補者詳細パネル内にある「職務要約」等の
+          // プロフィール見出し（active/title系のクラス名を持つ）を誤って拾ってしまう
+          // 事故が実データで確認された（ポジション名が「職務要約」という明らかに
+          // おかしい値でRDS 74件記録されていた）。プロフィール見出しとして使われがちな
+          // 語句は明確に除外する
+          const activeLabel = searchRoot.querySelector('[class*="selected"] [class*="title"], [class*="active"] [class*="title"], [class*="template"][class*="name"]');
+          const activeLabelText = activeLabel ? (activeLabel.textContent || '').trim() : '';
+          const PROFILE_SECTION_HEADINGS = ['職務要約', '職務経歴', 'スキル', 'プロフィール', '学歴', '資格', '自己PR', 'スカウト履歴'];
+          if (activeLabelText && !PROFILE_SECTION_HEADINGS.includes(activeLabelText)) {
+            tmplRaw = activeLabelText;
+          }
+        }
+
+        // 確定ボタン押下時点で既にポジション照合まで済んでいるなら、
+        // 本文の記録だけ済ませてここでの再照合はスキップする
+        if (pending.templateName) {
+          if (bodyText && !pending.bodyText) pending.bodyText = bodyText.substring(0, 2000);
+          sessionStorage.setItem('pendingScout', JSON.stringify(pending));
+          return;
+        }
+
+        let matched = '';
+        try {
+          const res = await chrome.runtime.sendMessage({ type: 'getPositionList' });
+          const positionList = res?.positions || [];
+          const sorted = [...positionList].sort((a, b) => b.length - a.length);
+          const normStr = s => stripFirmPrefix(s)
+            .replace(/[-–—－]/g, '-').replace(/[（]/g, '(').replace(/[）]/g, ')')
+            .replace(/　/g, ' ').trim();
+          const stripSuffix2 = p => p
+            .replace(/\s*[-–—－]\s*[A-Za-z]{2,}[\s）)]*$/, '')
+            .replace(/\s*[-–—－]\s*[゠-ヿ一-鿿]{2,}[\s）)]*$/, '')
+            .trim();
+          const normBody = normStr(bodyText);
+          console.log('[Snow-we] メール本文先頭200字:', bodyText.substring(0, 200));
+          // テンプレート名一致（取得できた場合）→ 本文内ポジション一致（一意のみ）の順で照合
+          if (tmplRaw) {
+            // AC）/ BC( 形式はスプレッドシートのドロップダウンと同形式なので直接採用
+            if (/^[AB]C[）(]/.test(tmplRaw)) {
+              matched = tmplRaw;
+            } else {
+              const exactHits = sorted.filter(p => p && normStr(tmplRaw) === normStr(p));
+              const stripHits = exactHits.length === 0
+                ? sorted.filter(p => { const t = stripSuffix2(p); return t.length >= 8 && normStr(tmplRaw) === normStr(t); })
+                : [];
+              const tmplCandidates = exactHits.length > 0 ? exactHits : stripHits;
+              if (tmplCandidates.length === 1) matched = tmplCandidates[0];
+            }
+          }
+          // 「」引用テキスト照合（BC（FAS）→「FASグループ」等の略称マッチを含む）
+          if (!matched) {
+            const quotedList = [...bodyText.substring(0, 400).matchAll(/「([^」]+)」/g)].map(m => normStr(m[1].trim()));
+            for (const qn of quotedList) {
+              if (qn.length < 3) continue;
+              const qHits = sorted.filter(p => {
+                if (!p || typeof p !== 'string') return false;
+                const np = normStr(p), ns = normStr(stripSuffix2(p));
+                if (np === qn || ns === qn) return true;
+                if (np.startsWith(qn) || ns.startsWith(qn)) return true;
+                const inner = (p.match(/[（(]([^）)]{2,6})[）)]/) || [])[1] || '';
+                return inner && qn.startsWith(normStr(inner));
+              });
+              if (qHits.length === 1) { matched = qHits[0]; break; }
+            }
+          }
+          // テンプレート名で照合できなかった場合のみ本文照合（一意チェック付き）
+          if (!matched) {
+            const bodyHits = sorted.filter(p => p && normBody.includes(normStr(p)));
+            if (bodyHits.length === 1) matched = bodyHits[0];
+          }
+          // 語順が入れ替わっているケースのフォールバック（例: 本文「自動車領域DXソリューション
+          // コンサルタント」 vs マスタ「DXソリューションコンサルタント(自動車領域)-IND」）。
+          // 完全な部分文字列一致はしなくても、主要な語句がすべて本文に含まれていれば一致とみなす
+          if (!matched) {
+            const tokenize = p => stripSuffix2(p)
+              .replace(/[（）()]/g, ' ')
+              .split(/[\s・\/／]+/)
+              .map(t => t.trim())
+              .filter(t => t.length >= 2);
+            const tokenHits = sorted.filter(p => {
+              if (!p) return false;
+              const tokens = tokenize(p);
+              return tokens.length > 0 && tokens.every(t => normBody.includes(normStr(t)));
+            });
+            if (tokenHits.length === 1) {
+              matched = tokenHits[0];
+              console.log('[Snow-we] 語順違いの本文照合で一致:', matched);
+            }
+          }
+        } catch (_) {}
+
+        // 生テンプレート名・メール本文・照合結果を保存
+        if (tmplRaw && !pending.templateRaw) pending.templateRaw = tmplRaw;
+        if (bodyText && !pending.bodyText) pending.bodyText = bodyText.substring(0, 2000);
+        if (matched) {
+          pending.templateName = matched;
+          console.log('[Snow-we] ポジション照合成功:', matched);
+        } else if (tmplRaw) {
+          // マスターリストと一致しなくても、無関係な古いドロップダウン値
+          // （fallbackPosition）に頼るよりは、実際のテンプレート名の方が正しい
+          pending.templateName = tmplRaw;
+          console.log('[Snow-we] ポジション照合できず。生のテンプレート名をそのまま採用:', tmplRaw);
+        } else {
+          console.log('[Snow-we] ポジション照合できず。templateRawもなし');
+        }
+        sessionStorage.setItem('pendingScout', JSON.stringify(pending));
+      } catch (_) {}
+    })();
+    return;
+  }
+
+  // ── 送信ボタン：スカウト記録 ──
+
+  // RDSは送信リクエストの検知に一本化した。二重に記録しないよう、ここでは何もしない。
+  // ただし切り替えるのは net-hook.js が動いていることを確認できた場合だけにする。
+  // フックが動かない環境で一本化すると、記録が丸ごと止まってしまうため
+  //
+  // bizreach も通信で検知するようにした（v1.36.0）が、ここは RDS しか止めていなかった。
+  // そのため bizreach は1回の送信でボタン経路が先に記録して pendingScout を消し、
+  // 通信経路は候補者を特定できず「この送信は記録されませんでした」と誤って警告し、
+  // 失敗としても報告していた。送信が失敗してもボタン経路は記録してしまう問題もある
+  if (SEND_REQUESTS[getPlatform()] && isNetHookAlive()) {
+    // pendingScout はここで消さない。スカウトボタンを押した時点で取れている
+    // 候補者情報（会社名・年齢・大学）とテンプレート名が入っており、送信検知側が
+    // これを使う。以前ここで消しており、会社名が空のまま記録されていた。
+    // 送信が成立すると画面が切り替わるので、テンプレート名と本文はいま読んで渡す
+    try {
+      const pr = sessionStorage.getItem('pendingScout');
+      if (pr) {
+        const p = JSON.parse(pr);
+        const snap = readSendFormSnapshot(getPlatform());
+        // ビズリーチはテンプレート名が送信画面に出たままなので、押した時点の画面の値が
+        // 常に正しい。「まだ入っていなければ入れる」だと、一度送信を押して入力エラー等で
+        // 成立しなかったあとにテンプレートを選び直して送り直した場合、最初に押したときの
+        // 名前が残る。画面から読めたときだけ上書きする（読めなければ既存の値を残す）。
+        // RDSは「確定」を押した時点でしか取れないため、こちらは従来どおりにする
+        if (getPlatform() === 'bizreach' && snap.templateRaw) p.templateRaw = snap.templateRaw;
+        else if (!p.templateRaw && snap.templateRaw) p.templateRaw = snap.templateRaw;
+        if (!p.bodyText && snap.bodyText) p.bodyText = snap.bodyText;
+        sessionStorage.setItem('pendingScout', JSON.stringify(p));
+      }
+    } catch (_) {}
+    console.log(`[Snow-we] ${getPlatform()}: 記録は送信リクエストの検知に任せます`);
+    return;
+  }
+
+  const sendClickedAt = Date.now();
+  const formSnap = readSendFormSnapshot(getPlatform());
+  let raw = sessionStorage.getItem('pendingScout');
+  const hadPending = !!raw;
+  console.log('[Snow-we] 送信クリック / pendingScout:', raw ? 'あり' : 'なし');
+  sessionStorage.removeItem('pendingScout');
+
+  // 開始の「スカウト」クリックが何らかの理由で検知できず（例: RDSの一括送信のように
+  // 個別クリックを経由せず「送信」だけが実行されるフロー）pendingScoutが作られて
+  // いなかった場合の保険。送信ボタンが押せている＝候補者の詳細パネルは開いている
+  // はずなので、その場で候補者情報を組み立て直す（記録が完全に消えるより優先する）
+  if (!raw) {
+    const platform = getPlatform();
+    // Bizreachもこのフォールバックの対象外だったため、開始クリックを取り逃すと
+    // 記録がまるごと消えていた（実データで未登録率85%を確認）
+    const detailPanel = findDetailPanelForPlatform(platform);
+    if (detailPanel) {
+      const id = getCandidateId(detailPanel);
+      if (id) {
+        // Greenは「テンプレート」チップのクリック追跡で拾ったテンプレート名(_cachedGreenTemplate)を
+        // ポジション名として使う。チップの表示は選択後も変わらないため、送信直前のDOM読み取り
+        // だけでは選択済みテンプレートが分からない（実機で確認）。
+        // 本文(scout_message)もこの時点でtextareaから直接読み取っておく
+        const templateName = platform === 'green' ? _cachedGreenTemplate : '';
+        const bodyText = platform === 'green'
+          ? (document.querySelector('.MuiModal-root textarea, .MuiDialog-root textarea')?.value || '')
+          : '';
+        raw = JSON.stringify({
+          id, info: extractBasicInfo(detailPanel), ts: Date.now(),
+          fallbackPosition: _cachedCurrentPosition, templateName, bodyText,
+        });
+        console.log(`[Snow-we] ${platform}: pendingScoutが無かったため送信時点の詳細パネルから復元:`, id,
+          templateName ? `/ template: ${templateName}` : '');
+      }
+    }
+  }
+
+  // 送信ボタンは押せたのに候補者を特定できなかった場合。ここまで来て raw が無いと、
+  // 以降の記録処理には一切入らず、画面にも何も出ないまま送信だけが成立する。
+  // 実データで、ある担当者のRDSだけ25分間に19件連続で記録が消えており、
+  // 前後の別媒体は正常だったため、気づく手がかりがまったく無かった
+  if (!raw) {
+    (async () => {
+      // 返信（スカウトではない送信）なら記録されなくて正しいので、警告も報告もしない
+      if (NOT_SEND_REQUESTS[getPlatform()]) {
+        for (let i = 0; i < 10 && _lastNotSendRequestAt < sendClickedAt; i++) await sleep(250);
+        if (_lastNotSendRequestAt >= sendClickedAt) return;
+      }
+      reportRecordFailure('送信ボタンは押されたが候補者を特定できない', { buttonText: textCore });
+      try {
+        showAutoStatus(
+          '⚠️ この送信は記録されませんでした（候補者を特定できていません）。'
+          + '管理者に、いまの画面と操作手順を伝えてください',
+          12000,
+        );
+      } catch (_) {}
+    })();
+  }
+
+  if (raw) {
+    (async () => {
+      // 返信は、スカウトではないので記録してはいけない。
+      // doda-Xの「メッセージ返信」画面は送信ボタンが「送信する」で、スカウト送信と
+      // 同じ文言になる。さらに、この画面でも候補者を復元できてしまうため（メッセージ
+      // 一覧の行から会社名や会員番号が読めてしまう）、返信を送るたびにスカウトが
+      // 1件記録されていた。実データで確認したもの：
+      //   「程 謙富士通株式会社」「田中 瞳AGC株式会社」「00924245富士通株式会社」
+      // これらは候補者カードではなくメッセージ一覧の行で、「氏名｜会社名」の
+      // 区切りがinnerTextで消えて連結されている。会社名の崩れもここが出所だった。
+      //
+      // 画面の作りで見分けると媒体の変更で壊れるので、実際に飛んだ通信で判断する。
+      // 返信の通信（NOT_SEND_REQUESTS）が来たら記録しない。
+      // 下の「候補者を特定できない」場合の警告抑制と同じ待ち方にそろえている
+      if (NOT_SEND_REQUESTS[getPlatform()]) {
+        for (let i = 0; i < 10 && _lastNotSendRequestAt < sendClickedAt; i++) await sleep(250);
+        if (_lastNotSendRequestAt >= sendClickedAt) {
+          console.log('[Snow-we] 返信の送信だったため記録しません');
+          return;
+        }
+      }
+      try {
+        const pending = JSON.parse(raw);
+        if (pending && pending.id && Date.now() - pending.ts < 30 * 60 * 1000) {
+          // AMBIはテンプレートドロップダウンからポジションを取得、本文も送信時に取得。
+          // getPositionList等の非同期呼び出しが失敗した場合でも、外側のcatchまで例外が
+          // 伝播してrecordScoutSent自体が一切呼ばれなくなる（記録が完全に消える）事故を
+          // 防ぐため、テンプレート照合はここだけで失敗を吸収し、記録処理は必ず続行する
+          try { if (getPlatform() === 'ambi') {
+            // テンプレート名からポジション照合
+            if (!pending.templateName) {
+              // 実機DOM調査で判明: ページには「絞り込み」「200件表示」「並び順」等の
+              // 一覧用<select>が複数あり、無条件のquerySelector('select')だとそれらの
+              // どれかを誤って掴む(実機で「最終ログイン日（降順）」が記録される事故を
+              // 確認済み)。テンプレート選択は.js_template_select内の<select>で一意に
+              // 特定できる(.js_rescoutは再送信フロー用の別要素なので除外)
+              const tmplSel = document.querySelector('select.js_template_select:not(.js_rescout)')
+                || document.querySelector('.js_template_select:not(.js_rescout) select')
+                || document.querySelector('select.js_template_select')
+                || document.querySelector('.js_template_select select');
+              const tmplVal = tmplSel ? (tmplSel.options[tmplSel.selectedIndex]?.text || '').trim() : '';
+              if (tmplVal && tmplVal !== 'テンプレートの選択') {
+                if (!pending.templateRaw) pending.templateRaw = tmplVal;
+                const res = await chrome.runtime.sendMessage({ type: 'getPositionList' });
+                const positionList = res?.positions || [];
+                const sorted = [...positionList].sort((a, b) => b.length - a.length);
+                const normStr = s => stripFirmPrefix(s).replace(/[-–—－]/g, '-').replace(/[（]/g, '(').replace(/[）]/g, ')').replace(/　/g, ' ').trim();
+                const stripSuffix3 = p => p.replace(/\s*[-–—－]\s*[A-Za-z]{2,}[\s）)]*$/, '').replace(/\s*[-–—－]\s*[゠-ヿ一-鿿]{2,}[\s）)]*$/, '').trim();
+                const exactHits = sorted.filter(p => p && normStr(tmplVal) === normStr(p));
+                const stripHits = exactHits.length === 0
+                  ? sorted.filter(p => { const t = stripSuffix3(p); return t.length >= 8 && normStr(tmplVal) === normStr(t); })
+                  : [];
+                const candidates2 = exactHits.length > 0 ? exactHits : stripHits;
+                if (candidates2.length === 1) {
+                  pending.templateName = candidates2[0];
+                  console.log('[Snow-we] AMBI: ポジション照合成功:', candidates2[0]);
+                } else {
+                  // RDS/doda-Xと同様、マスターリストと一致しなくても生のテンプレート名を
+                  // フォールバックとして採用する（以前はここが空欄になり記録から
+                  // ポジションが完全に抜け落ちていた）
+                  pending.templateName = tmplVal;
+                  console.log('[Snow-we] AMBI: ポジション照合できず。生のテンプレート名をそのまま採用:', tmplVal);
+                }
+              }
+            }
+            // 確認ステップがないため送信時にメール本文を取得
+            if (!pending.bodyText) {
+              const ta = document.querySelector('textarea');
+              if (ta && ta.value && ta.value !== 'スカウト本文を入力') {
+                pending.bodyText = ta.value.substring(0, 2000);
+              }
+            }
+          } } catch (err) { console.warn('[Snow-we] AMBIテンプレート照合中にエラー（記録は続行します）:', err.message); }
+          // doda-Xも確認ステップがないため送信時にテンプレート名を取得する。
+          // 「テンプレート」欄はvue-select製のカスタムコンポーネントで、選択済みの値は
+          // ネイティブ<select>ではなく<span class="vs__selected">の中に入る（実機DOM調査で確認済み）
+          try { if (getPlatform() === 'dodax' && !pending.templateName) {
+            const selectedSpan = document.querySelector('.vs__selected');
+            // 長いテンプレート名だと、vue-selectの表示上の省略により<span>のtextContent自体が
+            // 末尾で欠けることが実機で確認された（例:「オープンポジション）」の閉じ括弧が消える）。
+            // title属性に完全なテキストが入っている場合はそちらを優先する
+            const tmplVal = selectedSpan
+              ? (selectedSpan.getAttribute('title') || selectedSpan.textContent || '').trim()
+              : '';
+            if (tmplVal) {
+              if (!pending.templateRaw) pending.templateRaw = tmplVal;
+              // AC）/BC(形式でも、上記の表示切れで末尾が欠けている可能性があるため、
+              // 直接採用する前にマスターリストとの照合を試みる（前方一致も含む）
+              const res = await chrome.runtime.sendMessage({ type: 'getPositionList' });
+              const positionList = res?.positions || [];
+              const sorted = [...positionList].sort((a, b) => b.length - a.length);
+              const normStr = s => stripFirmPrefix(s).replace(/[-–—－]/g, '-').replace(/[（]/g, '(').replace(/[）]/g, ')').replace(/　/g, ' ').trim();
+              const stripSuffix4 = p => p.replace(/\s*[-–—－]\s*[A-Za-z]{2,}[\s）)]*$/, '').replace(/\s*[-–—－]\s*[゠-ヿ一-鿿]{2,}[\s）)]*$/, '').trim();
+              const nTmpl = normStr(tmplVal);
+              const exactHits = sorted.filter(p => p && nTmpl === normStr(p));
+              const stripHits = exactHits.length === 0
+                ? sorted.filter(p => { const t = stripSuffix4(p); return t.length >= 8 && nTmpl === normStr(t); })
+                : [];
+              // 表示切れ対策：候補者名が基準の前方一致（先頭が一致し、末尾だけ欠けている）で
+              // 一意に絞れる場合も採用する
+              const prefixHits = (exactHits.length === 0 && stripHits.length === 0 && nTmpl.length >= 10)
+                ? sorted.filter(p => p && normStr(p).startsWith(nTmpl))
+                : [];
+              const candidates3 = exactHits.length > 0 ? exactHits : (stripHits.length > 0 ? stripHits : prefixHits);
+              if (candidates3.length === 1) {
+                pending.templateName = candidates3[0];
+                console.log('[Snow-we] doda-x テンプレート名からポジション照合成功:', candidates3[0]);
+              } else if (/^[AB]C[）(]/.test(tmplVal)) {
+                pending.templateName = tmplVal;
+                console.log('[Snow-we] doda-x AC/BC形式テンプレートを直接採用:', tmplVal);
+              } else {
+                // マスターリストと一致しなくても、無関係な古いドロップダウン値
+                // （fallbackPosition）より実際のテンプレート名の方が正しい記録になる
+                pending.templateName = tmplVal;
+                console.log('[Snow-we] doda-x テンプレート名照合できず。生のテンプレート名をそのまま採用:', tmplVal);
+              }
+            }
+          } } catch (err) { console.warn('[Snow-we] doda-xテンプレート照合中にエラー（記録は続行します）:', err.message); }
+          // Bizreachも確認ステップがないため送信時にテンプレート名を取得する。
+          // 「テンプレートを選択」欄はb-ui-select製のカスタムコンポーネントで、選択済みの値は
+          // ネイティブ<select>ではなく<span class="bui-select-box-label">の中に入る（実機DOM調査で確認済み）
+          try { if (getPlatform() === 'bizreach' && !pending.templateName) {
+            const selectedLabel = document.querySelector('[data-templates-dropdown] .bui-select-box-label');
+            const tmplVal = selectedLabel ? (selectedLabel.textContent || '').trim() : '';
+            if (tmplVal) {
+              if (!pending.templateRaw) pending.templateRaw = tmplVal;
+              const res = await chrome.runtime.sendMessage({ type: 'getPositionList' });
+              const positionList = res?.positions || [];
+              const sorted = [...positionList].sort((a, b) => b.length - a.length);
+              const normStr = s => stripFirmPrefix(s).replace(/[-–—－]/g, '-').replace(/[（]/g, '(').replace(/[）]/g, ')').replace(/　/g, ' ').trim();
+              const stripSuffix5 = p => p.replace(/\s*[-–—－]\s*[A-Za-z]{2,}[\s）)]*$/, '').replace(/\s*[-–—－]\s*[゠-ヿ一-鿿]{2,}[\s）)]*$/, '').trim();
+              const nTmpl = normStr(tmplVal);
+              const exactHits = sorted.filter(p => p && nTmpl === normStr(p));
+              const stripHits = exactHits.length === 0
+                ? sorted.filter(p => { const t = stripSuffix5(p); return t.length >= 8 && nTmpl === normStr(t); })
+                : [];
+              const candidates4 = exactHits.length > 0 ? exactHits : stripHits;
+              if (candidates4.length === 1) {
+                pending.templateName = candidates4[0];
+                console.log('[Snow-we] Bizreach テンプレート名からポジション照合成功:', candidates4[0]);
+              } else if (/^[AB]C[）(]/.test(tmplVal)) {
+                pending.templateName = tmplVal;
+                console.log('[Snow-we] Bizreach AC/BC形式テンプレートを直接採用:', tmplVal);
+              } else {
+                // マスターリストと一致しなくても、無関係な古いドロップダウン値
+                // （fallbackPosition）より実際のテンプレート名の方が正しい記録になる
+                pending.templateName = tmplVal;
+                console.log('[Snow-we] Bizreach テンプレート名照合できず。生のテンプレート名をそのまま採用:', tmplVal);
+              }
+            }
+          } } catch (err) { console.warn('[Snow-we] Bizreachテンプレート照合中にエラー（記録は続行します）:', err.message); }
+          // fallbackPositionは「スカウト」ボタン押下時点でこの候補者用に固定済みの値をそのまま使う。
+          // 以前はここで送信直前にドロップダウンの「今の」値を読み直していたが、複数候補者を
+          // 連続処理する運用では、候補者Aの送信が完了する前に次の候補者B用にドロップダウンを
+          // 変更してしまうことがあり、その場合Aに本来の位置ではなくBの位置が記録される
+          // バグになっていた（スカウト時点で捕まえた値こそが、この候補者にとって正しい値）
+          const latestPosition = pending.fallbackPosition || '';
+          if (!pending.bodyText && formSnap.bodyText) pending.bodyText = formSnap.bodyText;
+
+          // doda X の返信対策。スカウト開始ボタンを経ていない送信は、メッセージへの
+          // 返信の可能性がある。返信の通信（NOT_SEND_REQUESTS）が来たら記録しない。
+          // 開始ボタンを経た送信（hadPending）は本物のスカウトなので待たない
+          if (!hadPending && NOT_SEND_REQUESTS[getPlatform()]) {
+            for (let i = 0; i < 10 && _lastNotSendRequestAt < sendClickedAt; i++) await sleep(250);
+            if (_lastNotSendRequestAt >= sendClickedAt) {
+              console.log('[Snow-we] メッセージの返信だったため記録しません:', pending.id);
+              return;
+            }
+          }
+
+          // AMBI: 「送信」を押した直後に「スカウトを送信しますか？」という確認
+          // ダイアログが出ることがある(実機で確認)。以前はここで即座に記録していた
+          // ため、万が一「いいえ」でキャンセルしても記録されてしまう恐れがあった。
+          // ダイアログの出現を少し待ち、出ていれば「はい」クリックまで記録を保留する
+          if (getPlatform() === 'ambi') {
+            let hasConfirmDialog = false;
+            for (let i = 0; i < 6; i++) {
+              if ((document.body.innerText || '').includes('スカウトを送信しますか')) { hasConfirmDialog = true; break; }
+              await sleep(150);
+            }
+            if (hasConfirmDialog) {
+              sessionStorage.setItem('pendingScoutConfirm', JSON.stringify({
+                id: pending.id,
+                info: pending.info || {},
+                templateName: pending.templateName || '',
+                bodyText: pending.bodyText || '',
+                fallbackPosition: latestPosition,
+                confirmTs: Date.now(),
+              }));
+              console.log('[Snow-we] AMBI: 確認ダイアログを検知。「はい」クリックまで記録を保留します');
+              return;
+            }
+          }
+
+          console.log('[Snow-we] recordScoutSent 呼び出し id:', pending.id, '/ template:', pending.templateName || 'なし', '/ fallback:', latestPosition || 'なし');
+          recordScoutSent(pending.id, pending.info || {}, pending.templateName || '', pending.bodyText || '', latestPosition);
+        }
+      } catch (err) {
+        // ここを無言で握り潰していたため、テンプレート照合等の途中で例外が出ると
+        // recordScoutSentに到達しないまま記録が消え、しかも何が起きたか分からなかった。
+        // せめて候補者IDが分かっていれば記録を残せるので、最低限の内容で記録を試みる
+        console.warn('[Snow-we] 送信時の記録処理でエラー:', err?.message || err);
+        try {
+          const p = JSON.parse(raw);
+          if (p?.id) recordScoutSent(p.id, p.info || {}, p.templateName || '', p.bodyText || '', p.fallbackPosition || '');
+        } catch (_) {}
+      }
+    })();
+  }
+}, true);
+
+// -------------------------------------------------------
+// 承認待ちレビュー時、検討中リストページで対象候補者を自動で探してハイライトする
+// -------------------------------------------------------
+// スカウト送信RPA（taichi536/scout, src/rds/findCandidateCard.js）で実機検証済みの
+// マッチングロジック（法人格つきフル会社名優先＋短いコアへのフォールバック、大学名での
+// タイブレーク、祖先階層探索でのボタン特定、レスポンシブ重複レイアウトの除外）をそのまま
+// 移植したもの。RPAは自動送信のためにこれを使うが、ここでは「本人らしきカードを見つけて
+// 画面をスクロール・ハイライトするだけ」で、クリック等の操作は一切行わない
+// （実際の送信可否判断・操作は必ず人が行う。送信そのものはRPAが別途担当する）。
+const SNOWWE_FIND_SCOUT_EXACT = ['スカウト'];
+const SNOWWE_FIND_SCOUT_INCLUDE = ['スカウトを送る', 'スカウトする', 'スカウトを作成'];
+const SNOWWE_FIND_MAX_CARD_TEXT_LENGTH = 1500;
+
+function snowweFindExtractCompanyCore(s) {
+  const core = String(s || '')
+    .replace(/株式会社/g, '')
+    .replace(/[（(]株[）)]/g, '')
+    .replace(/\s/g, '')
+    .trim();
+  return core.length >= 2 ? core : String(s || '').trim();
+}
+
+function snowweFindCompanyMatchVariants(company) {
+  const raw = String(company || '').trim();
+  const core = snowweFindExtractCompanyCore(company);
+  const variants = new Set();
+  if (raw) variants.add(raw);
+  if (core && core !== raw) {
+    variants.add(`株式会社${core}`);
+    variants.add(`${core}株式会社`);
+    variants.add(`（株）${core}`);
+    variants.add(`${core}（株）`);
+    variants.add(`(株)${core}`);
+    variants.add(`${core}(株)`);
+  }
+  return { strictVariants: Array.from(variants), core };
+}
+
+function snowweFindIsVisible(el) {
+  if (el.offsetParent === null) return false;
+  const style = window.getComputedStyle(el);
+  return style.visibility !== 'hidden' && style.display !== 'none';
+}
+
+function snowweFindIsScoutTrigger(t) {
+  if (SNOWWE_FIND_SCOUT_EXACT.includes(t)) return true;
+  return SNOWWE_FIND_SCOUT_INCLUDE.some((s) => t.includes(s));
+}
+
+function snowweFindCandidateButton({ strictVariants, core, wantAge, wantUniv }) {
+  function runPass(matchesCompany) {
+    let textMatches = Array.from(
+      document.querySelectorAll('div, li, article, section, label, tr, form, fieldset, p, span')
+    ).filter((el) => {
+      const t = el.innerText || '';
+      if (t.length > SNOWWE_FIND_MAX_CARD_TEXT_LENGTH) return false;
+      if (!matchesCompany(t)) return false;
+      if (wantAge && !t.includes(`${wantAge}歳`)) return false;
+      if (!snowweFindIsVisible(el)) return false;
+      return true;
+    });
+    textMatches = textMatches.filter((el) => !textMatches.some((other) => other !== el && other.contains(el)));
+    if (textMatches.length === 0) return null;
+
+    // button -> { ancestor: 収束した祖先要素, start: 会社名+年齢を含んでいた元の(候補者情報側の)要素 }
+    // startは右カラムのスカウトボタンとは別の左カラム（候補者情報）側の要素なので、
+    // 誤ってスカウトボタンを押してしまうことなく「候補者詳細を開く」クリック対象として使える
+    const resolvedMap = new Map();
+    for (const start of textMatches) {
+      let ancestor = start;
+      for (let depth = 0; ancestor && depth < 15; ancestor = ancestor.parentElement, depth++) {
+        const buttonsHere = Array.from(ancestor.querySelectorAll('button, a, [role="button"]')).filter(
+          (b) => snowweFindIsScoutTrigger((b.innerText || '').trim()) && snowweFindIsVisible(b)
+        );
+        if (buttonsHere.length === 1) {
+          if (!resolvedMap.has(buttonsHere[0])) resolvedMap.set(buttonsHere[0], { ancestor, start });
+          break;
+        }
+        if (buttonsHere.length > 1) break;
+      }
+    }
+    let candidates = Array.from(resolvedMap.entries());
+    if (wantUniv && candidates.length > 1) {
+      const narrowed = candidates.filter(([, v]) => (v.ancestor.innerText || '').includes(wantUniv));
+      if (narrowed.length >= 1) candidates = narrowed;
+    }
+    return candidates.length === 1
+      ? { btn: candidates[0][0], ancestor: candidates[0][1].ancestor, start: candidates[0][1].start }
+      : null;
+  }
+
+  // まず法人格表記込みのフルの会社名（前株/後株どちらの表記も試す）で厳密一致、
+  // 見つからなければ短いコアでの緩い一致にフォールバック
+  return runPass((t) => strictVariants.some((v) => t.includes(v))) || runPass((t) => t.includes(core));
+}
+
+async function snowweFindScrollForLoadMore() {
+  window.scrollTo(0, document.documentElement.scrollHeight);
+  const scrollable = Array.from(document.querySelectorAll('*')).find(
+    (el) => el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 300
+  );
+  if (scrollable) scrollable.scrollTop = scrollable.scrollHeight;
+  await new Promise((r) => setTimeout(r, 200));
+
+  const loadMoreEl = Array.from(document.querySelectorAll('button, a, [role="button"], div, span')).find((el) => {
+    const t = (el.innerText || el.textContent || '').trim();
+    return t === 'さらに読み込む' || t.includes('さらに読み込む');
+  });
+  if (!loadMoreEl) return;
+  try {
+    loadMoreEl.scrollIntoView({ block: 'center' });
+    loadMoreEl.click();
+  } catch (_) {}
+  await new Promise((r) => setTimeout(r, 500));
+}
+
+async function snowweFindAndHighlightCandidate({ company, age, univ }) {
+  const { strictVariants, core } = snowweFindCompanyMatchVariants(company);
+  if (!core) return false;
+  const wantAge = String(age || '').replace(/[^0-9]/g, '');
+  const wantUniv = String(univ || '').trim();
+
+  // 見つからない間、画面を強制的に最下部までスクロール→「さらに読み込む」を繰り返すため、
+  // アニメーションなしで瞬間移動が繰り返されカクカクして見える。以前は最大20秒間続けて
+  // いたが、見つからない場合は大抵「room_urlが間違っている（対象候補者がそもそもこの
+  // 部屋にいない）」等の理由で何秒粘っても見つからないため、短く切り上げて人手に委ねる
+  // 方が体験として良い。あわせて、諦めた場合は画面に分かりやすく伝える（今までは
+  // console.warnのみで、ユーザーからは「固まった」ようにしか見えなかった）
+  showAutoStatus(`🔍 ${core}さんを探しています...`);
+  const deadline = Date.now() + 8000;
+  for (;;) {
+    const found = snowweFindCandidateButton({ strictVariants, core, wantAge, wantUniv });
+    if (found) {
+      const { btn, start } = found;
+      btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      let highlightTarget = btn;
+      for (let i = 0; i < 4 && highlightTarget.parentElement; i++) highlightTarget = highlightTarget.parentElement;
+      highlightTarget.style.outline = '4px solid #f97316';
+      highlightTarget.style.outlineOffset = '3px';
+      setTimeout(() => {
+        highlightTarget.style.outline = '';
+        highlightTarget.style.outlineOffset = '';
+      }, 8000);
+      showAutoStatus(`✅ ${core}さんを見つけました`, 3000);
+
+      // 候補者詳細（レジュメ）画面まで自動で開く。startは会社名+年齢を含んでいた
+      // 候補者情報側の要素（スカウトボタンとは別カラム）なので、これをクリックしても
+      // 誤ってスカウト送信フローに入ることはない。getFullProfile()と同じ手法
+      // （カードクリック→詳細パネルでレジュメタブに切り替え）を流用する。
+      try {
+        start.click();
+        await new Promise((r) => setTimeout(r, 1200));
+        await tryClickRDSResumeTab();
+      } catch (_) {}
+      return true;
+    }
+    if (Date.now() >= deadline) {
+      showAutoStatus(
+        `⚠️ ${core}さんを自動で見つけられませんでした。手動でスクロールして探してください`,
+        6000
+      );
+      return false;
+    }
+    await snowweFindScrollForLoadMore();
+  }
+}
+
+// URLの#snowweFind=...に会社名/年齢/大学名が埋め込まれていたら、検討中リストページ上で
+// 自動的に本人のカードまでスクロール・ハイライトする（承認待ちポップアップの
+// 「🔗 検討中リストを開く」から呼ばれる。手動で探す手間をなくすための機能で、
+// クリック等の操作は一切行わない＝実際の送信は必ずRPA側が別途行う）
+function snowweInitAutoFindFromUrlHash() {
+  const m = location.hash.match(/snowweFind=([^&]+)/);
+  if (!m) return;
+  let params;
+  try {
+    params = JSON.parse(decodeURIComponent(m[1]));
+  } catch (_) {
+    return;
+  }
+  history.replaceState(null, '', location.pathname + location.search);
+  if (getPlatform() !== 'rds' || !params.company) return;
+  setTimeout(() => {
+    snowweFindAndHighlightCandidate(params).then((found) => {
+      if (!found) {
+        console.warn('[Snow-we] 自動での本人特定に失敗しました。手動で会社名・年齢を頼りに探してください:', params);
+      }
+    });
+  }, 1500); // ページ側の一覧描画を待つ
+}
+
+// -------------------------------------------------------
+// 「さらに読み込む」ボタンを押して全候補者をDOMに展開
+// -------------------------------------------------------
+async function loadAllCandidatesIntoDOM() {
+  const platform = getPlatform();
+  // BizreachはCDK仮想スクロールのため window.scrollTo では新カードをロードできない
+  // 仮想スクロールの制御はtriggerAutoAdd内の再帰スクロールループで行う
+  if (platform === 'bizreach') return;
+
+  // AMBI: per_page=1000 で全件表示済み → DOMにすでに存在するため何もしない
+  // (per_page チェック＆リダイレクトは triggerAutoAdd / autoScreenCandidates で行う)
+  if (platform === 'ambi') return;
+
+  const LOAD_MORE_TEXTS = ['さらに読み込む', 'もっと見る', 'Load more', '次の候補者'];
+  const MAX_LOADS = 100;
+  const TARGET_COUNT = 2000;
+
+  function findLoadMoreBtn() {
+    for (const el of document.querySelectorAll('button, a, div[role="button"], span')) {
+      const t = (el.innerText || '').trim();
+      if (LOAD_MORE_TEXTS.some(kw => t.includes(kw))) return el;
+    }
+    return null;
+  }
+
+  // ページ最下部までスクロールして遅延ロードを誘発
+  async function scrollToBottom() {
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+    await new Promise(r => setTimeout(r, 800));
+  }
+
+  let loaded = 0;
+
+  for (let i = 0; i < MAX_LOADS; i++) {
+    const countBefore = findCandidateCardsByPlatform().length;
+    if (countBefore >= TARGET_COUNT) break; // 目標人数に達したら終了
+
+    showAutoStatus(`📥 さらに読み込み中... (${countBefore}人 読み込み済み)`);
+    await scrollToBottom();
+
+    const btn = findLoadMoreBtn();
+    if (btn) btn.click();
+
+    await new Promise(r => setTimeout(r, 2000));
+    const countAfter = findCandidateCardsByPlatform().length;
+
+    loaded++;
+    if (countAfter <= countBefore) break; // 増えなければ終了（全員読み込み済み）
+  }
+
+  // 判定後バッジが見えるよう先頭に戻る
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  await new Promise(r => setTimeout(r, 600));
+}
+
+// -------------------------------------------------------
+// 自動判定：ページロード時に全候補者を自動スクリーニング
+// -------------------------------------------------------
+async function autoScreenCandidates() {
+  // triggerAutoAdd再開が予定されている場合はスキップ（APIコール重複を防ぐ）
+  if (_autoAddResuming) return;
+  // APIキーと設定を取得
+  let stored = {};
+  try { stored = await chrome.storage.local.get(['apiKey', 'screeningCriteria', 'currentPosition']); } catch (_) { return; }
+  const apiKey = (stored.apiKey || '').replace(/[^\x21-\x7E]/g, '').trim();
+  if (!apiKey || apiKey.length < 20) return; // APIキー未設定なら何もしない
+
+  const criteria = stored.screeningCriteria || {};
+  const currentPosition = stored.currentPosition || '';
+
+  // ポジション要件・フィードバックを並列取得（スクリーニング精度向上）
+  let posReq = '', companyCriteria = '', feedbacks = [];
+  try {
+    const [reqRes, fbData] = await Promise.all([
+      currentPosition ? fetchPositionRequirements(currentPosition) : Promise.resolve(null),
+      loadRecentFeedbacks(5),
+    ]);
+    posReq = reqRes?.requirements || '';
+    companyCriteria = reqRes?.companyCriteria || '';
+    feedbacks = fbData;
+  } catch (_) {}
+
+  // カード検出（DOMが安定するまで待つ）
+  await new Promise(r => setTimeout(r, 400));
+
+  // 初回カードチェック：候補者一覧ページでなければ終了
+  const initialCards = extractAllCandidateCards();
+  if (initialCards.length === 0) return;
+
+  injectStyles();
+  showAutoStatus('📥 候補者を全件読み込み中...');
+
+  // 「さらに読み込む」を自動クリックして全候補者をDOMに展開
+  await loadAllCandidatesIntoDOM();
+
+  // 全件読み込み後に再取得
+  const cards = extractAllCandidateCards();
+  if (cards.length === 0) return;
+
+  // 判定中バッジを全カードに表示
+  cards.forEach(c => {
+    if (getComputedStyle(c.el).position === 'static') c.el.style.position = 'relative';
+    const badge = document.createElement('div');
+    badge.className = 'snow-we-badge batch checking';
+    badge.textContent = '🔍 判定中...';
+    c.el.appendChild(badge);
+  });
+
+  showAutoStatus(`🔍 ${cards.length}人を判定中...`);
+
+  try {
+    const results = await callBatchScreeningAPI(apiKey, cards, criteria, posReq, feedbacks, currentPosition, companyCriteria);
+
+    // 結果をカードに反映
+    results.forEach((r, i) => {
+      if (!cards[i]) return;
+      const el = cards[i].el;
+      el.querySelectorAll('.snow-we-badge').forEach(b => b.remove());
+
+      const [cls, text] = r.overall === 'OK' ? ['ok', '✅ スカウト候補']
+                        : r.overall === 'NG' ? ['ng', '❌ 見送り']
+                        : ['warn', '⚠️ 要確認'];
+      setBatchBadge(el, cls, text, '', cards[i].summary?.substring(0, 200) || '', r.overall);
+
+      // OK候補者の追加ボタンを光らせる
+      if (r.overall === 'OK') {
+        highlightAddButton(el);
+      }
+    });
+
+    const okCount   = results.filter(r => r.overall === 'OK').length;
+    const ngCount   = results.filter(r => r.overall === 'NG').length;
+    const warnCount = results.filter(r => r.overall === '要確認').length;
+    showAutoStatus(`✅ 判定完了 — ✅${okCount}人 ⚠️${warnCount}人 ❌${ngCount}人`, 6000);
+
+    // Bizreach: 仮想スクロールでバッジが消えないよう監視を開始
+    if (getPlatform() === 'bizreach') startBizreachBadgeObserver();
+
+  } catch (e) {
+    cards.forEach(c => c.el.querySelectorAll('.snow-we-badge').forEach(b => b.remove()));
+    showAutoStatus(`❌ 判定エラー: ${e.message}`, 5000);
+  }
+}
+
+// 画面右下にステータス表示
+function showAutoStatus(message, autoDismissMs) {
+  let el = document.getElementById('snow-we-auto-status');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'snow-we-auto-status';
+    el.style.cssText = `
+      position: fixed; bottom: 20px; right: 20px; z-index: 2147483647;
+      background: #1e1b4b; color: #fff; font-size: 13px; font-weight: 600;
+      padding: 10px 18px; border-radius: 24px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+      font-family: -apple-system, sans-serif;
+      pointer-events: none;
+      transition: opacity 0.3s;
+    `;
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.style.opacity = '1';
+  if (autoDismissMs) {
+    clearTimeout(el._timer);
+    el._timer = setTimeout(() => { el.style.opacity = '0'; }, autoDismissMs);
+  }
+}
+
+function showPreviousResultsBanner(progress) {
+  const existing = document.getElementById('snow-we-results-banner');
+  if (existing) existing.remove();
+  const v = progress.verdicts || {};
+  const ok = v.ok || 0;
+  const ng = v.ng || 0;
+  const pending = v.pending || 0;
+  const total = progress.processed || 0;
+  if (total === 0) return;
+  const banner = document.createElement('div');
+  banner.id = 'snow-we-results-banner';
+  banner.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;background:rgba(30,30,30,0.92);color:#fff;padding:8px 16px;font-size:12px;font-family:-apple-system,sans-serif;display:flex;align-items:center;gap:16px;box-shadow:0 2px 8px rgba(0,0,0,0.3);`;
+  banner.innerHTML = `<span style="font-weight:600;">📊 前ページまでの選定結果 (${total}人判定)</span><span>✅ OK: <b>${ok}人</b></span><span>❌ NG: <b>${ng}人</b></span><span>⚠️ 要確認: <b>${pending}人</b></span><button onclick="this.parentElement.remove()" style="margin-left:auto;background:none;border:none;color:#aaa;cursor:pointer;font-size:16px;">×</button>`;
+  document.body.appendChild(banner);
+}
+
+// Claude API fetch with retry on 529 (overloaded)
+async function claudeFetch(apiKey, body, maxRetries = 4) {
+  // 利用額が上限に達していたらAPIを叩かない。一括処理はここから何十回も
+  // 呼ばれるため、歯止めが無いと一度の実行で使い切れてしまう
+  try {
+    const budget = await chrome.runtime.sendMessage({ type: 'checkApiBudget' });
+    if (budget && budget.ok === false) throw new Error(budget.reason || 'API利用額が上限に達しました');
+  } catch (e) {
+    // 拡張機能のコンテキストが切れている等、確認自体ができない場合は止めない。
+    // ただし上限超過のエラーはそのまま投げる
+    if (/上限/.test(e.message || '')) throw e;
+  }
+  let delay = 3000;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify(body)
+    });
+    if (response.status === 529 || response.status === 429) {
+      if (attempt === maxRetries) throw new Error('APIが混み合っています。しばらく待ってから再試行してください。');
+      showAutoStatus(`APIが混み合っています。${delay / 1000}秒後にリトライ... (${attempt + 1}/${maxRetries})`, delay - 200);
+      await sleep(delay);
+      delay = Math.min(delay * 2, 30000);
+      continue;
+    }
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error?.message || `APIエラー (${response.status})`);
+    }
+    const data = await response.json();
+    // 呼び出しごとの内訳をコンソールに出す。合計額（API利用額の表示）だけでは
+    // どの処理が費用の大半を占めているのか分からず、削る場所を推測で決めることに
+    // なるため。単価はHaiku 4.5が入力$1/出力$5、Sonnet 4.6が入力$3/出力$15（100万トークンあたり）
+    if (data.usage) {
+      const price = body.model?.includes('sonnet') ? { i: 3, o: 15 } : { i: 1, o: 5 };
+      const cost = (data.usage.input_tokens || 0) / 1e6 * price.i
+                 + (data.usage.output_tokens || 0) / 1e6 * price.o;
+      console.log(`[Snow-we] API呼び出し: 入力${data.usage.input_tokens}トークン / `
+        + `出力${data.usage.output_tokens}トークン / $${cost.toFixed(4)} (${body.model})`);
+    }
+    await recordApiCost(body.model, data.usage);
+    return data;
+  }
+}
+
+// API利用額の記録はbackground.js（service worker）に一元化する。
+// content.jsはページ遷移で破棄されるため、ここでchrome.storage.localに
+// 直接書き込むと、遷移のタイミング次第で書き込みが完了せず記録が失われることがある。
+async function recordApiCost(model, usage) {
+  if (!usage) return;
+  try {
+    await chrome.runtime.sendMessage({ type: 'recordApiCost', model, usage });
+  } catch (e) {
+    if (!e.message?.includes('Extension context invalidated'))
+      console.warn('[Snow-we] recordApiCost送信エラー:', e.message);
+  }
+}
+
+// Claude APIを呼び出す（content.js内から直接）
+async function callBatchScreeningAPI(apiKey, cards, criteria, posReq = '', feedbacks = [], positionName = '', companyCriteria = '') {
+  const criteriaLines = buildCriteriaText(criteria, getPlatform());
+  // 応募ポジションの職務内容はOK/NG判定に使わない（judgeSingleCandidateと同じ理由。
+  // 選択中のポジション次第で同じ候補者の判定結果が変わってしまうのを避けるため）
+  const companySection = companyCriteria ? `\n【会社別採用基準（共通基準より優先）】\n${companyCriteria.slice(0, 800)}\n` : '';
+  const fbSection = feedbacks.length > 0
+    ? '\n【過去の訂正例】\n' + feedbacks.slice(0, 5).map(f =>
+        `- 「${(f.profileSummary || '').slice(0, 60)}…」→ 正解:${f.correction}（AI誤判定:${f.aiVerdict}）`
+      ).join('\n') + '\n'
+    : '';
+  const CHUNK = 80;
+
+  const callChunk = async (chunk, offset) => {
+    // judgeSingleCandidate（個別判定）にはAIに年齢区分の年収基準計算をさせず
+    // コード側で確実に計算する安全策があるが、一括判定にはこれが抜けていて、
+    // 無人で大量処理される自動実行の方でこそ気づかれにくい誤判定（隣接年齢層の
+    // 基準取り違え）が起きうる状態だった。候補者ごとに適用年収基準を計算し明示する
+    const candidateList = chunk.map((c, i) => {
+      let thresholdHint = '';
+      if (c.age) {
+        const isIT = IT_KEYWORD_RE.test(c.summary || '');
+        const threshold = computeIncomeThreshold(c.age, isIT, criteria.ageIncome);
+        if (threshold != null) {
+          thresholdHint = `[年齢${c.age}歳・${isIT ? 'ITエンジニア系' : '文系職'}・適用年収基準${threshold}万円(自動計算・確定値、他の年齢層の基準と混同しないこと)] `;
+        } else if (!isIT) {
+          thresholdHint = `[年齢${c.age}歳・46歳以上の特別ルール(財務・経理・FP&A等の職歴があるか)で判定] `;
+        }
+      }
+      return `候補者${offset + i + 1}: ${thresholdHint}${c.summary}`;
+    }).join('\n');
+
+    const prompt = `あなたは転職エージェントの一次選定アシスタントです。
+${companySection}
+以下の【選定基準】に照らして、各候補者を判定してください。
+カード情報は概要のみのため、読み取れない項目は「情報なし」として扱ってください。
+【選定基準】
+${criteriaLines}${fbSection}
+【候補者一覧】
+${candidateList}
+
+以下のJSON形式のみで出力してください（説明不要）:
+{"results":[{"i":${offset + 1},"o":"OK"},{"i":${offset + 2},"o":"NG"}]}`;
+
+    const data = await claudeFetch(apiKey, {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1200,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const text = (data.content?.[0]?.text || '').trim();
+    const clean = text.replace(/```json|```/g, '').trim();
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+    try {
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : clean);
+      return (parsed.results || []).map(r => ({ overall: r.overall || r.o || '要確認' }));
+    } catch {
+      return chunk.map(() => ({ overall: '要確認' }));
+    }
+  };
+
+  const allResults = [];
+  for (let i = 0; i < cards.length; i += CHUNK) {
+    if (i > 0) showAutoStatus(`🔍 判定中... (${i}/${cards.length}人完了)`);
+    const chunk = cards.slice(i, i + CHUNK);
+    const chunkResults = await callChunk(chunk, i);
+    allResults.push(...chunkResults);
+  }
+  return allResults;
+}
+
+// -------------------------------------------------------
+// 自動リスト追加モード
+// -------------------------------------------------------
+async function triggerAutoAdd() {
+  // このページで今回星をつけた候補者（レビューパネル表示用。DOM参照はページ内でのみ有効なため
+  // ページ単位でリセットし、次ページへ遷移する前にレビュー→送信を完結させる）
+  const _starredThisPage = [];
+
+  // 外部からの重複起動を防ぐ（_batchIsRunning=true の再帰呼び出しは通過）
+  if (!_batchIsRunning && _triggerAutoAddLock) {
+    console.log('[Snow-we] triggerAutoAdd: 二重起動スキップ');
+    return;
+  }
+  if (!_batchIsRunning) _triggerAutoAddLock = true;
+
+  // _batchApiKey が未セットの場合のみ chrome.storage を読む（再帰呼び出し時はキャッシュを使う）
+  if (!_batchApiKey) {
+    let stored;
+    try {
+      stored = await chrome.storage.local.get(['apiKey', 'screeningCriteria', 'currentPosition', 'gasSettings', 'recruiterName']);
+    } catch (e) {
+      console.warn('[Snow-we] triggerAutoAdd: ストレージ読み込みエラー', e.message);
+      showAutoStatus('⚠️ 拡張機能が再起動されました。ページをリロードして再度ボタンを押してください。', 10000);
+      _triggerAutoAddLock = false;
+      return;
+    }
+    const key = (stored.apiKey || '').replace(/[^\x21-\x7E]/g, '').trim();
+    if (!key || key.length < 20) {
+      showAutoStatus('⚙️設定タブでAPIキーを保存してください', 4000);
+      await saveAutoAddProgress({ running: false });
+      return;
+    }
+    // 担当者名が未設定のまま一括判定を走らせると、その回の記録が全件「担当者不明」に
+    // なってしまう（拡張機能の再インストール・設定リセット直後に発生していたのを実データで確認）。
+    // GAS側は担当者名が空だと書き込み自体をスキップするため症状が出ないが、Supabase側は
+    // 無条件に記録するため、その回だけ丸ごと集計から漏れる。開始前に止めて設定を促す
+    const recruiterCheck = (stored.gasSettings && stored.gasSettings.recruiter) || stored.recruiterName || _cachedRecruiterName || '';
+    if (!recruiterCheck) {
+      showAutoStatus('⚙️設定タブで担当者名を保存してください（未設定のまま実行すると記録が担当者不明になります）', 6000);
+      await saveAutoAddProgress({ running: false });
+      _triggerAutoAddLock = false;
+      return;
+    }
+    _batchApiKey = key;
+    _batchCriteria = stored.screeningCriteria || {};
+    _batchPosition = stored.currentPosition || '';
+  }
+  const apiKey = _batchApiKey;
+  const criteria = _batchCriteria;
+  injectStyles();
+
+  // AMBI: per_pageリダイレクトは検討リストページに誤遷移するため削除
+  // 現在表示中の候補者のみを処理する
+
+  showAutoStatus('📥 読み込み中...');
+
+  // ページをまたいで処理するため、進捗をストレージで管理（バッジ消去前に確認）
+  const progress = await loadAutoAddProgress();
+  // _batchIsRunning: chrome.storage失敗でprogress={}になっても誤ってfreshStart扱いにしない
+  const isFreshStart = _batchIsRunning ? false : !progress.running;
+
+  // Bizreach再帰呼び出し時はバッジを消去しない（仮想スクロールで再表示されたカードのバッジが消えるため）
+  if (getPlatform() !== 'bizreach' || isFreshStart) {
+    document.querySelectorAll('.snow-we-badge.batch').forEach(b => b.remove());
+    if (getPlatform() === 'bizreach') {
+      _bizreachBadgeRegistry.clear();
+      if (_bizreachObserver) { _bizreachObserver.disconnect(); _bizreachObserver = null; }
+    }
+  }
+
+  // Bizreachは仮想スクロール監視を開始
+  if (getPlatform() === 'bizreach') startBizreachBadgeObserver();
+
+  await loadAllCandidatesIntoDOM();
+
+  const cards = extractAllCandidateCards();
+  const _platform = getPlatform();
+  console.log('[Snow-we] triggerAutoAdd cards found:', cards.length, 'platform:', _platform, 'url:', location.href);
+  if (cards.length === 0) {
+    console.warn('[Snow-we] カードが見つかりません。platform=' + _platform + ' hostname=' + location.hostname);
+    showAutoStatus('❌ 候補者が見つかりません。一覧ページで実行してください。', 4000);
+    await saveAutoAddProgress({ running: false });
+    return;
+  }
+
+  // カウンターの初期値：chrome.storage失敗時はsessionStorageのバックアップから復元
+  let addedCount, totalProcessed, okCount, ngCount, pendingCount;
+  if (isFreshStart) {
+    addedCount = 0; totalProcessed = 0; okCount = 0; ngCount = 0; pendingCount = 0;
+    try { sessionStorage.removeItem('snowWeBatchCounters'); } catch (_) {}
+    _batchIsRunning = true; // バッチ開始をマーク
+  } else if (progress.added != null) {
+    addedCount = progress.added; totalProcessed = progress.processed || 0;
+    okCount = progress.verdicts?.ok || 0; ngCount = progress.verdicts?.ng || 0; pendingCount = progress.verdicts?.pending || 0;
+    // 前ページの結果バナーを表示
+    if (totalProcessed > 0) showPreviousResultsBanner(progress);
+  } else {
+    // chrome.storage失敗 → sessionStorageのバックアップから復元
+    try {
+      const ss = JSON.parse(sessionStorage.getItem('snowWeBatchCounters') || '{}');
+      addedCount = ss.added || 0; totalProcessed = ss.processed || 0;
+      okCount = ss.ok || 0; ngCount = ss.ng || 0; pendingCount = ss.pending || 0;
+    } catch (_) { addedCount = 0; totalProcessed = 0; okCount = 0; ngCount = 0; pendingCount = 0; }
+  }
+
+  const isRDS = getPlatform() === 'rds';
+  // スカウト履歴：初回のみ取得してキャッシュ（CDKスクロール再帰時はchrome.storage不要）
+  if (!_batchScoutHistory) {
+    _batchScoutHistory = isRDS ? {} : await getScoutHistory();
+  }
+  const scoutHistory = _batchScoutHistory;
+
+  // ─── 仮想スクロール用：セッション内の処理済みIDセット ───
+  // 再帰呼び出し時に前バッチの候補者を再処理しないための dedup
+  const BATCH_SESSION_KEY = 'snowWeBatchProcessed';
+  if (isFreshStart) {
+    sessionStorage.removeItem(BATCH_SESSION_KEY);
+    sessionStorage.removeItem('snowWeBizreachStarred');
+  }
+  let batchProcessed;
+  try {
+    batchProcessed = new Set(JSON.parse(sessionStorage.getItem(BATCH_SESSION_KEY) || '[]'));
+  } catch (_) { batchProcessed = new Set(); }
+
+  // ─── 候補者を1人ずつ処理 ───
+  const pending = []; // 処理済み記録用
+  const batchSizeBefore = batchProcessed.size; // 今バッチ開始時点の処理済み数（Bizreach無限ループ検出用）
+  for (let i = 0; i < cards.length; i++) {
+    const { el, text: cardText } = cards[i];
+    showAutoStatus(`📥 ${i + 1}/${cards.length}人 プロフィール取得中...`);
+
+    // Bizreach の仮想スクロール内では scrollIntoView が viewport と競合するためスキップ
+    if (getPlatform() !== 'bizreach') {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      await sleep(400);
+    }
+
+    // AMBI: スカウト済みカード (userSet--already) はスキップ
+    if (getPlatform() === 'ambi' && el.classList.contains('userSet--already')) {
+      console.log('[Snow-we] AMBI: スカウト済みスキップ (userSet--already)');
+      totalProcessed++;
+      continue;
+    }
+
+    const candidateId = getCandidateId(el);
+
+    // 仮想スクロール再帰時：前バッチで処理済みなら即スキップ
+    if (candidateId && batchProcessed.has(candidateId)) {
+      console.log('[Snow-we] 処理済みスキップ:', candidateId);
+      continue;
+    }
+    // 処理開始前にマーク（失敗しても再処理しない）
+    if (candidateId) {
+      batchProcessed.add(candidateId);
+      try { sessionStorage.setItem(BATCH_SESSION_KEY, JSON.stringify([...batchProcessed])); } catch (_) {}
+    }
+
+    if (!isRDS) {
+      const status = scoutStatus(scoutHistory, candidateId);
+      if (status.scouted && !status.reScoutable) {
+        setBatchBadge(el, 'warn', `⏸ 送信済（${status.daysAgo}日前）`);
+        totalProcessed++;
+        continue;
+      }
+    }
+
+    setBatchBadge(el, 'checking', '📥 取得中...');
+    let profileText = cardText;
+    try { profileText = await getFullProfile(el, cardText); } catch (_) {}
+
+    if (isRDS) {
+      // パネル内のみスクロール（リストをスクロールするとスカウト履歴検索が不正確になる）
+      const rdsAutoPanel = findRDSDetailPanel();
+      if (rdsAutoPanel) {
+        let autoScrollTarget = rdsAutoPanel;
+        rdsAutoPanel.querySelectorAll('*').forEach(el => {
+          const s = window.getComputedStyle(el);
+          if (s.overflowY !== 'scroll' && s.overflowY !== 'auto') return;
+          if (el.getBoundingClientRect().height > 200) autoScrollTarget = el;
+        });
+        autoScrollTarget.scrollTop = autoScrollTarget.scrollHeight;
+        await sleep(800);
+      }
+      const daysAgo = checkScoutSentInBody();
+      if (daysAgo !== null && daysAgo < RESCOUNT_DAYS) {
+        setBatchBadge(el, 'warn', `⏸ 送信済（${daysAgo}日前）`);
+        totalProcessed++;
+        await saveAutoAddProgress({ added: addedCount, processed: totalProcessed, running: true, ts: Date.now(), verdicts: { ok: okCount, ng: ngCount, pending: pendingCount } });
+        continue;
+      }
+    }
+
+    // 年収チェック：IT閾値を下回る場合は即NG確定
+    if (checkIncomeNG(profileText)) {
+      setBatchBadge(el, 'ng', '❌ 見送り', '年収基準未満', profileText.substring(0, 200), 'NG');
+      ngCount++; totalProcessed++;
+      await saveAutoAddProgress({ added: addedCount, processed: totalProcessed, running: true, ts: Date.now(), verdicts: { ok: okCount, ng: ngCount, pending: pendingCount } });
+      continue;
+    }
+
+    // 短期在籍チェック：過去職歴に2年未満の在籍がある場合は即NG確定
+    if (checkShortTenureNG(profileText)) {
+      setBatchBadge(el, 'ng', '❌ 見送り(短期在籍)', '短期在籍あり', profileText.substring(0, 200), 'NG');
+      ngCount++; totalProcessed++;
+      await saveAutoAddProgress({ added: addedCount, processed: totalProcessed, running: true, ts: Date.now(), verdicts: { ok: okCount, ng: ngCount, pending: pendingCount } });
+      continue;
+    }
+
+    // 除外キャリアチェック：投資銀行・プルデンシャル出身は、AI判定に委ねず確実にNGにする
+    // （AIへのプロンプト指示だけだと見落として稀にOK判定になってしまうため、他の
+    // 確定NG条件と同様に判定前の決定的チェックとして弾く）
+    const excludedCareer = checkExcludedCareerNG(profileText);
+    if (excludedCareer) {
+      setBatchBadge(el, 'ng', '❌ 見送り(除外対象)', `除外対象: ${excludedCareer}`, profileText.substring(0, 200), 'NG');
+      ngCount++; totalProcessed++;
+      await saveAutoAddProgress({ added: addedCount, processed: totalProcessed, running: true, ts: Date.now(), verdicts: { ok: okCount, ng: ngCount, pending: pendingCount } });
+      continue;
+    }
+
+    // 転職意向チェック（doda Xのみ）
+    const intentResult = checkJobChangeIntentNG(profileText);
+    if (intentResult === null && getPlatform() === 'dodax') {
+      console.log('[Snow-we] doda X 転職意向: 問題なし（or 情報なし）→ AI判定へ');
+    }
+    if (intentResult === 'ng') {
+      setBatchBadge(el, 'ng', '❌ 見送り(転職意向なし)', '転職に興味がない', profileText.substring(0, 200), 'NG');
+      ngCount++; totalProcessed++;
+      await saveAutoAddProgress({ added: addedCount, processed: totalProcessed, running: true, ts: Date.now(), verdicts: { ok: okCount, ng: ngCount, pending: pendingCount } });
+      continue;
+    }
+    // ─── AI判定（1人ずつ）───
+    setBatchBadge(el, 'checking', '🤖 判定中...');
+    showAutoStatus(`🤖 判定中 (${totalProcessed + 1}人目)... ✅${addedCount}人追加`);
+    let overall, judgeReason, judgeConfidence;
+    try {
+      const result = await judgeSingleCandidate(apiKey, profileText, criteria);
+      overall         = result.verdict;
+      judgeReason     = result.reason     || '';
+      judgeConfidence = result.confidence ?? null;
+    } catch (err) {
+      console.error('[Snow-we] judgeSingleCandidate error:', err);
+      setBatchBadge(el, 'warn', `⚠️ 判定失敗: ${(err.message || '').slice(0, 30)}`);
+      totalProcessed++;
+      await saveAutoAddProgress({ added: addedCount, processed: totalProcessed, running: true, ts: Date.now(), verdicts: { ok: okCount, ng: ngCount, pending: pendingCount } });
+      await sleep(500);
+      continue;
+    }
+
+    const isLowConfidence = judgeConfidence != null && judgeConfidence < 60;
+    const badgeCls = isLowConfidence ? 'warn'
+                   : overall === 'OK' ? 'ok'
+                   : overall === 'NG' ? 'ng'
+                   : 'warn';
+    const confLabel = judgeConfidence != null ? ` ${judgeConfidence}%` : '';
+    const badgeText = overall === 'OK' ? `✅ スカウト候補${confLabel}`
+                    : overall === 'NG' ? `❌ 見送り${confLabel}`
+                    : `⚠️ 要確認${confLabel}`;
+    const tooltipText = isLowConfidence
+      ? `[低確信度] ${judgeReason}`
+      : judgeReason;
+    setBatchBadge(el, badgeCls, badgeText, tooltipText, profileText.substring(0, 200), overall);
+    if (overall === 'OK') okCount++;
+    else if (overall === 'NG') ngCount++;
+    else pendingCount++;
+
+    const shouldAdd = getPlatform() === 'bizreach' ? overall === 'OK' : (overall === 'OK' || overall === '要確認');
+    if (shouldAdd) {
+      const tagName = getPlatform() === 'bizreach' ? (criteria.autoTagName || 'KOJI→礼士郎スカウト') : (criteria.autoTagName || '');
+      try {
+        const added = await clickAddButton(el, tagName);
+        if (added) {
+          addedCount++;
+          if (candidateId) {
+            scoutHistory[`listed_${candidateId}`] = { date: Date.now(), platform: getPlatform() };
+            // Bizreachは検討中リストへの追加(clickAddButton)だけ行い、承認待ちキューには
+            // 入れない。判定でOKになった候補者だけを追加する運用のため、人によるレビュー
+            // (承認/却下)を挟む他媒体の運用とは異なる。承認待ちに入れると、作業中の画面に
+            // 割り込む形でレビューパネルが表示されてしまうため対象外にする
+            if (getPlatform() !== 'bizreach') {
+              const starredInfo = extractBasicInfo(el);
+              recordScoutQueueEntry({
+                candidateId,
+                platform: getPlatform(),
+                position: _batchPosition,
+                info: starredInfo,
+                reason: judgeReason,
+                verdict: overall,
+                fullProfile: profileText,
+              }).catch(() => {});
+              _starredThisPage.push({ candidateId, el, position: _batchPosition, info: starredInfo, reason: judgeReason });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[Snow-we] clickAddButton error:', err);
+      }
+    }
+
+    totalProcessed++;
+    pending.push(el); // 処理済みとして記録
+    await saveAutoAddProgress({ added: addedCount, processed: totalProcessed, running: true, ts: Date.now(), verdicts: { ok: okCount, ng: ngCount, pending: pendingCount } });
+    await sleep(500);
+  }
+
+  // 次ページへ移動する前に、このページで星をつけた候補者のレビュー（承認/ポジション修正/却下）を
+  // その場で完結させる。DOM参照はページ遷移すると失われるため、必ずここで処理する。
+  if (_starredThisPage.length > 0) {
+    await showApprovalReviewPanel(_starredThisPage);
+  }
+
+  // ビズリーチ：仮想スクロールで次バッチへ
+  if (getPlatform() === 'bizreach') {
+    // CDK仮想スクロール：viewport要素またはwindowスクロールの両方に対応
+    let viewport = document.querySelector('cdk-virtual-scroll-viewport');
+    // フォールバック：viewport未検出時はカードリストの親スクロール要素を探す
+    if (!viewport) {
+      const firstCard = document.querySelector('ess-resume-list-item');
+      if (firstCard) {
+        let el = firstCard.parentElement;
+        for (let i = 0; i < 8 && el; i++, el = el.parentElement) {
+          const s = window.getComputedStyle(el);
+          if ((s.overflowY === 'scroll' || s.overflowY === 'auto') && el.scrollHeight > el.clientHeight + 50) {
+            viewport = el;
+            break;
+          }
+        }
+      }
+    }
+
+    // 現在DOMに存在するカードのIDテキスト指紋（新カード出現を検出するため）
+    const getCardFingerprint = () => {
+      const items = document.querySelectorAll('ess-resume-list-item');
+      if (!items.length) return '';
+      const texts = Array.from(items).map(it => (it.innerText || '').substring(0, 20));
+      return texts.join('|');
+    };
+
+    const prevFingerprint = getCardFingerprint();
+    const prevViewportTop = viewport ? viewport.scrollTop : window.scrollY;
+    const scrollAmt = (viewport && viewport.clientHeight > 50) ? viewport.clientHeight * 0.8 : (window.innerHeight || 800);
+
+    // scrollBy() を優先（ネイティブscrollイベントを発火→AngularCDKがDOMを再レンダリング）
+    if (viewport) {
+      if (typeof viewport.scrollBy === 'function') {
+        viewport.scrollBy({ top: scrollAmt, behavior: 'smooth' });
+      } else {
+        viewport.scrollTop += scrollAmt;
+        viewport.dispatchEvent(new Event('scroll', { bubbles: true }));
+      }
+    } else {
+      window.scrollBy({ top: scrollAmt, behavior: 'smooth' });
+    }
+
+    // Angular CDKがDOMを更新するまで最大10秒待機（指紋変化 or scrollTop変化を検出）
+    let scrolled = false;
+    for (let w = 0; w < 40; w++) {
+      await sleep(250);
+      const newFp = getCardFingerprint();
+      const newViewportTop = viewport ? viewport.scrollTop : window.scrollY;
+      if (newFp !== prevFingerprint || newViewportTop > prevViewportTop + 50) {
+        scrolled = true;
+        break;
+      }
+    }
+
+    // スクロール後にレジストリのバッジを再適用（仮想スクロールで消えたバッジを復元）
+    reapplyBizreachBadges();
+
+    console.log(`[Snow-we] Bizreach scroll: prevTop=${prevViewportTop} newTop=${viewport?.scrollTop ?? window.scrollY} scrolled=${scrolled} fp_changed=${getCardFingerprint() !== prevFingerprint}`);
+
+    // 今バッチで新規処理ゼロ（全員すでにbatchProcessed済み）→ CDK仮想スクロールが無限ループするため完了扱い
+    const newlyProcessedThisBatch = batchProcessed.size - batchSizeBefore;
+    if (scrolled && newlyProcessedThisBatch === 0) {
+      console.log(`[Snow-we] Bizreach: 今バッチ新規処理ゼロ → 全${totalProcessed}人完了`);
+      sessionStorage.removeItem(BATCH_SESSION_KEY);
+      showAutoStatus(`🤖 完了！ ✅${addedCount}人を検討リストに追加 (全${totalProcessed}人中)`, 8000);
+      await saveAutoAddProgress({ running: false });
+      // 夜間自動実行中は「このURL(箱)は完了」を背景スクリプトに通知しないと、
+      // 次のURLへ進まずこのタブが放置され、他プラットフォームと違って
+      // 「同じ箱を最初からやり直す」不具合の原因になっていた
+      if (_isAutoRunMode && _isAutoRunMode !== 'list-inner') { chrome.runtime.sendMessage({ type: 'autoRunComplete', slotId: _autoRunSlotId }).catch(() => {}); }
+      _isAutoRunMode = false;
+      return;
+    }
+
+    if (scrolled) {
+      await sleep(800); // Angular CDKのレンダリング完了を待つ
+      showAutoStatus(`🤖 次の候補者を処理中... (累計✅${addedCount}人追加)`);
+      await saveAutoAddProgress({ added: addedCount, processed: totalProcessed, running: true, ts: Date.now(), verdicts: { ok: okCount, ng: ngCount, pending: pendingCount } });
+      await triggerAutoAdd();
+      return;
+    }
+
+    // スクロールしても変化なし＝全候補者処理完了
+    sessionStorage.removeItem(BATCH_SESSION_KEY);
+    showAutoStatus(`🤖 完了！ ✅${addedCount}人を検討リストに追加 (全${totalProcessed}人中)`, 8000);
+    await saveAutoAddProgress({ running: false });
+    if (_isAutoRunMode && _isAutoRunMode !== 'list-inner') { chrome.runtime.sendMessage({ type: 'autoRunComplete', slotId: _autoRunSlotId }).catch(() => {}); }
+    _isAutoRunMode = false;
+    return;
+  }
+
+  // doda-x: 全カード処理後、右パネルが開いたままだとページネーションが隠れるためEscapeで閉じる
+  if (getPlatform() === 'dodax') {
+    const closeBtn = document.querySelector('[class*="close" i][class*="panel" i], [class*="panel" i] [class*="close" i], [aria-label*="閉じ"], [aria-label*="close" i]');
+    if (closeBtn) { closeBtn.click(); await sleep(400); }
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+    document.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Escape', keyCode: 27, bubbles: true }));
+    await sleep(1200);
+    console.log('[Snow-we] doda X: 右パネルをEscapeで閉じてページネーション検索へ');
+  }
+
+  // 次のページがあれば自動で移動して処理を続ける
+  const nextPage = findNextPageButton();
+
+  // 夜間自動実行: ページ数上限チェック
+  if (nextPage && _isAutoRunMode) {
+    _autoRunPageCount++;
+    if (_autoRunPageCount >= _autoRunMaxPages) {
+      showAutoStatus(`🌙 自動実行: ${_autoRunMaxPages}ページ完了 ✅${addedCount}人追加`, 3000);
+      await saveAutoAddProgress({ running: false });
+      if (_isAutoRunMode !== 'list-inner') {
+        chrome.runtime.sendMessage({ type: 'autoRunComplete', slotId: _autoRunSlotId }).catch(() => {});
+      }
+      _isAutoRunMode = false;
+      return;
+    }
+  }
+
+  if (nextPage) {
+    showAutoStatus(`🤖 次ページへ移動中... (累計✅${addedCount}人追加)`);
+    // running:true で保存 → 次ページのロード時に isFreshStart=false になる
+    await saveAutoAddProgress({ added: addedCount, processed: totalProcessed, running: true, ts: Date.now(), verdicts: { ok: okCount, ng: ngCount, pending: pendingCount } });
+    try {
+      sessionStorage.setItem('snowWeAutoAdd', JSON.stringify({
+        resume: true, added: addedCount, processed: totalProcessed,
+        autoRun: _isAutoRunMode ? { maxPages: _autoRunMaxPages, pageCount: _autoRunPageCount, slotId: _autoRunSlotId } : null,
+      }));
+    } catch (_) {}
+
+    await sleep(300);
+
+    // <a href> でかつ別URLへのリンクならlocation.href移動（フルページロード確定・最も確実）
+    const nextHref = nextPage.href || nextPage.getAttribute('href');
+    const baseHref = (u) => u.split('#')[0];
+    if (nextHref && nextHref !== '#' && !nextHref.startsWith('javascript') &&
+        nextHref !== location.href && baseHref(nextHref) !== baseHref(location.href)) {
+      console.log(`[Snow-we] 次ページ: location.href移動 → ${nextHref}`);
+      location.href = nextHref;
+      return; // フルページロード後にsessionStorageから再開される
+    }
+
+    // href なし（SPA内クリック）→ クリック後URL変化またはDOM変化を検出
+    const getCardFingerprint = () => {
+      const first = document.querySelector('li[id^="search-result-"]');
+      return first ? (first.innerText || '').substring(0, 120) : '';
+    };
+    const prevUrl = location.href;
+    const prevFingerprint = getCardFingerprint();
+    nextPage.click();
+
+    // SPA ナビゲーション検出: URLまたはカードDOM内容が変わったら続行（doda-x等URLが変わらないSPA対応）
+    for (let w = 0; w < 40; w++) {
+      await sleep(250);
+      if (location.href !== prevUrl) {
+        showAutoStatus(`🤖 次ページ読込中... (累計✅${addedCount}人追加)`);
+        await sleep(2500);
+        try { sessionStorage.removeItem('snowWeAutoAdd'); } catch (_) {}
+        await triggerAutoAdd();
+        return;
+      }
+      const fp = getCardFingerprint();
+      if (fp && fp !== prevFingerprint) {
+        console.log('[Snow-we] 次ページ: DOM内容変化検出（URL変化なしSPA）');
+        showAutoStatus(`🤖 次ページ読込中... (累計✅${addedCount}人追加)`);
+        await sleep(2000);
+        await triggerAutoAdd();
+        return;
+      }
+    }
+    // タイムアウト：URL変化もDOM変化もなし
+    console.warn('[Snow-we] 次ページ遷移タイムアウト（URL・DOM変化なし）');
+    await saveAutoAddProgress({ running: false });
+    if (_isAutoRunMode && _isAutoRunMode !== 'list-inner') { chrome.runtime.sendMessage({ type: 'autoRunComplete', slotId: _autoRunSlotId }).catch(() => {}); }
+    _isAutoRunMode = false;
+  } else {
+    showAutoStatus(`🤖 完了！ ✅${addedCount}人を検討リストに追加 (全${totalProcessed}人中)`, 8000);
+    await saveAutoAddProgress({ running: false });
+    if (_isAutoRunMode && _isAutoRunMode !== 'list-inner') { chrome.runtime.sendMessage({ type: 'autoRunComplete', slotId: _autoRunSlotId }).catch(() => {}); }
+    _isAutoRunMode = false;
+  }
+}
+
+// ── 検索条件リストページの自動実行（doda-X等） ──────────────────────
+// 「表示」ボタンを順番にクリックして各条件の候補者を処理する
+async function autoRunListPage(request) {
+  const maxPages = request.maxPages || 2;
+  const urlIndex = request.urlIndex || 0;
+  const totalUrls = request.totalUrls || 1;
+
+  const findShowButtons = () => Array.from(document.querySelectorAll('button, a'))
+    .filter(el => el.textContent.trim() === '表示');
+
+  // ボタンが表示されるまで待つ
+  let buttons = [];
+  for (let w = 0; w < 20; w++) {
+    await sleep(500);
+    buttons = findShowButtons();
+    if (buttons.length > 0) break;
+  }
+  if (buttons.length === 0) {
+    console.warn('[Snow-we] リスト自動実行: 表示ボタンが見つかりません');
+    _isAutoRunMode = false;
+    chrome.runtime.sendMessage({ type: 'autoRunComplete', slotId: _autoRunSlotId }).catch(() => {});
+    return;
+  }
+
+  const total = buttons.length;
+  console.log(`[Snow-we] リスト自動実行: ${total}件の検索条件を処理`);
+
+  for (let i = 0; i < total; i++) {
+    const currentButtons = findShowButtons();
+    if (i >= currentButtons.length) break;
+
+    showAutoStatus(`🌙 自動実行 (${urlIndex+1}/${totalUrls}): 条件${i+1}/${total} 処理中...`);
+    currentButtons[i].click();
+
+    // 候補者カードが出るまで待つ
+    let found = false;
+    for (let w = 0; w < 20; w++) {
+      await sleep(500);
+      if (extractAllCandidateCards().length > 0) { found = true; break; }
+    }
+
+    if (found) {
+      _batchApiKey = null; _batchCriteria = null; _batchIsRunning = false; _batchScoutHistory = null;
+      _isAutoRunMode = 'list-inner';
+      _autoRunPageCount = 0;
+      _autoRunMaxPages = maxPages;
+      await triggerAutoAdd();
+      _isAutoRunMode = false;
+    } else {
+      console.warn(`[Snow-we] 条件${i+1}: 候補者なし、スキップ`);
+    }
+
+    // リストに戻る
+    history.back();
+    await sleep(2000);
+    for (let w = 0; w < 10; w++) {
+      await sleep(500);
+      if (findShowButtons().length > 0) break;
+    }
+    await sleep(500);
+  }
+
+  showAutoStatus(`🌙 自動実行完了: ${total}条件処理済み (${urlIndex+1}/${totalUrls})`, 6000);
+  _isAutoRunMode = false;
+  chrome.runtime.sendMessage({ type: 'autoRunComplete', slotId: _autoRunSlotId }).catch(() => {});
+}
+
+async function autoRunBizreachListPage(request) {
+  const maxPages = request.maxPages || 2;
+  const urlIndex = request.urlIndex || 0;
+  const totalUrls = request.totalUrls || 1;
+
+  // 保存された検索条件タブを探す（新規検索・条件一覧・矢印を除く）
+  const findConditionTabs = () => {
+    // 方法1: role="tab" 属性（Angular Material 等）
+    let tabs = Array.from(document.querySelectorAll('[role="tab"]'))
+      .filter(el => {
+        const t = (el.textContent || '').trim();
+        return t && t !== '新規検索' && t !== '条件一覧' && t.length < 60;
+      });
+    if (tabs.length > 0) return tabs;
+
+    // 方法2: クラス名に Tab を含む要素（ナビ矢印・close ボタン除く）
+    tabs = Array.from(document.querySelectorAll('[class*="Tab"], [class*="tab"]'))
+      .filter(el => {
+        const t = (el.textContent || '').trim();
+        const rect = el.getBoundingClientRect();
+        return t && t !== '新規検索' && t !== '条件一覧' && t.length < 60
+          && rect.height > 20 && rect.height < 70 && rect.width > 30
+          && el.tagName !== 'BUTTON';
+      });
+    if (tabs.length > 0) return tabs;
+
+    return [];
+  };
+
+  // タブが出るまで待つ
+  let tabs = [];
+  for (let w = 0; w < 20; w++) {
+    await sleep(500);
+    tabs = findConditionTabs();
+    if (tabs.length > 0) break;
+  }
+
+  if (tabs.length === 0) {
+    // タブが見つからなければ通常の候補者一覧として処理
+    console.warn('[Snow-we] Bizreachタブ未検出 → 通常処理');
+    _isAutoRunMode = true;
+    await triggerAutoAdd();
+    _isAutoRunMode = false;
+    chrome.runtime.sendMessage({ type: 'autoRunComplete', slotId: _autoRunSlotId }).catch(() => {});
+    return;
+  }
+
+  console.log(`[Snow-we] Bizreach自動実行: ${tabs.length}件の検索条件タブを処理`);
+
+  for (let i = 0; i < tabs.length; i++) {
+    const currentTabs = findConditionTabs();
+    if (i >= currentTabs.length) break;
+
+    const tab = currentTabs[i];
+    const tabLabel = (tab.textContent || '').replace(/[×✕\xd7×]/g, '').trim().substring(0, 20);
+    showAutoStatus(`🌙 自動実行 (${urlIndex+1}/${totalUrls}): 「${tabLabel}」${i+1}/${tabs.length}`);
+
+    // ×(close)ボタン以外の部分をクリック
+    const closeBtn = tab.querySelector('[aria-label*="削除"], [aria-label*="close"], [class*="close"], [class*="Close"], [class*="delete"]');
+    if (closeBtn) {
+      const tabRect = tab.getBoundingClientRect();
+      const closeBtnRect = closeBtn.getBoundingClientRect();
+      const clickX = tabRect.left + (tabRect.width - closeBtnRect.width) / 2;
+      const clickY = tabRect.top + tabRect.height / 2;
+      const el = document.elementFromPoint(clickX, clickY);
+      if (el && el !== closeBtn && !closeBtn.contains(el)) {
+        el.click();
+      } else {
+        tab.click();
+      }
+    } else {
+      tab.click();
+    }
+
+    // 候補者カードが出るまで待つ
+    await sleep(1500);
+    let found = false;
+    for (let w = 0; w < 20; w++) {
+      await sleep(500);
+      if (findCandidateCardsByPlatform().length > 0) { found = true; break; }
+    }
+
+    if (found) {
+      _batchApiKey = null; _batchCriteria = null; _batchIsRunning = false; _batchScoutHistory = null;
+      _isAutoRunMode = 'list-inner';
+      _autoRunPageCount = 0;
+      _autoRunMaxPages = maxPages;
+      await triggerAutoAdd();
+      _isAutoRunMode = false;
+    } else {
+      console.warn(`[Snow-we] 「${tabLabel}」: 候補者なし、スキップ`);
+    }
+
+    await sleep(1000);
+  }
+
+  showAutoStatus(`🌙 自動実行完了: ${tabs.length}条件処理済み (${urlIndex+1}/${totalUrls})`, 6000);
+  _isAutoRunMode = false;
+  chrome.runtime.sendMessage({ type: 'autoRunComplete', slotId: _autoRunSlotId }).catch(() => {});
+}
+
+// RDSのプロフィール/レジュメタブに切り替える
+// 条件に関わらずレジュメ系タブを強制クリック
+async function forceClickRDSResumeTab() {
+  // 詳細パネル・モーダル内に限定して検索（ページ全体検索だと別候補者カードをクリックする危険がある）
+  const panel = findRDSDetailPanel()
+    || document.querySelector('[role="dialog"]')
+    || document.querySelector('[class*="modal" i]')
+    || document.querySelector('[class*="dialog" i]');
+  if (!panel) return false; // パネルが見つからない場合はドキュメント全体を検索しない
+
+  const tabLabels = ['レジュメ', 'プロフィール', '基本情報', '職務経歴'];
+  for (const label of tabLabels) {
+    // button/role=tab/li/a/span をパネル内限定で検索（span はタブラベルによく使われる）
+    const tab = Array.from(panel.querySelectorAll('button, [role="tab"], li, span, a'))
+      .find(el => {
+        const t = (el.innerText || '').trim();
+        return (t === label || t.startsWith(label)) && t.length < label.length + 6;
+      });
+    if (tab) { tab.click(); await sleep(800); return true; }
+  }
+  return false;
+}
+
+async function tryClickRDSResumeTab() {
+  // 詳細パネル・モーダル内に限定して検索（ページ全体検索だと別候補者カードをクリックする危険がある）
+  const panel = findRDSDetailPanel()
+    || document.querySelector('[role="dialog"]')
+    || document.querySelector('[class*="modal" i]')
+    || document.querySelector('[class*="dialog" i]');
+  if (!panel) return false;
+
+  // 以前は「パネル内に『職務経歴』の文字があれば既にレジュメ表示中」とみなして
+  // 切り替えをスキップしていたが、タブバー自体に「職務経歴」というタブ名が常に
+  // 含まれているため、スカウト履歴タブが表示されている状態でもこの語がパネルの
+  // 先頭付近（タブバー）に存在してしまい、判定が常に「切り替え不要」と誤判定して
+  // 文生成機能がスカウト履歴（過去に送信した本文）を候補者プロフィールと誤認して
+  // 抽出してしまう事故が実機で発生した。文字列でタブの現在状態を判定するのは
+  // 信頼できないため、判定をやめて毎回無条件でタブ切り替えを試みる（既にそのタブが
+  // 選択されている場合にクリックしても実害はない）
+  const tabLabels = ['レジュメ', 'プロフィール', '基本情報', '職務経歴'];
+  for (const label of tabLabels) {
+    const tab = Array.from(panel.querySelectorAll('button, [role="tab"], li, span, a'))
+      .find(el => {
+        const t = (el.innerText || '').trim();
+        return (t === label || t.startsWith(label)) && t.length < label.length + 6;
+      });
+    if (tab) {
+      tab.click();
+      await sleep(700);
+      return true;
+    }
+  }
+  return false;
+}
+
+
+// Bizreach APIレスポンスJSONからプロフィールテキストを抽出する
+function extractBizreachProfileText(data) {
+  if (!data || typeof data !== 'object') return '';
+  const lines = [];
+
+  // 再帰的に文字列値を収集（ラベルフィールドを特定して整形）
+  const labelKeys = /name|title|company|school|university|education|career|skill|summary|description|reason|position|department|industry|role|job|work|experience|history|business|project|achievement|pr|appeal|content|detail|年収|会社|学歴|職歴|スキル|経験|業務|担当|在籍|退職|勤務|期間|役職|従業員|年齢|出身|卒業|大学|高校/i;
+  const skipKeys = /id$|Id$|flag|flg|bool|count|num|code|status|type|sort|order|page|limit|offset|created|updated|deleted|token|hash|url|path|icon|image|avatar|photo|thumb|color|style|class|version|timestamp/i;
+
+  function collect(obj, depth) {
+    if (depth > 8) return;
+    if (Array.isArray(obj)) {
+      obj.forEach(item => collect(item, depth + 1));
+      return;
+    }
+    if (typeof obj === 'object' && obj !== null) {
+      for (const [k, v] of Object.entries(obj)) {
+        if (skipKeys.test(k)) continue;
+        if (typeof v === 'string' && v.trim().length > 1) {
+          if (labelKeys.test(k) || v.length > 10) lines.push(v.trim());
+        } else if (typeof v === 'number' && labelKeys.test(k)) {
+          lines.push(`${k}: ${v}`);
+        } else {
+          collect(v, depth + 1);
+        }
+      }
+    }
+  }
+
+  collect(data, 0);
+  const result = [...new Set(lines)].join('\n');
+  return result.substring(0, 5000);
+}
+
+async function getFullProfile(cardEl, fallbackText) {
+  const platform = getPlatform();
+
+  // RDS：カードクリック → 右パネルで全文取得
+  if (platform === 'rds') {
+    cardEl.click();
+    await sleep(1500);
+    // スカウト履歴タブが表示されている場合はレジュメタブに切り替える
+    await tryClickRDSResumeTab();
+    const panel = findRDSDetailPanel();
+    if (panel) {
+      const full = removeNonProfileSections(extractMainText(panel, 5000));
+      if (full.length > 200) return full;
+      // まだ短い場合は強制的にタブ切り替えを再試行
+      const switched = await forceClickRDSResumeTab();
+      if (switched) {
+        const full2 = removeNonProfileSections(extractMainText(findRDSDetailPanel(), 5000));
+        if (full2.length > 200) return full2;
+      }
+      // タブの問題ではなく、単に詳細パネルの描画がまだ間に合っていないだけの
+      // ケースが一定数あった（連続自動処理時、実測でおよそ2割前後）。
+      // その場合カード要約(短文)のみでAI判定することになり、職歴の詳細や
+      // 過去の在籍企業などの情報が欠落したまま判定される＝判定精度が落ちる。
+      // 諦める前にもう一度だけ待って再取得する。
+      await sleep(1200);
+      const full3 = removeNonProfileSections(extractMainText(findRDSDetailPanel(), 5000));
+      if (full3.length > 200) return full3;
+    }
+    console.warn(`[Snow-we] 詳細プロフィール取得に失敗。カード要約(${fallbackText.trim().length}文字)のみでAI判定します。判定精度が落ちる可能性があります`);
+    return fallbackText.substring(0, 900);
+  }
+
+  // Bizreach: カードクリック → 右パネル(ess-resume-detail)からプロフィール取得
+  if (platform === 'bizreach') {
+    const resumeId = getBizreachResumeNumericId(cardEl);
+
+    // クリック前のパネルテキストを記録（別候補者のパネルと区別するため）
+    const prevDetailEl = document.querySelector('ess-resume-detail');
+    const prevText = (prevDetailEl?.innerText || '').trim();
+
+    // スター/お気に入りボタン以外の要素をクリック対象とする
+    const starPattern = /star|favorite|bookmark|wish|heart|toggle/i;
+    const linkEl = Array.from(cardEl.querySelectorAll('a')).find(a => {
+      const href = a.getAttribute('href') || '';
+      return href.includes('/list/') || href.includes('/resumes/');
+    });
+    const clickTarget = linkEl ||
+      Array.from(cardEl.querySelectorAll('div, span, p')).find(el => {
+        const cls = el.getAttribute('class') || '';
+        return !starPattern.test(cls) && (el.innerText || '').trim().length > 2 && (el.innerText || '').trim().length < 60;
+      }) || cardEl;
+
+    clickTarget.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1 }));
+    clickTarget.dispatchEvent(new PointerEvent('pointerup',   { bubbles: true, cancelable: true, pointerId: 1 }));
+    clickTarget.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+
+    // 右パネル(ess-resume-detail)が更新されるのを待つ
+    let detailEl = null;
+    for (let i = 0; i < 10; i++) {
+      await sleep(i === 0 ? 1800 : 600);
+      const el = document.querySelector('ess-resume-detail');
+      const txt = (el?.innerText || '').trim();
+      if (el && txt.length > 500 && txt !== prevText) {
+        // IDが取れる場合は念のため一致確認
+        if (!resumeId || txt.includes(resumeId) || txt.includes('BU' + resumeId)) {
+          detailEl = el;
+          break;
+        }
+        // IDが含まれなくてもテキスト量が十分なら採用（IDの表示形式が異なるケース対応）
+        if (txt.length > 1000) {
+          detailEl = el;
+          break;
+        }
+      }
+    }
+
+    if (detailEl) {
+      const text = extractMainText(detailEl, 5000);
+      console.log('[Snow-we] Bizreach右パネルからプロフィール取得:', text.length, '文字');
+      return text;
+    }
+
+    // フォールバック：カードテキスト
+    const text = fallbackText.substring(0, 900);
+    console.log('[Snow-we] Bizreachカードテキスト取得(fallback):', text.length, '文字');
+    return text;
+  }
+
+  // AMBI：カードにプロフィール全文が含まれているためカードテキストを直接使用
+  if (platform === 'ambi') {
+    const text = fallbackText.trim();
+    console.log('[Snow-we] AMBI カードテキスト取得:', text.length, '文字');
+    return text.substring(0, 3000);
+  }
+
+  // doda X：カードクリック → 右パネルで全文取得（転職意向を含む）
+  if (platform === 'dodax') {
+    // 星ボタンを除いたカード内の最初のテキスト要素をクリック（LI自体ではReactイベントが発火しない）
+    const starCls = /star|c-star/i;
+    const innerEl = Array.from(cardEl.querySelectorAll('div, section, article')).find(el => {
+      const cls = el.getAttribute('class') || '';
+      return !starCls.test(cls) && (el.innerText || '').trim().length > 10;
+    });
+    const clickTarget = innerEl || cardEl;
+    console.log('[Snow-we] doda X クリック対象:', clickTarget.tagName, (clickTarget.getAttribute('class') || '').substring(0, 50));
+    // PointerEvent → MouseEvent の順で発火（React 18 はポインタイベントも処理）
+    const dispatchClick = (el) => {
+      el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1 }));
+      el.dispatchEvent(new PointerEvent('pointerup',   { bubbles: true, cancelable: true, pointerId: 1 }));
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    };
+    dispatchClick(clickTarget);
+    // リトライ付きパネル検出（最大6回）
+    let panel = null;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      await sleep(attempt === 0 ? 1800 : 800);
+      panel = findDodaxDetailPanel();
+      if (panel && (panel.innerText || '').trim().length > 200) break;
+      console.log('[Snow-we] doda X パネル待機中... attempt=' + attempt);
+      if (attempt === 0) dispatchClick(clickTarget);   // 1回目待機後に再発火
+      if (attempt === 2) dispatchClick(cardEl);        // 3回目はLI自体を試す
+    }
+    if (panel) {
+      const text = (panel.innerText || '').trim();
+      if (text.length > 200) {
+        console.log('[Snow-we] doda X 右パネル取得成功:', text.length, '文字');
+        return text.substring(0, 5000);
+      }
+    }
+    console.log('[Snow-we] doda X 右パネル未取得 → カードテキストで代替');
+    return fallbackText.substring(0, 1500);
+  }
+
+  // その他：プロフィールURLをフェッチして全文取得
+  const profileUrl = findProfileUrl(cardEl);
+  if (profileUrl) {
+    const fetched = await fetchProfilePage(profileUrl);
+    if (fetched && fetched.length > 300) return fetched;
+  }
+
+  return fallbackText.substring(0, 900);
+}
+
+// カード内のプロフィールページURLを探す
+function findProfileUrl(cardEl) {
+  const platform = getPlatform();
+  const patterns = {
+    rds:      [/\/scout\//, /\/candidate\//, /\/member\//, /\/detail\//, /hrtech/, /rikunabi/, /recruitdirect/],
+    dodax:    [/member_search\/detail/, /member_detail/, /\/profile\//],
+    ambi:     [/\/scout\/member\//, /\/member\/\d+/, /company\/scout/],
+    green:    [/green-japan\.com\/user\//, /\/members\//],
+    mynavi:   [/\/candidate\//, /\/resume\//],
+    bizreach: [/\/resume\//, /\/candidate\//],
+  };
+
+  const platformPatterns = patterns[platform] || [];
+  // 求人広告など、候補者を一意に識別しないリンクは常に除外する
+  // （RDSの hrtech/rikunabi/recruitdirect パターンはドメイン名だけで緩くマッチするため、
+  //  同じ求人に紐づく複数候補者が同一の求人広告URLを候補者IDとして誤取得し、
+  //  重複記録や別候補者の混同を引き起こしていた）
+  // 設定・テンプレート・管理画面等へのリンクも候補者を識別しない。実データで
+  // 「/client/setting/chatTemplate」が候補者IDとして採用され、複数の別人が同一IDに
+  // 潰れていたため、候補者ページではありえないパスを明示的に除外する
+  const excludePatterns = [
+    /jobAdvertisement/i, /joboffer/i, /job_offer/i, /\/requisition\//i,
+    /\/setting(s)?(\/|$)/i, /template/i, /\/admin(\/|$)/i, /\/mypage(\/|$)/i,
+    /\/help(\/|$)/i, /\/logout/i, /\/notification/i,
+  ];
+
+  const matchesPattern = (href) => {
+    if (!href || href === '#' || href.startsWith('javascript')) return false;
+    if (excludePatterns.some(p => p.test(href))) return false;
+    return platformPatterns.length === 0 || platformPatterns.some(p => p.test(href));
+  };
+
+  // カード内部のリンクを検索
+  for (const link of cardEl.querySelectorAll('a[href]')) {
+    if (matchesPattern(link.href)) return link.href;
+  }
+
+  // Reactカードではカード要素がリンクの子要素になることがある → 祖先を遡って検索
+  for (let el = cardEl.parentElement, depth = 0; el && depth < 5; el = el.parentElement, depth++) {
+    if (el.tagName === 'A' && el.href && matchesPattern(el.href)) {
+      console.log(`[Snow-we] findProfileUrl: 祖先<a>で発見 depth=${depth} href=${el.href.substring(0, 70)}`);
+      return el.href;
+    }
+    for (const link of el.querySelectorAll(':scope > a[href], :scope > * > a[href]')) {
+      if (matchesPattern(link.href)) {
+        console.log(`[Snow-we] findProfileUrl: 祖先内リンク発見 depth=${depth} href=${link.href.substring(0, 70)}`);
+        return link.href;
+      }
+    }
+    if (['UL', 'OL', 'MAIN', 'BODY', 'SECTION', 'ARTICLE'].includes(el.tagName)) break;
+  }
+
+  // フォールバック：カード内の最初の内部リンク
+  // doda-xは候補者ごとに異なるIDを含まない汎用リンク（例: .../member_search/resume/ の
+  // ベースURLのみ）を持つことがあり、このフォールバックがそれを拾うと全候補者が同一の
+  // candidateIdになってしまう（別候補者の履歴・重複判定が混同される）。doda-xは直後の
+  // fiberベースの専用ロジックの方が信頼できるため、ここではスキップする。
+  if (platform !== 'dodax') {
+    for (const link of cardEl.querySelectorAll('a[href]')) {
+      const href = link.href || '';
+      if (href.startsWith(location.origin) && !href.includes('#') && !excludePatterns.some(p => p.test(href))) return href;
+    }
+  }
+
+  // doda-x: React fiberのpropsからmemberId/candidateIdを探してURLを構築
+  if (platform === 'dodax') {
+    const tryFiberForId = (el) => {
+      try {
+        const fKey = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+        if (!fKey) return null;
+        let fiber = el[fKey];
+        for (let depth = 0; fiber && depth < 20; fiber = fiber.return, depth++) {
+          const props = fiber.memoizedProps || {};
+          // memberId / candidateId / userId 等を探す
+          for (const key of Object.keys(props)) {
+            const v = props[key];
+            if (typeof v === 'string' && /^\d{6,12}$/.test(v) &&
+                /id|member|candidate|user|resume/i.test(key)) {
+              return v;
+            }
+            if (typeof v === 'number' && v > 100000 && /id|member|candidate|user|resume/i.test(key)) {
+              return String(v);
+            }
+          }
+        }
+      } catch (_) {}
+      return null;
+    };
+    const memberId = tryFiberForId(cardEl) ||
+                     tryFiberForId(cardEl.firstElementChild) ||
+                     tryFiberForId(cardEl.querySelector('.c-star-cts') || cardEl);
+    if (memberId) {
+      const url = `${location.origin}/member_search/detail/${memberId}`;
+      console.log(`[Snow-we] findProfileUrl: doda-x fiberからID取得 memberId=${memberId} → ${url}`);
+      return url;
+    }
+    console.log(`[Snow-we] findProfileUrl: doda-x ID未取得 cardId=${cardEl.id}`);
+  }
+
+  console.log(`[Snow-we] findProfileUrl: URL未発見 platform=${platform} cardTag=${cardEl.tagName} cardClass=${cardEl.className.substring(0, 50)}`);
+  return null;
+}
+
+// テキストから簡易ハッシュを生成（URLが取れない場合の候補者ID代替）
+function simpleHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h).toString(36);
+}
+
+// プロフィールページをフェッチしてテキストを返す
+async function fetchProfilePage(url) {
+  try {
+    const res = await fetch(url, {
+      credentials: 'include',
+      headers: { 'Accept': 'text/html,application/xhtml+xml' }
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    // 不要要素を除去
+    doc.querySelectorAll('script,style,noscript,nav,header,footer,aside,[class*="banner"],[class*="ad"]').forEach(e => e.remove());
+
+    // プロフィールキーワードを含む最大ブロックを探す
+    const keywords = ['職務経歴', '職歴', '業務内容', 'スキル', '学歴', '自己PR', '転職理由', '経験', '転職意向'];
+    let best = '';
+    doc.querySelectorAll('main,[role="main"],#main,.profile,.resume,section,article').forEach(el => {
+      const t = (el.innerText || el.textContent || '').trim();
+      if (t.length > best.length && keywords.some(kw => t.includes(kw))) best = t;
+    });
+
+    if (best.length < 200) {
+      best = (doc.body?.innerText || doc.body?.textContent || '').trim();
+    }
+
+    return best.replace(/\s+/g, ' ').trim().substring(0, 5000);
+  } catch {
+    return null;
+  }
+}
+
+// Bizreach の星ボタン（ess-star-icon-toggle）をカード要素から探して返す
+function findBizreachStarButton(cardEl) {
+  // 自身から最大6段階上の親まで順番にquerySelectorで探す
+  let el = cardEl;
+  for (let i = 0; i < 6; i++) {
+    if (!el) break;
+    const star = el.querySelector('ess-star-icon-toggle');
+    if (star) {
+      console.log('[Snow-we] 星ボタン発見 深さ', i, el.tagName);
+      return star;
+    }
+    el = el.parentElement;
+  }
+  console.warn('[Snow-we] 星ボタン未発見 cardEl:', cardEl?.tagName, cardEl?.className?.substring(0, 40));
+  return null;
+}
+
+// Bizreach の星ボタンが既スター済みかどうかを返す
+// Angular は JS property を更新する（attribute は初期値のみ反映のことがある）
+function isBizreachStarred(starEl) {
+  const toggle = starEl.querySelector('b-ui-icon-toggle') || starEl;
+  // Angular は JS property を優先的に更新する
+  if (toggle.checked === true)  return true;
+  if (toggle.checked === false) return false;
+  // aria-checked（Angular が DOM attribute として反映する場合）
+  const aria = toggle.getAttribute('aria-checked');
+  if (aria === 'true')  return true;
+  if (aria === 'false') return false;
+  // フォールバック：HTML attribute
+  return toggle.getAttribute('checked') === 'true';
+}
+
+// Bizreach 星ボタンを実際にクリックする（API応答を待ってポーリングでチェック）
+async function clickBizreachStar(starBtn) {
+  const innerToggle = starBtn.querySelector('b-ui-icon-toggle') || starBtn;
+  const innerIcon   = innerToggle.querySelector('b-ui-icon') || innerToggle;
+  const opts = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, buttons: 0 };
+
+  // クリック後にポーリングで starred を確認（API応答が遅い場合に対応）
+  async function pollStarred(maxMs = 3000) {
+    const end = Date.now() + maxMs;
+    while (Date.now() < end) {
+      if (isBizreachStarred(starBtn)) return true;
+      await sleep(300);
+    }
+    return false;
+  }
+
+  // 手法1: b-ui-icon（最内部）にポインター→マウス→クリック完全シーケンス
+  const downOpts = {...opts, buttons: 1};
+  innerIcon.dispatchEvent(new PointerEvent('pointerover', opts));
+  innerIcon.dispatchEvent(new MouseEvent  ('mouseover',   opts));
+  innerIcon.dispatchEvent(new PointerEvent('pointerdown', downOpts));
+  innerIcon.dispatchEvent(new MouseEvent  ('mousedown',   downOpts));
+  await sleep(50);
+  innerIcon.dispatchEvent(new PointerEvent('pointerup',   opts));
+  innerIcon.dispatchEvent(new MouseEvent  ('mouseup',     opts));
+  innerIcon.dispatchEvent(new MouseEvent  ('click',       opts));
+  if (await pollStarred(3000)) return true;
+
+  // 手法2: b-ui-icon-toggle に click（手法1が無効だった場合のみ試す）
+  innerToggle.dispatchEvent(new MouseEvent('click', opts));
+  if (await pollStarred(3000)) return true;
+
+  // 手法3: ess-star-icon-toggle 自体に click
+  starBtn.dispatchEvent(new MouseEvent('click', opts));
+  if (await pollStarred(3000)) return true;
+
+  // 手法4: Angular ng.getComponent() API
+  try {
+    const ngApi = window.ng;
+    if (ngApi) {
+      for (const el of [innerToggle, starBtn]) {
+        const comp = ngApi.getComponent?.(el);
+        if (!comp) continue;
+        if (typeof comp.toggle   === 'function') comp.toggle();
+        else if (typeof comp.onClick === 'function') comp.onClick();
+        else comp.checked = true;
+        ngApi.applyChanges?.(el);
+        if (await pollStarred(2000)) return true;
+      }
+    }
+  } catch (_) {}
+
+  // 手法5: 内部 button/a 要素
+  const innerBtn = starBtn.querySelector('button,[role="button"],a');
+  if (innerBtn) {
+    innerBtn.click();
+    if (await pollStarred(2000)) return true;
+  }
+
+  console.warn('[Snow-we] 星クリック全手法失敗（isTrusted制限またはAPI拒否の可能性）');
+  return false;
+}
+
+// API成功後に星のDOM状態を強制的にONにする
+// b-ui-icon-toggle: checked属性 + 内部 b-ui-icon のCSSクラスを onicon に切り替える
+function forceBizreachStarOn(starBtn) {
+  const toggle = starBtn.querySelector('b-ui-icon-toggle') || starBtn;
+  toggle.setAttribute('checked', 'true');
+  try { toggle.checked = true; } catch (_) {}
+  try {
+    const ng = window.ng;
+    if (ng) {
+      const comp = ng.getComponent?.(toggle) || ng.getComponent?.(starBtn);
+      if (comp && typeof comp.checked === 'boolean') { comp.checked = true; ng.applyChanges?.(toggle); }
+    }
+  } catch (_) {}
+  const icon = toggle.querySelector('b-ui-icon');
+  if (icon) {
+    const offIcon = toggle.getAttribute('officon') || 'star';
+    const onIcon  = toggle.getAttribute('onicon')  || 'star-fill';
+    icon.className = icon.className.replace(`bui-icon-${offIcon}`, `bui-icon-${onIcon}`);
+  }
+}
+
+// API失敗時またはNG再適用時に星のDOM状態を強制的にOFFにする
+function forceBizreachStarOff(starBtn) {
+  const toggle = starBtn.querySelector('b-ui-icon-toggle') || starBtn;
+  toggle.removeAttribute('checked');
+  try { toggle.checked = false; } catch (_) {}
+  try {
+    const ng = window.ng;
+    if (ng) {
+      const comp = ng.getComponent?.(toggle) || ng.getComponent?.(starBtn);
+      if (comp && typeof comp.checked === 'boolean') { comp.checked = false; ng.applyChanges?.(toggle); }
+    }
+  } catch (_) {}
+  const icon = toggle.querySelector('b-ui-icon');
+  if (icon) {
+    const offIcon = toggle.getAttribute('officon') || 'star';
+    const onIcon  = toggle.getAttribute('onicon')  || 'star-fill';
+    icon.className = icon.className.replace(`bui-icon-${onIcon}`, `bui-icon-${offIcon}`);
+  }
+}
+
+// Bizreach カード要素から resume の数値IDを取得する
+function getBizreachResumeNumericId(cardEl) {
+  // 子孫を先に探す（bui-drawer-trigger等に id="resume-xxx" が設定されているケースが多い）
+  const child = cardEl.querySelector?.('[id^="resume-"]');
+  if (child) {
+    const mc = child.id.match(/^resume-(\d+)$/);
+    if (mc) return mc[1];
+  }
+  // 自身・親要素を順に探す
+  let el = cardEl;
+  for (let i = 0; i < 8; i++) {
+    if (!el) break;
+    const m = el.id?.match(/^resume-(\d+)$/);
+    if (m) return m[1];
+    el = el.parentElement;
+  }
+  return null;
+}
+
+// Bizreach お気に入りAPIを直接呼び出す（isTrusted 制限を回避）
+async function callBizreachFavoriteApi(resumeNumericId) {
+  if (!resumeNumericId) return false;
+  let xsrfToken = '';
+  for (const part of document.cookie.split(';')) {
+    const [k, ...vParts] = part.trim().split('=');
+    if (k === 'XSRF-TOKEN') { xsrfToken = decodeURIComponent(vParts.join('=')); break; }
+  }
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  };
+  if (xsrfToken) headers['X-XSRF-TOKEN'] = xsrfToken;
+  try {
+    const res = await fetch(
+      `${location.origin}/v1/api/resume-favorite/${resumeNumericId}`,
+      { method: 'PUT', credentials: 'include', headers, body: JSON.stringify({ favorite: true }) }
+    );
+    console.log('[Snow-we] お気に入りAPI:', res.status, resumeNumericId);
+    return res.status === 204 || res.status === 200 || res.ok;
+  } catch (e) {
+    console.warn('[Snow-we] お気に入りAPI失敗:', e.message);
+    return false;
+  }
+}
+
+// 候補者カードの追加ボタンを探してクリックする
+async function clickAddButton(cardEl, tagName) {
+  const platform = getPlatform();
+
+  // Bizreach: お気に入りAPIを直接呼び出す（合成イベントの isTrusted 制限を回避）
+  if (platform === 'bizreach') {
+    const starBtn = findBizreachStarButton(cardEl);
+    if (!starBtn) return false;
+    const resumeNumericId = getBizreachResumeNumericId(cardEl);
+    if (resumeNumericId) {
+      // セッション内で既にスター済み（別DOM要素での重複防止）
+      let starredIds;
+      try { starredIds = new Set(JSON.parse(sessionStorage.getItem('snowWeBizreachStarred') || '[]')); }
+      catch (_) { starredIds = new Set(); }
+      if (starredIds.has(resumeNumericId)) {
+        console.log('[Snow-we] セッション内スター済みスキップ:', resumeNumericId);
+        forceBizreachStarOn(starBtn);
+        return false;
+      }
+      // DOM再利用でstar状態が古い場合があるため isBizreachStarred を迂回して直接API呼び出し
+      const apiOk = await callBizreachFavoriteApi(resumeNumericId);
+      if (apiOk) {
+        console.log('[Snow-we] APIで星追加成功:', resumeNumericId);
+        forceBizreachStarOn(starBtn);
+        starredIds.add(resumeNumericId);
+        try { sessionStorage.setItem('snowWeBizreachStarred', JSON.stringify([...starredIds])); } catch (_) {}
+        return true;
+      }
+    }
+    // IDが取得できないまたはAPIが失敗した場合のフォールバック
+    if (isBizreachStarred(starBtn)) {
+      console.log('[Snow-we] すでにスター済み（フォールバック確認）、スキップ');
+      return false;
+    }
+    const result = await clickBizreachStar(starBtn);
+    console.log('[Snow-we] 星クリック結果:', result, '/ checked後:', isBizreachStarred(starBtn));
+    return result;
+  }
+
+  // doda-x: 星ボタン（c-star-cts）をクリック
+  if (platform === 'dodax') {
+    const searchRoot = cardEl.closest('li, [class*="result"], [class*="member"], [class*="item"]') || cardEl;
+    const starBtn = searchRoot.querySelector('.c-star-cts');
+    if (!starBtn) { console.warn('[Snow-we] dodax 星ボタン未発見'); return false; }
+
+    const icon = starBtn.querySelector('i');
+    // aria属性・コンテナクラス・アイコンクラスの複数手段でスター済みを判定
+    const isStarred = () => {
+      if (starBtn.getAttribute('aria-pressed') === 'true' ||
+          starBtn.getAttribute('aria-checked') === 'true') return true;
+      if (/\b(?:active|starred|is-active|is-starred|on|is-checked)\b/.test(starBtn.className)) return true;
+      if (!icon) return false;
+      // is-checked-star クラスはスター済みを示す
+      if (icon.className.includes('is-checked-star')) return true;
+      return icon.className.includes('icon-star') && !icon.className.includes('icon-star_border');
+    };
+    console.log(`[Snow-we] dodax 星診断 btn:"${starBtn.className}" icon:"${icon?.className || 'なし'}" aria-pressed:"${starBtn.getAttribute('aria-pressed')}" → starred:${isStarred()}`);
+    if (isStarred()) { console.log('[Snow-we] dodax すでにスター済み、スキップ'); return false; }
+
+    // fiber walkは使わない（親カードのonClick=ページ遷移を誤発火させるため）
+    // ネイティブイベントのみ使用 → ReactのルートへのイベントデリゲーションでstopPropagationが効く
+    const currentUrl = location.href;
+    const opts = { bubbles: true, cancelable: true, view: window };
+    const target = icon || starBtn;
+
+    // Try 1: PointerEvent シーケンス（React はpointerイベントを優先）
+    try { target.dispatchEvent(new PointerEvent('pointerdown', { ...opts, pointerId: 1, isPrimary: true })); } catch (_) {}
+    try { target.dispatchEvent(new PointerEvent('pointerup',   { ...opts, pointerId: 1, isPrimary: true })); } catch (_) {}
+    target.dispatchEvent(new MouseEvent('click', opts));
+    await sleep(600);
+    // ページ遷移してしまった場合は中断
+    if (location.href !== currentUrl) {
+      console.warn('[Snow-we] dodax 星クリック後にページ遷移が発生 → 中断');
+      return false;
+    }
+    if (isStarred()) { console.log('[Snow-we] dodax 星クリック成功(pointer)'); return true; }
+
+    // Try 2: starBtn直接 .click()
+    starBtn.click();
+    await sleep(600);
+    if (location.href !== currentUrl) { console.warn('[Snow-we] dodax 遷移発生'); return false; }
+    if (isStarred()) { console.log('[Snow-we] dodax 星クリック成功(native click)'); return true; }
+
+    // Try 3: MouseEvent シーケンス
+    target.dispatchEvent(new MouseEvent('mousedown', opts));
+    target.dispatchEvent(new MouseEvent('mouseup',   opts));
+    target.dispatchEvent(new MouseEvent('click',     opts));
+    await sleep(600);
+    if (location.href !== currentUrl) { console.warn('[Snow-we] dodax 遷移発生'); return false; }
+
+    const success = isStarred();
+    console.log('[Snow-we] dodax 星クリック完了, スター済み:', success);
+    return success;
+  }
+
+  // AMBI：「この検討人材リストに追加」ボタンを明示処理
+  if (platform === 'ambi') {
+    // スカウト済みカードはスキップ
+    if (cardEl.classList.contains('userSet--already')) {
+      console.log('[Snow-we] AMBI: スカウト済みカードスキップ (userSet--already)');
+      return false;
+    }
+    // .js_consider が確認済みの追加ボタンセレクター
+    const btn = cardEl.querySelector('.js_consider') ||
+                Array.from(cardEl.querySelectorAll('a,button')).find(el =>
+                  (el.innerText || '').includes('この検討人材リストに追加'));
+    if (!btn) {
+      console.warn('[Snow-we] AMBI: 追加ボタン未発見');
+      return false;
+    }
+    // 既に追加済みの場合はスキップ
+    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true' ||
+        /disabled|added|済/.test(btn.className || '')) {
+      console.log('[Snow-we] AMBI: 既に追加済みとみなしスキップ');
+      return false;
+    }
+    console.log('[Snow-we] AMBI: 追加ボタンをクリック:', (btn.innerText || '').trim().substring(0, 30));
+    btn.click();
+    await sleep(900);
+    // ドロップダウン・モーダルを処理（フォルダ選択 or 確定ボタン）
+    await handleAmbiAddDialog();
+    return true;
+  }
+
+  const labelMap = {
+    rds:      '検討中リスト追加',
+    green:    '気になる',
+    mynavi:   '検討リスト',
+  };
+  const label = labelMap[platform];
+  if (!label) return false;
+
+  // カード→親要素→ページ全体の順で検索
+  const roots = [cardEl, cardEl.parentElement, cardEl.closest('li,tr,article,[class*="row"]'), document.body].filter(Boolean);
+  let btn = null;
+  for (const root of roots) {
+    btn = Array.from(root.querySelectorAll('button,a,[role="button"]'))
+      .find(el => (el.innerText || '').trim().includes(label));
+    if (btn) break;
+  }
+  if (!btn) return false;
+
+  btn.click();
+  await sleep(600);
+
+  // ダイアログが開いた場合：タグ名入力＋確定
+  await handleAddDialog(tagName);
+  return true;
+}
+
+// AMBI検討リスト追加後のダイアログを処理する
+async function handleAmbiAddDialog() {
+  await sleep(500);
+  // 表示中のダイアログ・ドロップダウンを探す
+  const dialogs = Array.from(document.querySelectorAll(
+    '[role="dialog"],[class*="modal"],[class*="dialog"],[class*="dropdown"],[class*="popup"],[class*="overlay"],[class*="layer"]'
+  )).filter(el => {
+    const s = getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  });
+
+  for (const dialog of dialogs) {
+    const text = (dialog.innerText || '').trim();
+    if (!text) continue;
+    // フォルダ選択ドロップダウン：最初の選択肢をクリック
+    const folderItems = Array.from(dialog.querySelectorAll('li,option,[role="option"],[class*="item"],[class*="folder"],[class*="category"]'))
+      .filter(el => {
+        const t = (el.innerText || '').trim();
+        return t.length > 0 && t.length < 50;
+      });
+    if (folderItems.length > 0) {
+      console.log('[Snow-we] AMBI: フォルダ選択ドロップダウン検出 -', folderItems[0].innerText?.trim());
+      folderItems[0].click();
+      await sleep(400);
+    }
+    // 確定ボタンを探す
+    const confirmTexts = ['追加', '確認', '確定', 'OK', 'はい', '保存', '完了', '登録'];
+    const btns = Array.from(dialog.querySelectorAll('button,a,[role="button"]'));
+    for (const t of confirmTexts) {
+      const found = btns.find(b => (b.innerText || '').trim().includes(t));
+      if (found) {
+        console.log('[Snow-we] AMBI: 確定ボタンをクリック:', t);
+        found.click();
+        await sleep(500);
+        return;
+      }
+    }
+  }
+}
+
+// 追加ダイアログを処理する（タグ名入力にも対応）
+async function handleAddDialog(tagName) {
+  await sleep(500);
+
+  // 表示中のダイアログ・ドロップダウンを探す
+  const dialogs = Array.from(document.querySelectorAll(
+    '[role="dialog"],[class*="modal"],[class*="dialog"],[class*="dropdown"],[class*="popup"],[class*="tooltip"]'
+  )).filter(el => {
+    const s = getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  });
+
+  for (const dialog of dialogs) {
+    // タグ入力欄があれば入力する（他媒体）
+    if (tagName) {
+      const input = dialog.querySelector('input[type="text"],input:not([type]),textarea');
+      if (input) {
+        input.focus();
+        input.value = tagName;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        await sleep(300);
+      }
+    }
+
+    // 確定ボタンをクリック
+    const confirmTexts = ['追加', '確認', 'OK', 'はい', '保存', '完了', '適用'];
+    const btns = Array.from(dialog.querySelectorAll('button,a,[role="button"]'));
+    for (const text of confirmTexts) {
+      const found = btns.find(b => (b.innerText || '').trim().includes(text));
+      if (found) { found.click(); return; }
+    }
+  }
+}
+
+// プロフィールテキストから年収（万円）を抽出する
+// カンマ区切り（1,000 ～ 1,199万円）に対応。範囲の場合は下限値を使用
+function extractIncomeFromText(text) {
+  const num = '(?:\\d{1,2},\\d{3}|\\d{3,4})'; // 1,000 or 1000 形式
+  const parseNum = s => parseInt(s.replace(/,/g, ''), 10);
+
+  // 「現年収」「年収」に続く数値（範囲 or 単値）を優先
+  const labelPatterns = [
+    new RegExp(`現年収[^\\d]*(${num})\\s*[〜~～]`),
+    new RegExp(`現年収[^\\d]*(${num})万`),
+    new RegExp(`年収[^\\d]*(${num})\\s*[〜~～]`),
+    new RegExp(`年収[^\\d]*(${num})万`),
+  ];
+  for (const re of labelPatterns) {
+    const m = text.match(re);
+    if (m) return parseNum(m[1]);
+  }
+
+  // 範囲形式（下限を採用）: 1,000 ～ 1,199万円 → 1000
+  const rangeRe = new RegExp(`(${num})\\s*[〜~～]\\s*${num}万`);
+  const rangeM = text.match(rangeRe);
+  if (rangeM) return parseNum(rangeM[1]);
+
+  // 単値: 800万円
+  const singleRe = new RegExp(`(${num})万円?(?:程度|前後|台)?(?:\\s|　|$|\\/|・)`);
+  const singleM = text.match(singleRe);
+  if (singleM) return parseNum(singleM[1]);
+
+  return null;
+}
+
+// 転職意向チェック（doda Xのみ）：'ng' | null
+// 投資銀行・プルデンシャル出身者を確実に除外する（AI任せだと稀に見落としてOKになるため）
+function checkExcludedCareerNG(profileText) {
+  if (!profileText) return null;
+  const ngPatterns = [
+    { re: /投資銀行/, label: '投資銀行' },
+    { re: /インベストメントバンキング/, label: 'インベストメントバンキング' },
+    { re: /インベストバンキング/, label: 'インベストメントバンキング' },
+    { re: /プルデンシャル/, label: 'プルデンシャル' },
+  ];
+  const hit = ngPatterns.find(p => p.re.test(profileText));
+  if (hit) {
+    console.log('[Snow-we] 除外キャリアNG:', hit.label);
+    return hit.label;
+  }
+  return null;
+}
+
+function checkJobChangeIntentNG(profileText) {
+  if (!profileText || getPlatform() !== 'dodax') return null;
+
+  // 転職意向フィールドの行を抽出してログ出力（確認用）
+  const _intentLines = profileText.split('\n');
+  const _intentIdx = _intentLines.findIndex(l => l.includes('転職意向') || l.includes('転職への'));
+  if (_intentIdx >= 0) {
+    // 前後2行のコンテキストを出力して構造を把握
+    const _ctx = _intentLines.slice(Math.max(0, _intentIdx - 1), _intentIdx + 4)
+      .map((l, i) => `[${_intentIdx - 1 + i}]"${l.trim()}"`)
+      .join(' / ');
+    console.log('[Snow-we] doda X 転職意向コンテキスト:', _ctx);
+  } else {
+    console.log('[Snow-we] doda X 転職意向: フィールド未検出（プロフィールに記載なし）');
+  }
+
+  // NG 判定（転職意向なし系の表現）
+  const ngPhrases = [
+    '転職に興味がない',
+    '転職への興味はない',
+    '転職を考えていない',
+    'とくに転職は考えていない',
+    '特に転職は考えていない',
+    '転職の意向はない',
+    '転職意向なし',
+  ];
+  const found = ngPhrases.find(p => profileText.includes(p));
+  if (found) {
+    console.log('[Snow-we] doda X 転職意向NG:', found);
+    return 'ng';
+  }
+  return null; // 情報なし or 転職意欲あり（検討中・決意済み・興味あり）→ 通常判定へ
+}
+
+// 年齢と年収からNG判定を返す（確実にNGの場合のみ 'NG'、それ以外は null）
+function checkIncomeNG(profileText) {
+  // Bizreach は年収情報が 0 や非公開で取得できないことが多いため Claude に委ねる
+  if (getPlatform() === 'bizreach') return null;
+
+  const ageMatch = profileText.match(/(\d{2})歳/);
+  if (!ageMatch) return null;
+  const age = parseInt(ageMatch[1], 10);
+
+  // 年収範囲（例: 700〜900万円）の場合は上限値を使用してAIと判定基準を一致させる
+  // AI prompt（buildStandardCriteria）も「上限値が基準以上であればNGにしない」と指定している
+  const numPat = '(?:\\d{1,2},\\d{3}|\\d{3,4})';
+  const parseNum = s => parseInt(s.replace(/,/g, ''), 10);
+  const labelRangeRe = new RegExp(`(?:現)?年収[^\\d]*${numPat}\\s*[〜~～]\\s*(${numPat})万`);
+  const genericRangeRe = new RegExp(`${numPat}\\s*[〜~～]\\s*(${numPat})万`);
+  const labelRangeM = profileText.match(labelRangeRe);
+  const genericRangeM = labelRangeM ? null : profileText.match(genericRangeRe);
+  const incomeUpperFromRange = labelRangeM ? parseNum(labelRangeM[1])
+                             : genericRangeM ? parseNum(genericRangeM[1]) : null;
+
+  // 年収取得：範囲の上限値を優先（確実NGは上限でも閾値未満の場合のみ）
+  const income = incomeUpperFromRange !== null && incomeUpperFromRange > 0
+    ? incomeUpperFromRange
+    : extractIncomeFromText(profileText);
+  if (income === null || income === 0) return null; // 年収不明・ゼロはClaudeに任せる
+
+  // ITエンジニア系キーワードで職種を判定
+  // 「SE[^\w]」はSEが文字列末尾に来ると直後の文字が存在せず一致しないため、
+  // 後読み否定（Latin文字が続かない）に変更。あわせてプログラマ等の表記ゆれも追加
+  const isIT = /エンジニア|ソフトウェア開発|ソフトウェアエンジニア|プログラマ|システム開発|システムエンジニア|インフラ|クラウド|SE(?![A-Za-z])|データエンジニア|データサイエンティスト|機械学習|バックエンド|フロントエンド|DevOps|情報システム/.test(profileText);
+
+  let threshold;
+  if (isIT) {
+    if (age < 30)      threshold = 350;
+    else if (age <= 35) threshold = 500;
+    else if (age <= 39) threshold = 700;
+    else if (age <= 45) threshold = 800;
+    else threshold = null;
+  } else {
+    // 文系職（またはIT判定できない場合）は文系基準で判定
+    if (age < 30)      threshold = 500;
+    else if (age <= 35) threshold = 700;
+    else if (age <= 39) threshold = 800;
+    else if (age <= 42) threshold = 1000;
+    else if (age <= 45) threshold = 1200;
+    else threshold = null;
+  }
+
+  if (threshold !== null && income < threshold) {
+    console.log(`[Snow-we] 年収NG: ${age}歳 ${income}万 < 閾値${threshold}万 (${isIT ? 'IT' : '文系'})`);
+    return 'NG';
+  }
+  return null;
+}
+
+// 在籍期間チェック：過去職歴に2年（24ヶ月）未満の会社エントリーがある場合NG
+// ・出向先・兼務先はカウントしない（出向元の在籍期間に含む）
+// ・同一会社を複数行に分けて記入している場合は合算する
+function checkShortTenureNG(profileText) {
+  if (!profileText) return null;
+
+  const companyRe = /株式会社|有限会社|合同会社|ホールディングス|LLC|Inc\b|Corp\b|Ltd\b|銀行[^員振]|証券[^取]|生命保険|損害保険|病院|クリニック|㈱|（株）|\(株\)/;
+  const shukkoRe  = /出向|兼務|派遣先/; // 出向・兼務行はスキップ
+
+  function parseTenureMonths(str) {
+    const m1 = str.match(/[（(](\d+)年(?:(\d+)[ヶか]月)?[）)]/);
+    if (m1) return parseInt(m1[1], 10) * 12 + parseInt(m1[2] || '0', 10);
+    const m2 = str.match(/[（(](\d+)[ヶか]月[）)]/);
+    if (m2) return parseInt(m2[1], 10);
+    const m3 = str.match(/^(\d+(?:\.\d+)?)年/);
+    if (m3) return Math.round(parseFloat(m3[1]) * 12);
+    const m4 = str.match(/^(\d+)[ヶか]月/);
+    if (m4) return parseInt(m4[1], 10);
+    const m5 = str.match(/各(\d+(?:\.\d+)?)年/);
+    if (m5) return Math.round(parseFloat(m5[1]) * 12);
+    return null;
+  }
+
+  function parseDateRangeMonths(str) {
+    const m = str.match(/(\d{4})年(\d{1,2})月\s*[〜~～]\s*(\d{4})年(\d{1,2})月/);
+    if (!m) return null;
+    const months = (parseInt(m[3]) - parseInt(m[1])) * 12 + (parseInt(m[4]) - parseInt(m[2]));
+    return months > 0 ? months : null;
+  }
+
+  // 現職の在籍期間：開始年月〜現在 から今日までのヶ月数を計算
+  function parseCurrentJobTenureMonths(str) {
+    const m = str.match(/(\d{4})年(\d{1,2})月\s*[〜~～]\s*(現在|在籍中)/);
+    if (!m) return null;
+    const now = new Date();
+    const months = (now.getFullYear() - parseInt(m[1], 10)) * 12 + (now.getMonth() + 1 - parseInt(m[2], 10));
+    return months > 0 ? months : 0;
+  }
+
+  const dodaxTenureRe = /^(?:各\d+(?:\.\d+)?年|\d+(?:\.\d+)?年|\d+[ヶか]月)/;
+  const lines = profileText.split('\n').map(l => l.trim()).filter(Boolean);
+
+  // 同一会社の全出現箇所から在籍期間を合算（複数行記入対応）
+  // 現職（現在/在籍中）が含まれる場合は開始年月から今日までの実在籍月数を加算
+  function getTotalTenureForCompanyLine(companyLineStr) {
+    if (!companyLineStr) return 0;
+    const key = companyLineStr.replace(/\s+/g, '').substring(0, Math.min(8, companyLineStr.replace(/\s+/g, '').length));
+    if (key.length < 3) return 0;
+    let total = 0;
+    for (let k = 0; k < lines.length; k++) {
+      const l = lines[k];
+      if (!l.replace(/\s+/g, '').includes(key.substring(0, Math.min(6, key.length)))) continue;
+      if (shukkoRe.test(l)) continue;
+      if (l.includes('現在') || l.includes('在籍中')) {
+        const cm = parseCurrentJobTenureMonths(l) ?? parseTenureMonths(l);
+        if (cm !== null && cm > 0) total += cm;
+        continue;
+      }
+      const inlineT = parseTenureMonths(l);
+      if (inlineT !== null && inlineT > 0) total += inlineT;
+      for (let j = k + 1; j < Math.min(k + 8, lines.length); j++) {
+        if (lines[j].includes('現在') || lines[j].includes('在籍中')) {
+          const cm = parseCurrentJobTenureMonths(lines[j]) ?? parseTenureMonths(lines[j]);
+          if (cm !== null && cm > 0) total += cm;
+          break;
+        }
+        if (companyRe.test(lines[j]) && !shukkoRe.test(lines[j])) break;
+        const t = parseTenureMonths(lines[j]);
+        if (t !== null && t > 0) total += t;
+      }
+    }
+    return total;
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.includes('現在') || line.includes('在籍中')) {
+      // 現職の在籍期間チェック：同社の過去役職期間も合算して判断
+      if (!shukkoRe.test(line)) {
+        const curM = parseCurrentJobTenureMonths(line) ?? parseTenureMonths(line);
+        if (curM !== null && curM < 24) {
+          const prev = i > 0 ? lines[i - 1] : '';
+          const next = i < lines.length - 1 ? lines[i + 1] : '';
+          let companyLineForCheck = null;
+          if (companyRe.test(line) && !shukkoRe.test(line)) companyLineForCheck = line;
+          else if (companyRe.test(prev) && !shukkoRe.test(prev)) companyLineForCheck = prev;
+          else if (companyRe.test(next) && !shukkoRe.test(next)) companyLineForCheck = next;
+          if (companyLineForCheck) {
+            const fullTotal = getTotalTenureForCompanyLine(companyLineForCheck);
+            if (fullTotal < 24) {
+              console.log(`[Snow-we] 短期在籍NG(現職): ${curM}ヶ月(同社合計${fullTotal}ヶ月) / "${line.substring(0, 60)}"`);
+              return 'NG';
+            }
+          }
+        }
+      }
+      continue;
+    }
+    if (shukkoRe.test(line)) continue; // 出向・兼務行は全てスキップ
+
+    // ── A: 日付範囲形式（"YYYY年MM月 〜 YYYY年MM月"）──
+    const dateMonths = parseDateRangeMonths(line);
+    if (dateMonths !== null && dateMonths < 24) {
+      const prevLine2 = i > 0 ? lines[i - 1] : '';
+      const nextLine2 = i < lines.length - 1 ? lines[i + 1] : '';
+      if (!shukkoRe.test(prevLine2) && !shukkoRe.test(nextLine2) &&
+          (companyRe.test(line) || companyRe.test(prevLine2) || companyRe.test(nextLine2))) {
+        console.log(`[Snow-we] 短期在籍NG(date): ${dateMonths}ヶ月 / "${line.substring(0, 60)}"`);
+        return 'NG';
+      }
+    }
+
+    // ── B: テキスト在籍期間形式 ──
+    const total = parseTenureMonths(line);
+    if (total === null || total <= 0 || total >= 24) continue;
+
+    // ① 同行に会社名 → 全プロフィール合算チェック後NG
+    if (companyRe.test(line)) {
+      const fullTotal = getTotalTenureForCompanyLine(line);
+      if (fullTotal >= 24) continue;
+      console.log(`[Snow-we] 短期在籍NG: ${fullTotal || total}ヶ月 / "${line.substring(0, 50)}"`);
+      return 'NG';
+    }
+
+    // ② 同行に部署・役職キーワード → サブエントリー
+    const roleRe = /部長|課長|係長|主任|マネージャー|ディレクター|リーダー|担当|チーフ|シニア|ジュニア|エンジニア|営業部|開発部|総務部|人事部|経営企画|事業部|本部|センター|グループ|チーム|課$|室$|部$/;
+    if (roleRe.test(line)) continue;
+
+    // ③ doda-x形式の在籍期間行（行頭が数字+年/月）
+    if (dodaxTenureRe.test(line)) {
+      if (i > 0 && dodaxTenureRe.test(lines[i - 1])) continue;
+
+      let companyLine = null;
+      let isCurrent = false;
+      for (let k = i - 1; k >= Math.max(0, i - 5); k--) {
+        if (lines[k].includes('現在') || lines[k].includes('在籍中') || lines[k].includes('現職')) isCurrent = true;
+        if (companyRe.test(lines[k])) { companyLine = lines[k]; break; }
+        if (dodaxTenureRe.test(lines[k])) break;
+      }
+      if (!companyLine) continue;
+      if (shukkoRe.test(companyLine)) continue; // 出向先会社はスキップ
+      if (isCurrent) {
+        // 現職のdoda-x形式：同社の過去役職も合算して判断
+        let curTotal = total;
+        for (let j = i + 1; j < lines.length; j++) {
+          if (!dodaxTenureRe.test(lines[j]) || lines[j].includes('現在') || lines[j].includes('在籍中')) break;
+          const t = parseTenureMonths(lines[j]);
+          if (t) curTotal += t;
+        }
+        if (curTotal < 24) {
+          const fullTotal = getTotalTenureForCompanyLine(companyLine);
+          if (fullTotal < 24) {
+            console.log(`[Snow-we] 短期在籍NG(現職dodax): ${curTotal}ヶ月(同社合計${fullTotal}ヶ月) / 会社: "${companyLine.substring(0, 50)}"`);
+            return 'NG';
+          }
+        }
+        continue;
+      }
+
+      let companyTotal = total;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (!dodaxTenureRe.test(lines[j]) || lines[j].includes('現在') || lines[j].includes('在籍中')) break;
+        const t = parseTenureMonths(lines[j]);
+        if (t) companyTotal += t;
+      }
+      if (companyTotal >= 24) continue;
+
+      // 同一会社の別エントリーと合算して基準クリアか確認
+      const fullTotal = getTotalTenureForCompanyLine(companyLine);
+      if (fullTotal >= 24) continue;
+
+      console.log(`[Snow-we] 短期在籍NG(dodax): 合計${companyTotal}ヶ月 / 会社: "${companyLine.substring(0, 50)}"`);
+      return 'NG';
+    }
+
+    // ④ Bizreach形式: 直前行を確認
+    const prevLine = i > 0 ? lines[i - 1] : '';
+    if (companyRe.test(prevLine)) {
+      if (shukkoRe.test(prevLine)) continue; // 出向先はスキップ
+      const prevTenure = parseTenureMonths(prevLine);
+      if (prevTenure !== null && prevTenure >= 24) continue;
+
+      const fullTotal = getTotalTenureForCompanyLine(prevLine);
+      if (fullTotal >= 24) continue;
+
+      console.log(`[Snow-we] 短期在籍NG: ${total}ヶ月 / 会社名行: "${prevLine.substring(0, 50)}"`);
+      return 'NG';
+    }
+  }
+  return null;
+}
+
+// ポジション要件をGASから取得（キャッシュ付き）
+async function fetchPositionRequirements(position) {
+  if (!position) return { requirements: '', companyCriteria: '' };
+  if (_posReqCache.has(position)) return _posReqCache.get(position);
+  try {
+    const res = await chrome.runtime.sendMessage({ type: 'getPositionRequirements', position });
+    if (res?.ok && (res.requirements || res.companyCriteria)) {
+      console.log(`[Snow-we] GASデータ取得成功: "${position}" / 要件${(res.requirements||'').length}文字${res.companyCriteria ? ` / 会社別基準${res.companyCriteria.length}文字` : ''}`);
+      _posReqCache.set(position, res);
+      return res;
+    } else {
+      console.warn(`[Snow-we] GASデータなし: "${position}" → 共通基準のみで判定します (ok=${res?.ok}, requirements="${res?.requirements}")`);
+      const result = { requirements: '', companyCriteria: '' };
+      _posReqCache.set(position, result);
+      return result;
+    }
+  } catch (e) {
+    console.error(`[Snow-we] GASデータ取得エラー: "${position}"`, e);
+    return { requirements: '', companyCriteria: '' };
+  }
+}
+
+// 1候補者のAI判定
+// 年齢・職種区分から適用すべき年収基準を計算する。AI任せで年齢区分を計算させると
+// 隣接する年齢層の基準（例:36歳を40〜45歳区分の基準で判定）を取り違えることがあり、
+// 実際に良い候補者を誤ってNGにしてしまう事例があったため、コード側で確実に計算する。
+// judgeSingleCandidate（個別判定）とcallBatchScreeningAPI（一括・自動実行判定）の
+// 両方で使う共通ロジック（以前は個別判定にしかなく、無人で大量処理される自動実行の方に
+// この安全策が抜けていた）
+function computeIncomeThreshold(age, isIT, ageIncome) {
+  if (isIT) {
+    if (age < 30) return 350;
+    if (age <= 35) return 500;
+    if (age <= 39) return 700;
+    if (age <= 45) return 800;
+    return null;
+  }
+  const ai2 = ageIncome || {};
+  if (age < 30) return ai2.age20s || 500;
+  if (age <= 35) return ai2.age30to35 || 700;
+  if (age <= 39) return ai2.age36to39 || 800;
+  if (age <= 42) return ai2.age40to42 || 1000;
+  if (age <= 45) return ai2.age43to45 || 1200;
+  return null;
+}
+
+const IT_KEYWORD_RE = /エンジニア|ソフトウェア開発|ソフトウェアエンジニア|プログラマ|システム開発|システムエンジニア|インフラ|クラウド|SE(?![A-Za-z])|データエンジニア|データサイエンティスト|機械学習|バックエンド|フロントエンド|DevOps|情報システム/;
+
+async function judgeSingleCandidate(apiKey, profileText, criteria) {
+  console.log(`[Snow-we] judgeSingleCandidate profileText: ${profileText.length}文字 / 冒頭150字: ${profileText.slice(0, 150)}`);
+  const criteriaLines = buildCriteriaText(criteria, getPlatform());
+
+  // ポジション要件をGASから取得
+  let _posStored = {};
+  try { _posStored = await chrome.storage.local.get(['currentPosition']); } catch (_) {}
+  const { currentPosition } = _posStored;
+  // requirements（応募ポジションの職務内容）はOK/NG判定の材料にしないでほしいという
+  // 意図で「参考情報」として渡していたが、AIがこれを見て「職務経験がポジションと
+  // 合わない」という理由でNGにする事例が実際に多発した。この判定はどのポジションが
+  // 選択されているか（担当者や作業タイミングによって変わる）に依存すべきではない
+  // （同じ候補者が、選択中のポジション次第でOKになったりNGになったりしてしまう）ため、
+  // 判定プロンプトからは応募ポジションの職務内容そのものを渡さないようにした。
+  // 会社別採用基準（companyCriteria）は選定基準そのものとして正式に扱うものなので引き続き渡す。
+  const { companyCriteria } = await fetchPositionRequirements(currentPosition || '');
+  const companySection = companyCriteria ? `\n【会社別採用基準（共通基準より優先）】\n${companyCriteria}\n` : '';
+
+  // 過去の訂正フィードバックをfew-shot examplesとして組み込む
+  const feedbacks = await loadRecentFeedbacks(10);
+  let fewShotSection = '';
+  if (feedbacks.length > 0) {
+    const examples = feedbacks
+      .map(f => {
+        const meta = [f.platform, f.recruiter].filter(Boolean).join('/');
+        return `- ${meta ? `[${meta}] ` : ''}「${(f.profileSummary || '').substring(0, 100)}…」\n  AI誤判定:${f.aiVerdict} → 人間正解:${f.correction}`;
+      })
+      .join('\n');
+    fewShotSection = `\n【過去の訂正例（最優先参照）】\n同様パターンの候補者は同じ判断をすること。\n${examples}\n`;
+  }
+
+  // 年齢はAIの自由読解に任せると誤読・誤比較が起きるため、コード側で確実に抽出して明示する
+  const ageMatch = profileText.match(/(\d{2,3})歳/);
+  const ageNote = ageMatch
+    ? `\n【候補者の年齢（自動抽出・正）】${ageMatch[1]}歳 ※年齢条件の判定は必ずこの数値を使うこと。プロフィール本文中の勤続年数・経験年数・西暦等、他の数字と混同しないこと。`
+    : '';
+
+  // 年収基準の年齢区分をAI任せで計算させると、隣接する年齢層の基準（例:36歳を
+  // 40〜45歳区分の基準で判定）を取り違えることがあり、実際に良い候補者を誤ってNGに
+  // してしまう事例があった。コード側で確実に計算し、この候補者に適用する基準額を
+  // そのまま明示することで、AIに年齢区分の計算をさせないようにする
+  let thresholdNote = '';
+  if (ageMatch) {
+    const age = parseInt(ageMatch[1], 10);
+    // プロフィール全文に対して判定すると、「現職は経営企画だが過去にSE経験あり」
+    // 「クラウドサービスの提案営業」のように、文系職なのに本文のどこかにIT関連語が
+    // 混ざっているだけの候補者まで誤ってITエンジニア系と判定してしまい、本来より
+    // 低い年収基準が適用されてしまう（AI自身の「現在・直近の職種で分類する」という
+    // ルールと食い違う）。現職・直近の経歴は通常プロフィール冒頭に書かれるため、
+    // 先頭部分だけを対象にすることで、後半の過去経験・自己PR文中の語による
+    // 誤判定を減らす
+    const isIT = IT_KEYWORD_RE.test(profileText.slice(0, 800));
+    const threshold = computeIncomeThreshold(age, isIT, criteria.ageIncome);
+    if (threshold != null) {
+      thresholdNote = `\n【この候補者に適用する年収基準（自動計算・確定値。必ずこの数値のみを使い、他の年齢層の基準と混同しないこと）】${age}歳・${isIT ? 'ITエンジニア系' : '文系職'}のため年収基準は${threshold}万円。`;
+    } else if (!isIT) {
+      thresholdNote = `\n【年収基準について】${age}歳は年収額での基準ではなく、46歳以上の特別ルール（財務・経理・FP&A等の職歴があるかどうか）で判定すること。`;
+    }
+  }
+
+  const prompt = `転職エージェントの一次選定アシスタントです。
+${companySection}
+【選定基準】
+${criteriaLines}${fewShotSection}
+【重要：職種分類の注意】候補者の職種分類（ITエンジニア系/文系職）は、候補者自身の現在・直近の職種のみで判断すること。
+${ageNote}${thresholdNote}
+【候補者情報】
+${profileText}
+
+JSON1行のみで出力（rを先に書いてからoを確定し、最後にcで確信度0-100を付けること。rは判定理由を50字以内で、qはNG判定の根拠となる【候補者情報】本文からの引用を20字以内でそのまま書き写すこと。OK判定の場合qは空文字でよい）:
+{"r":"理由","o":"OK","c":90,"q":""} または {"r":"理由","o":"NG","c":85,"q":"候補者情報本文からの引用"} または {"r":"理由","o":"要確認","c":45,"q":""}
+※cは判定の確信度（0〜100の整数）。基準に明確に合致/不合致なら80以上、判断が難しければ60未満。
+※qはNGの場合のみ必須。【候補者情報】に実際に書かれている文字列をそのまま抜き出すこと。要約・言い換え・推測は不可。
+【最終確認・厳守事項】JSON出力の前に必ず以下を確認すること：
+・年収基準は上記【この候補者に適用する年収基準】に示した金額のみを使うこと。46歳以上向けの特別ルールは、候補者が実際に46歳以上の場合にのみ適用し、それ未満の年齢の候補者には一切言及しないこと。
+・OK/NG判定は【選定基準】に列挙された条件のみで行うこと。候補者の実務経験が特定の職務内容に合っているかどうかは、このタスクの判定材料に含まれていない。`;
+
+  const data = await claudeFetch(apiKey, {
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 250,
+    messages: [{ role: 'user', content: prompt }]
+  });
+  const text = (data.content?.[0]?.text || '').trim();
+  const verdictMatch    = text.match(/"o"\s*:\s*"([^"]+)"/);
+  const reasonMatch     = text.match(/"r"\s*:\s*"([^"]+)"/);
+  const confidenceMatch = text.match(/"c"\s*:\s*(\d+)/);
+  const quoteMatch      = text.match(/"q"\s*:\s*"([^"]*)"/);
+  let verdict      = verdictMatch    ? verdictMatch[1]        : '要確認';
+  let reason       = reasonMatch     ? reasonMatch[1]         : '';
+  const confidence = confidenceMatch ? parseInt(confidenceMatch[1], 10) : null;
+  const quote      = quoteMatch      ? quoteMatch[1]          : '';
+
+  // NG判定の根拠として提示された引用(q)が、実際に候補者情報本文に存在するかを
+  // 機械的に検証する。存在しない（＝応募ポジション欄の依頼主企業名や、基準にない
+  // 独自解釈と混同した等）場合は根拠のない判定とみなし、要確認へ格下げする。
+  if (verdict === 'NG') {
+    const normalize = s => s.replace(/\s+/g, '');
+    const normProfile = normalize(profileText);
+    let grounded = false;
+    if (quote && quote.length >= 3) {
+      if (normProfile.includes(normalize(quote))) {
+        grounded = true;
+      } else {
+        // AIの引用が「職種タグ／年齢／年収」等、候補者情報のあちこちに離れて
+        // 書かれている複数の事実を改行区切りで並べただけのケースがあり、
+        // 個々の事実はすべて実在するのに文字列として連続していないという理由だけで
+        // 「根拠なし」と誤判定され、正しいNG判定まで要確認に格下げされていた
+        // （実際のログで多発）。断片ごとに実在確認し、全断片が見つかれば根拠ありとする。
+        const fragments = quote.split(/\n+/).map(f => f.trim()).filter(f => f.length >= 2);
+        grounded = fragments.length > 0 && fragments.every(f => normProfile.includes(normalize(f)));
+      }
+    }
+    if (!grounded) {
+      console.warn('[Snow-we] NG判定の根拠引用が候補者情報に見当たらない → 要確認に修正:', JSON.stringify(quote), '/', reason);
+      verdict = '要確認';
+      reason = quote
+        ? `[要確認: 判定根拠「${quote}」が候補者情報に見当たりません] ${reason}`
+        : `[要確認: 判定根拠の引用なし] ${reason}`;
+    }
+  }
+
+  console.log(`[Snow-we] AI判定: ${verdict}${confidence != null ? ` (${confidence}%)` : ''}${reason ? ` / ${reason}` : ''}`);
+  return { verdict, reason, confidence };
+}
+
+// ── フィードバック保存・読み込み ──────────────────────────────────────
+async function saveFeedback(profileSummary, aiVerdict, correction, platform) {
+  const ts = Date.now();
+
+  // ローカルに保存
+  try {
+    const stored = await chrome.storage.local.get(['snowWeFeedbacks']);
+    const feedbacks = stored.snowWeFeedbacks || [];
+    feedbacks.unshift({ profileSummary, aiVerdict, correction, platform, ts });
+    if (feedbacks.length > 50) feedbacks.length = 50;
+    await chrome.storage.local.set({ snowWeFeedbacks: feedbacks });
+    console.log(`[Snow-we] フィードバック保存: AI=${aiVerdict} → 訂正=${correction} (累計${feedbacks.length}件)`);
+  } catch (_) {}
+
+  // GASスプレッドシートにも送信（設定済みかつフィードバック保存が有効な場合）
+  // sendMessageをawaitせず投げっぱなしにしていたため、送信が実際に成功したかわからず、
+  // ページ遷移等でコンテキストが切れると結果が来る前に無言で失敗していた
+  // （ローカル保存はされるがシートには反映されない、という症状の原因）
+  try {
+    const { gasSettings } = await chrome.storage.local.get(['gasSettings']);
+    const gasUrl = gasSettings?.url || gasSettings?.dbUrl;
+    const secret = gasSettings?.secret || 'snowwe2024';
+    if (gasUrl && gasSettings?.feedbackEnabled !== false) {
+      const r = await chrome.runtime.sendMessage({
+        type: 'gasPost',
+        url: gasUrl,
+        payload: {
+          action: 'saveFeedback',
+          secret,
+          recruiter: gasSettings?.recruiter || '',
+          platform,
+          aiVerdict,
+          correction,
+          profileSummary,
+          ts,
+        }
+      });
+      if (!r?.ok) console.warn('[Snow-we] フィードバックのGAS送信失敗:', JSON.stringify(r || {}));
+      else console.log('[Snow-we] フィードバックをGASスプレッドシートに送信しました');
+    }
+  } catch (e) {
+    console.warn('[Snow-we] フィードバックGAS送信エラー:', e.message);
+  }
+
+  // Supabaseにも保存
+  ;(async () => {
+    let recruiter = '';
+    try {
+      const s = await chrome.storage.local.get(['gasSettings']);
+      recruiter = s.gasSettings?.recruiter || '';
+    } catch (_) {}
+    await supabaseInsert('ai_feedback', {
+      platform,
+      original_verdict: aiVerdict,
+      corrected_verdict: correction,
+      recruiter_name: recruiter,
+    });
+  })();
+}
+
+// スカウトメール本文・履歴等のボイラープレート文言（プロフィール本文ではない汚染データの検出に使用）
+const SCOUT_BOILERPLATE_MARKERS = [
+  'スカウト履歴', 'メモ・備考', '候補者評価', 'スカウト送信履歴',
+  'スカウトメール', '送信したメール', 'スカウト文面', 'スカウト送信文',
+  'エージェントからのメッセージ', 'この度はご連絡', '貴方様のご経歴を拝見',
+  'ご経歴を拝見し', '採用担当者からのメッセージ', 'メッセージ履歴',
+  '送信済みテンプレート', '前回スカウト', 'スカウト送信日', '送信日時',
+  'スカウト済み', '選考ステータス', 'エージェントメモ', '社内メモ',
+  // RDSの再送（既にスカウト済み）候補者は詳細パネル先頭に過去のスカウト送信
+  // 履歴（他エージェントの送信文面）が「スカウト送信 [ポジション] [日付] ...」
+  // という見出しで入り込む。これが未検知だと丸ごとプロフィールとして誤抽出される。
+  'スカウト送信', '候補者様',
+];
+
+// dodaXの候補者検索結果ページ・絞り込みフィルター欄（「学歴」「資格」等、実際の
+// プロフィールと同じ語を見出しに使うため誤検出しやすい）を検出するための定型文。
+// findDodaxDetailPanelの候補除外と、extractProfileの最終安全策の両方で使う
+const DODAX_PAGE_CHROME_MARKERS = ['候補者検索結果', '一括スカウト送信は、最大', 'ポジティブアクション等法令上の例外事由'];
+
+// フィードバックのprofileSummaryがスカウトメール文面等の汚染データでないかを判定
+function isContaminatedFeedback(f) {
+  const summary = f?.profileSummary || '';
+  if (!summary) return false;
+  return SCOUT_BOILERPLATE_MARKERS.some(marker => summary.includes(marker));
+}
+
+// チームフィードバックの短時間キャッシュ。夜間自動実行等で候補者を100〜300人
+// 連続判定する際、loadRecentFeedbacksが候補者ごとに毎回GASへ生で問い合わせると、
+// ほぼ同じ内容を100〜300回取りに行くことになりGAS側の負荷・レイテンシを無駄に
+// 増やす（以前対処したロック競合を助長する方向）。チームのフィードバックは
+// 秒単位で変わるものではないため、3分間はキャッシュを使い回す
+let _teamFeedbackCache = { data: null, ts: 0 };
+const TEAM_FEEDBACK_CACHE_MS = 3 * 60 * 1000;
+
+async function loadRecentFeedbacks(limit = 10) {
+  // ローカルフィードバック
+  let local = [];
+  try {
+    const stored = await chrome.storage.local.get(['snowWeFeedbacks']);
+    local = stored.snowWeFeedbacks || [];
+  } catch (_) {}
+
+  // GASからチーム全体のフィードバックも取得（30件、キャッシュ付き）
+  let team = [];
+  if (_teamFeedbackCache.data && Date.now() - _teamFeedbackCache.ts < TEAM_FEEDBACK_CACHE_MS) {
+    team = _teamFeedbackCache.data;
+  } else {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: 'getTeamFeedbacks' });
+      team = res?.feedbacks || [];
+      _teamFeedbackCache = { data: team, ts: Date.now() };
+    } catch (_) {}
+  }
+
+  // スカウトメール文面のような汚染データを few-shot 対象から除外
+  local = local.filter(f => !isContaminatedFeedback(f));
+  team = team.filter(f => !isContaminatedFeedback(f));
+
+  // 重複排除（profileSummary+correction で判定）した上で、ローカル・チーム分を
+  // 合わせて日時(ts)の新しい順に並び替える。以前は単純にローカル分を全部並べてから
+  // チーム分を後ろに追加していたため、ローカルの訂正履歴が上限件数以上たまっていると
+  // それだけで枠が埋まり、他メンバーによるより新しい訂正例が一切参照されなかった
+  const seen = new Set();
+  const merged = [];
+  for (const f of [...local, ...team]) {
+    const key = (f.profileSummary || '').slice(0, 40) + f.correction;
+    if (!seen.has(key)) { seen.add(key); merged.push(f); }
+  }
+  merged.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  return merged.slice(0, limit);
+}
+
+// 訂正ポップアップを表示する
+function showFeedbackPopup(badgeEl) {
+  // 既存のポップアップを消す
+  document.querySelectorAll('.snow-we-fb-popup').forEach(p => p.remove());
+
+  const aiVerdict      = badgeEl.dataset.verdict || '';
+  const profileSummary = badgeEl.dataset.profile || '';
+  const reason         = badgeEl.dataset.reason  || '';
+  const platform       = getPlatform();
+
+  const popup = document.createElement('div');
+  popup.className = 'snow-we-fb-popup';
+  const reasonHtml = reason ? `<div class="snow-we-fb-reason">💭 ${escapeHtml(reason)}</div>` : '';
+  popup.innerHTML = `${reasonHtml}<span>判定を訂正</span><div class="snow-we-fb-row"></div>`;
+  const row = popup.querySelector('.snow-we-fb-row');
+
+  const options = aiVerdict === 'OK'
+    ? [{ label: '❌ 実はNG', cls: 'ng', value: 'NG' }]
+    : aiVerdict === 'NG'
+    ? [{ label: '✅ 実はOK', cls: 'ok', value: 'OK' }]
+    : [{ label: '✅ OK', cls: 'ok', value: 'OK' }, { label: '❌ NG', cls: 'ng', value: 'NG' }];
+
+  options.forEach(({ label, cls, value }) => {
+    const btn = document.createElement('button');
+    btn.className = `snow-we-fb-btn ${cls}`;
+    btn.textContent = label;
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      popup.remove();
+      try {
+        await saveFeedback(profileSummary, aiVerdict, value, platform);
+      } catch (_) {}
+      // saveFeedbackが失敗してもバッジは必ず更新する
+      badgeEl.className = badgeEl.className.replace(/\b(ok|ng|warn)\b/, 'corrected');
+      badgeEl.textContent = value === 'OK' ? '↩ 訂正: OK' : '↩ 訂正: NG';
+      badgeEl.style.cursor = 'default';
+      badgeEl.removeEventListener('click', badgeEl._fbHandler);
+    });
+    row.appendChild(btn);
+  });
+
+  // ポップアップ内クリックは閉じない
+  popup.addEventListener('click', e => e.stopPropagation());
+
+  // ポップアップ外クリックで閉じる
+  setTimeout(() => {
+    document.addEventListener('click', function closePopup() {
+      popup.remove();
+      document.removeEventListener('click', closePopup);
+    });
+  }, 0);
+
+  badgeEl.parentElement.appendChild(popup);
+}
+
+// ok/ng/warn 判定済みバッジにのみ訂正ハンドラを付与（単体判定・バッチ判定 共通）
+function attachFeedbackHandler(badge, cls, tooltip, profileSummary, aiVerdict) {
+  if (!((cls === 'ok' || cls === 'ng' || cls === 'warn') && profileSummary)) return;
+  badge.dataset.verdict = aiVerdict || cls.toUpperCase();
+  badge.dataset.profile = profileSummary;
+  badge.dataset.reason  = tooltip || '';
+  badge._fbHandler = (e) => { e.stopPropagation(); showFeedbackPopup(badge); };
+  badge.addEventListener('click', badge._fbHandler);
+  badge.title = (tooltip ? tooltip + '\n' : '') + '（クリックで判定を訂正）';
+}
+
+// バッジをセット（バッチ用）
+function setBatchBadge(el, cls, text, tooltip, profileSummary, aiVerdict) {
+  el.querySelectorAll('.snow-we-badge.batch').forEach(b => b.remove());
+  if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
+  const badge = document.createElement('div');
+  badge.className = `snow-we-badge batch ${cls}`;
+  badge.textContent = text;
+  if (tooltip) badge.title = tooltip;
+  attachFeedbackHandler(badge, cls, tooltip, profileSummary, aiVerdict);
+  // Bizreach: DOM再利用検出のためresumeIdをバッジに記録
+  if (getPlatform() === 'bizreach') {
+    const rid = getBizreachResumeNumericId(el);
+    if (rid) badge.dataset.resumeId = rid;
+  }
+  el.appendChild(badge);
+
+  // Bizreach仮想スクロール: checkingを除く確定判定をレジストリに保存（スクロール後の再表示に使用）
+  if (getPlatform() === 'bizreach' && cls !== 'checking') {
+    const resumeId = getBizreachResumeNumericId(el);
+    if (resumeId) {
+      _bizreachBadgeRegistry.set(resumeId, {
+        cls, text, tooltip: tooltip || '', profileSummary: profileSummary || '', aiVerdict: aiVerdict || ''
+      });
+    }
+  }
+}
+
+// Bizreach仮想スクロール: DOM上の全カードにレジストリのバッジを再適用（デバウンス付き）
+function reapplyBizreachBadges() {
+  if (_bizreachBadgeRegistry.size === 0) return;
+  clearTimeout(_reapplyBizreachTimer);
+  _reapplyBizreachTimer = setTimeout(() => {
+    let starredIds;
+    try { starredIds = new Set(JSON.parse(sessionStorage.getItem('snowWeBizreachStarred') || '[]')); }
+    catch (_) { starredIds = new Set(); }
+    document.querySelectorAll('ess-resume-list-item').forEach(el => {
+      const resumeId = getBizreachResumeNumericId(el);
+      if (!resumeId) return;
+
+      // DOM再利用検出: 既存バッジのresumeIdが現在のカードと一致しない場合は削除
+      const existingBadge = el.querySelector('.snow-we-badge.batch');
+      if (existingBadge) {
+        if (existingBadge.dataset.resumeId === resumeId) {
+          // 正しいバッジが既にある → 星のみ再確認
+          const state = _bizreachBadgeRegistry.get(resumeId);
+          if (state) {
+            const isNg = state.cls === 'ng' || (state.cls === 'corrected' && state.aiVerdict === 'NG');
+            const isOk = state.cls === 'ok' || (state.cls === 'corrected' && state.aiVerdict === 'OK');
+            const starBtn = findBizreachStarButton(el);
+            if (starBtn) {
+              if (isNg && isBizreachStarred(starBtn)) forceBizreachStarOff(starBtn);
+              if (isOk && starredIds.has(resumeId) && !isBizreachStarred(starBtn)) forceBizreachStarOn(starBtn);
+            }
+          }
+          return;
+        }
+        existingBadge.remove(); // 古いバッジ（DOM再利用）を削除
+      }
+
+      const state = _bizreachBadgeRegistry.get(resumeId);
+      if (!state) return;
+      setBatchBadge(el, state.cls, state.text, state.tooltip, state.profileSummary, state.aiVerdict);
+
+      const isNg = state.cls === 'ng' || (state.cls === 'corrected' && state.aiVerdict === 'NG');
+      const isOk = state.cls === 'ok' || (state.cls === 'corrected' && state.aiVerdict === 'OK');
+      const starBtn = findBizreachStarButton(el);
+      if (starBtn) {
+        if (isNg && isBizreachStarred(starBtn)) forceBizreachStarOff(starBtn);
+        if (isOk && starredIds.has(resumeId) && !isBizreachStarred(starBtn)) forceBizreachStarOn(starBtn);
+      }
+    });
+  }, 300);
+}
+
+// Bizreach仮想スクロール監視を開始（初回のみ・viewport未検出時は監視しない）
+function startBizreachBadgeObserver() {
+  if (_bizreachObserver) return;
+  const target = document.querySelector('cdk-virtual-scroll-viewport');
+  if (!target) {
+    console.log('[Snow-we] cdk-virtual-scroll-viewport 未検出のため監視スキップ');
+    return;
+  }
+  _bizreachObserver = new MutationObserver(() => reapplyBizreachBadges());
+  _bizreachObserver.observe(target, { childList: true, subtree: true });
+  console.log('[Snow-we] Bizreachバッジ監視開始');
+}
+
+// 次ページボタンを探す
+function findNextPageButton() {
+  const nextTexts = ['次へ', '次のページ', '>', '›', 'Next'];
+
+  // 1. テキストベースの「次へ」ボタン
+  // モーダル・カレンダー内の要素や長いテキストを含む要素は除外する
+  const isInModal = (el) => {
+    for (let p = el.parentElement; p; p = p.parentElement) {
+      const cls = (p.getAttribute('class') || '').toLowerCase();
+      if (cls.includes('modal') || cls.includes('calendar') || cls.includes('dialog') ||
+          p.getAttribute('role') === 'dialog') return true;
+    }
+    return false;
+  };
+  for (const el of document.querySelectorAll('a,button,[role="button"],span,div,li')) {
+    const t = (el.innerText || el.getAttribute('aria-label') || '').trim();
+    // テキストが短い（< 20文字）場合のみ。'>'や'›'は完全一致のみ
+    const matches = nextTexts.some(kw => {
+      if (kw === '>' || kw === '›') return t === kw;
+      return (t === kw || t.includes(kw)) && t.length < 20;
+    });
+    if (matches && !el.disabled && !el.classList.contains('disabled') &&
+        el.getAttribute('aria-disabled') !== 'true' &&
+        !el.classList.contains('active') && !el.classList.contains('current') &&
+        !isInModal(el)) {
+      console.log('[Snow-we] テキスト次ページボタン発見:', t, el.tagName, (el.getAttribute('class') || '').substring(0, 40));
+      return el;
+    }
+  }
+
+  // 2. 数字ページネーション: アクティブページ番号+1を探す（doda-x等SPA）
+  // 結果件数表示（0件・531件・30件表示等）を除外し、ページボタンのみを対象にする
+  const isResultCountEl = (el) => {
+    for (let p = el.parentElement, i = 0; p && i < 5; p = p.parentElement, i++) {
+      const cls = (p.getAttribute('class') || '').toLowerCase();
+      // 件数表示コンテナのクラス名パターン（'result'は検索結果リストと区別できないため除外）
+      if (cls.includes('cnt') || cls.includes('count') ||
+          cls.includes('total') || cls.includes('件数') || cls.includes('hits')) return true;
+    }
+    return false;
+  };
+
+  // AMBI: per_page=1000 で全件を1ページに表示するためページネーション不要
+  if (getPlatform() === 'ambi') {
+    console.log('[Snow-we] AMBI: per_page=1000 使用中 → ページネーション不要');
+    return null;
+  }
+
+  // doda-x 専用: prts-paging 構造から次ページを取得
+  if (getPlatform() === 'dodax') {
+    const paging = document.querySelector('[class*="prts-paging"]');
+    if (paging) {
+      const items = Array.from(paging.querySelectorAll('li, a'));
+      const activeItem = items.find(el => el.classList.contains('active'));
+      const currentNum = activeItem ? parseInt((activeItem.innerText || '').trim(), 10) : 1;
+      const nextItem = items.find(el => {
+        if (el.classList.contains('active') || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+        const n = parseInt((el.innerText || '').trim(), 10);
+        return !isNaN(n) && n === currentNum + 1;
+      });
+      if (nextItem) {
+        console.log(`[Snow-we] dodax prts-paging 次ページ: ${currentNum} → ${currentNum + 1}`);
+        return nextItem;
+      }
+      console.log(`[Snow-we] dodax prts-paging: 最終ページ (currentPage=${currentNum})`);
+      return null;
+    }
+  }
+
+  const allNumericEls = Array.from(document.querySelectorAll('a,button,[role="button"],span,div,li'))
+    .filter(el => {
+      const t = (el.innerText || '').trim();
+      const n = parseInt(t, 10);
+      if (!/^\d{1,3}$/.test(t) || el.children.length > 1) return false;
+      if (n < 1) return false; // 0 は件数表示の可能性が高いので除外
+      if (isInModal(el)) return false;
+      if (isResultCountEl(el)) return false;
+      return true;
+    });
+
+  console.log(`[Snow-we] 数字ページ候補要素数: ${allNumericEls.length}`, allNumericEls.slice(0, 8).map(e => `${e.tagName}:${(e.innerText||'').trim()}:${(e.getAttribute('class')||'').substring(0,30)}`));
+
+  if (allNumericEls.length > 0) {
+    let currentPage = null;
+
+    const activeEl = allNumericEls.find(el => {
+      if (el.classList.contains('active') || el.classList.contains('current') ||
+          el.classList.contains('is-active') || el.classList.contains('is-current') ||
+          el.classList.contains('selected') || el.classList.contains('is-selected')) return true;
+      if (el.getAttribute('aria-current') === 'page' || el.getAttribute('aria-selected') === 'true') return true;
+      if (el.getAttribute('aria-disabled') === 'true' || el.disabled) return true;
+      if (parseInt(getComputedStyle(el).fontWeight) >= 700) return true;
+      const parent = el.parentElement;
+      if (parent && (parent.classList.contains('active') || parent.classList.contains('current') ||
+          parent.classList.contains('is-active') || parent.classList.contains('is-current'))) return true;
+      return false;
+    });
+
+    if (activeEl) {
+      currentPage = parseInt((activeEl.innerText || '').trim(), 10);
+      console.log(`[Snow-we] アクティブページ検出: ${currentPage} class="${activeEl.getAttribute('class')||''}" parent="${(activeEl.parentElement?.getAttribute('class')||'').substring(0,40)}"`);
+    } else {
+      const m = location.href.match(/[?&](?:page|p)=(\d+)/);
+      currentPage = m ? parseInt(m[1], 10) : 1;
+      console.log(`[Snow-we] URLからページ推定: ${currentPage} url="${location.href.substring(0, 80)}"`);
+    }
+
+    const nextBtn = allNumericEls.find(el => {
+      const n = parseInt((el.innerText || '').trim(), 10);
+      if (n !== currentPage + 1) return false;
+      if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+      if (el.classList.contains('active') || el.classList.contains('current') ||
+          el.classList.contains('is-active') || el.classList.contains('is-current')) return false;
+      return true;
+    });
+
+    if (nextBtn) {
+      console.log(`[Snow-we] 数字ページネーション: ${currentPage} → ${currentPage + 1} tag=${nextBtn.tagName} href=${nextBtn.href || 'なし'}`);
+      return nextBtn;
+    }
+    console.log(`[Snow-we] 次ページボタン未発見 currentPage=${currentPage}`);
+  }
+
+  return null;
+}
+
+// 夜間自動実行は複数スロット（複数タブ/ウィンドウ）が同時並行で動くことがあり、
+// chrome.storage.localはタブ間で共有されるため、単一の'autoAddProgress'キーを
+// 全スロットで使い回すとお互いの進捗を上書きし合ってしまう
+// （片方のスロットの完了書き込みが、まだ実行中の別スロットの状態を消してしまい、
+// checkForUpdate()の実行中バッチ判定を誤らせ、動いている最中に拡張機能が
+// リロードされてバッチが中断する、という実害につながる）。
+// スロットごとに別キーへ保存することで衝突を避ける。
+function autoAddProgressKey() {
+  return _isAutoRunMode ? `autoAddProgress_slot${_autoRunSlotId}` : 'autoAddProgress';
+}
+
+// 自動追加の進捗をストレージに保存
+async function saveAutoAddProgress(data) {
+  if (!data.running) {
+    // バッチ終了：モジュールキャッシュとsessionStorageバックアップをリセット
+    _batchIsRunning = false;
+    _triggerAutoAddLock = false;
+    _batchApiKey = null;
+    _batchCriteria = null;
+    _batchScoutHistory = null;
+    try { sessionStorage.removeItem('snowWeBatchCounters'); } catch (_) {}
+  } else if (data.added != null) {
+    // バッチ進行中：chrome.storage失敗時の復元用にsessionStorageへバックアップ
+    try { sessionStorage.setItem('snowWeBatchCounters', JSON.stringify({ added: data.added, processed: data.processed || 0, ok: data.verdicts?.ok || 0, ng: data.verdicts?.ng || 0, pending: data.verdicts?.pending || 0 })); } catch (_) {}
+  }
+  try {
+    await chrome.storage.local.set({ [autoAddProgressKey()]: data });
+  } catch (e) {
+    // Extension context invalidated（拡張機能再読み込み時）は無視
+    if (!e.message?.includes('Extension context invalidated')) console.warn('[Snow-we] saveAutoAddProgress error:', e.message);
+  }
+}
+
+// 自動追加の進捗をストレージから読み込む
+async function loadAutoAddProgress() {
+  try {
+    const key = autoAddProgressKey();
+    const r = await chrome.storage.local.get([key]);
+    return r[key] || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// リクナビHRTechのカード上の「送済（X日前）」バッジからスカウト送信日数を取得
+function getRikunabiScoutDays(cardEl) {
+  // カード自身 → 親 → 祖父母 と広げて探す（バッジがDOM外にある場合の対策）
+  for (let el = cardEl, depth = 0; el && depth < 4; el = el.parentElement, depth++) {
+    const text = el.innerText || '';
+    const m = text.match(/送(?:信)?済[（(]\s*(\d+)\s*日前\s*[）)]/);
+    if (m) {
+      return parseInt(m[1], 10);
+    }
+  }
+  // 座標でバッジ要素を探す（絶対配置で親外に出ている場合）
+  const rect = cardEl.getBoundingClientRect();
+  const allEls = document.querySelectorAll('span, div, p');
+  for (const el of allEls) {
+    const t = (el.innerText || '').trim();
+    const m = t.match(/^送(?:信)?済[（(]\s*(\d+)\s*日前\s*[）)]$/);
+    if (!m) continue;
+    const r = el.getBoundingClientRect();
+    if (r.top >= rect.top - 10 && r.bottom <= rect.bottom + 10) {
+      return parseInt(m[1], 10);
+    }
+  }
+  return null;
+}
+
+// モーダル（候補者詳細ポップアップ）またはパネルを下までスクロール
+async function scrollModalToBottom() {
+  // role="dialog" やクラス名でモーダルを優先して探す
+  const modalRoot =
+    document.querySelector('[role="dialog"]') ||
+    document.querySelector('[class*="modal" i]') ||
+    document.querySelector('[class*="dialog" i]') ||
+    document.querySelector('[class*="overlay" i]');
+
+  const searchRoot = modalRoot || document.body;
+  // スクロール可能な子要素を探す
+  let best = null;
+  let bestH = 0;
+  searchRoot.querySelectorAll('*').forEach(el => {
+    const style = window.getComputedStyle(el);
+    if (style.overflowY !== 'scroll' && style.overflowY !== 'auto') return;
+    const rect = el.getBoundingClientRect();
+    if (rect.height > bestH) { best = el; bestH = rect.height; }
+  });
+  if (best) {
+    best.scrollTop = best.scrollHeight;
+  } else if (modalRoot) {
+    modalRoot.scrollTop = modalRoot.scrollHeight;
+  } else {
+    window.scrollTo(0, document.body.scrollHeight);
+  }
+  await sleep(1200);
+}
+
+// ページ内の「スカウト送信」テキスト直後の日付から最近の送信日数を返す
+function checkScoutSentInBody() {
+  // モーダル（候補者詳細）内だけを検索する（ページ全体だと誤検出する）
+  const modal = findRDSDetailPanel() ||
+    document.querySelector('[role="dialog"]') ||
+    document.querySelector('[class*="modal" i]') ||
+    document.querySelector('[class*="dialog" i]');
+
+  const searchRoot = modal || document.body;
+  const bodyText = searchRoot.innerText || '';
+
+  let minDays = Infinity;
+  const now = Date.now();
+  let searchFrom = 0;
+  while (true) {
+    const idx = bodyText.indexOf('スカウト送信', searchFrom);
+    if (idx === -1) break;
+    const nextChars = bodyText.slice(idx + 6, idx + 10);
+    // 「スカウト送信済み」タブ・「スカウト送信履歴」見出し・「スカウト送信する」ボタンはスキップ
+    if (nextChars[0] === '済' || nextChars.startsWith('履歴') || nextChars.startsWith('する') || nextChars.startsWith('ボタン')) {
+      searchFrom = idx + 7;
+      continue;
+    }
+    // 日付は直後100文字以内に限定（遠い日付=職務経歴日付の誤検出を防ぐ）
+    const section = bodyText.slice(idx, idx + 100);
+    const dates = section.match(/\d{4}\/\d{2}\/\d{2}/g) || [];
+    for (const ds of dates) {
+      const d = new Date(`${ds.replace(/\//g, '-')}T00:00:00+09:00`);
+      if (isNaN(d.getTime())) continue;
+      const daysAgo = Math.floor((now - d.getTime()) / (1000 * 60 * 60 * 24));
+      if (daysAgo >= 0 && daysAgo < minDays) minDays = daysAgo;
+    }
+    searchFrom = idx + 7;
+  }
+  const result = minDays === Infinity ? null : minDays;
+  console.log('[Snow-we] checkScoutSentInBody result:', result);
+  return result;
+}
+
+// 右パネルのスクロール可能要素を下までスクロールして返す
+async function scrollRightPanelToBottom() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let best = null;
+  let bestArea = 0;
+  document.querySelectorAll('*').forEach(el => {
+    const rect = el.getBoundingClientRect();
+    if (rect.left < vw * 0.4) return; // 右半分のみ
+    if (rect.height < vh * 0.3) return;
+    const style = window.getComputedStyle(el);
+    if (style.overflowY !== 'scroll' && style.overflowY !== 'auto') return;
+    const area = rect.width * rect.height;
+    if (area > bestArea) { best = el; bestArea = area; }
+  });
+  if (best) {
+    best.scrollTop = best.scrollHeight;
+    await sleep(1000);
+    return best; // スクロールした要素を返す（スカウト履歴の検索範囲として使う）
+  } else {
+    window.scrollTo(0, document.body.scrollHeight);
+    await sleep(1000);
+    return null;
+  }
+}
+
+// 指定要素（右パネル）内のスカウト履歴セクションから最近の送信日数を返す（なければnull）
+function checkScoutHistoryInElement(root) {
+  const searchRoot = root || document.body;
+  const text = searchRoot.innerText || '';
+  const idx = text.indexOf('スカウト履歴');
+
+
+  if (idx === -1) return null;
+  const section = text.slice(idx, idx + 2000);
+  const dates = section.match(/\d{4}\/\d{2}\/\d{2}/g) || [];
+
+  let minDays = Infinity;
+  const now = Date.now();
+  for (const ds of dates) {
+    const d = new Date(`${ds.replace(/\//g, '-')}T00:00:00+09:00`);
+    if (isNaN(d.getTime())) continue;
+    const daysAgo = Math.floor((now - d.getTime()) / (1000 * 60 * 60 * 24));
+    if (daysAgo >= 0 && daysAgo < minDays) minDays = daysAgo;
+  }
+  const result = minDays === Infinity ? null : minDays;
+  return result;
+}
+
+function buildCriteriaText(criteria, platform) {
+  platform = platform || getPlatform();
+  const isBizreach = platform === 'bizreach';
+  const lines = [];
+
+  // 常時適用される標準基準
+  lines.push(`【重要】以下の企業名・職歴に関するNG条件はすべて、【候補者情報】に記載されている候補者自身の実際の勤務先・経歴のみを見て判定すること。応募ポジションの依頼主企業名（【応募ポジションの職務内容】セクション等に出てくる企業名）は候補者の職歴ではないため、絶対に判定材料にしないこと。`);
+  lines.push(`【絶対NG】`);
+  lines.push(`- 職歴にアクセンチュアが含まれる場合は即NG`);
+  lines.push(`- 職歴にベイカレントが含まれる場合は原則即NG。ただし43歳以上かつ財務・経理・FP&A等の職歴がある場合は「要確認」`);
+  lines.push(`- 秘書が実際の職歴・業務内容・職種として含まれる場合は即NG。ただし「総務・法務・知財・秘書」のようなカテゴリ名に秘書が含まれるだけで、実際の職種（「/」以降や業務内容）が法務・総務・人事等の場合はNG対象外`);
+  lines.push(`- ITエンジニア系で保守運用のみの場合は即NG`);
+  lines.push(`- 46歳以上で文系職（コンサル・営業・マーケ・経営企画・人事・金融営業・システム営業・IT営業等）かつ財務・経理・FP&A・CFO・財務戦略等の職歴が一切ない場合は即NG（年収が高くても）`);
+  lines.push(`- ★重要★ 「財務・経理・FP&A職歴あり」の定義: 財務部・経理部・FP&A部門・Treasury・経営管理部（財務担当）等で実際に財務経理業務を担当した経験があること。以下はNG対象外外の例外にはならない：サステナビリティ/ESG担当として経理的な仕組みを設計した、非財務情報開示（SSBJ・TCFD等）を担当した、カーボン会計・GHG会計の仕組みを作った、経理部門と連携しただけ`);
+  lines.push(`- 46歳以上でIT・理系・技術職（ソフトウェアエンジニア・インフラ・クラウド・SE・データサイエンティスト・データアナリスト・DXコンサル・PMO・研究職・建築設計・土木・機械設計・電気設計・製造技術・生産技術・品質管理等のIT以外の理工系技術職を含む）は即NG`);
+  lines.push(`- 医師・医者・歯科医・歯科医師・薬剤師等、国家資格を保有し臨床診療・調剤等の資格必須業務に実際に従事している場合のみ即NG。製薬会社・医療機器メーカー等での薬事/法規対応・MR・臨床開発・研究開発・品質管理・その他医薬品専門職等、医薬品/医療業界に勤務しているだけで上記の医療資格そのものは保有・行使していない一般のビジネス職・技術職は、この条件には該当しない（この条件だけを理由にNGにしない。他の基準は通常通り適用する）`);
+  lines.push(`- 大学教授・准教授・講師・助教等のアカデミア（学術職）が主なキャリアの場合は即NG`);
+  lines.push(`- 弁護士・法律事務所勤務が主なキャリアの場合は即NG`);
+  lines.push(`- 記者・ジャーナリスト（新聞・テレビ・雑誌等のメディア記者）が主なキャリアの場合は即NG`);
+  lines.push(`- テレビ・映画・ラジオ・出版等のメディア制作職（プロデューサー・ディレクター・編集者・放送作家・カメラマン等）が主なキャリアの場合は即NG`);
+  lines.push(`- 自衛官・自衛隊員が主なキャリアの場合は即NG`);
+  lines.push(`- 司法書士・行政書士・社会保険労務士・土地家屋調査士等の士業（公認会計士・税理士・弁護士を除く）が主なキャリアの場合は即NG`);
+  lines.push(`- フリーランス・個人事業主が主なキャリアで文系職の場合は即NG（ただし理系・IT・技術職のフリーランスはOK）`);
+  lines.push(`- 中小企業・無名企業・スタートアップの代表取締役・社長・経営者（自社設立・オーナー経営）が現在の主な活動の場合は即NG。大手・外資・有名上場企業に正社員として勤務中の人のみOK対象`);
+  lines.push(`- パチンコ・消費者金融・サラ金・マルチ商法（MLM・ネットワークビジネス）・風俗・ギャンブル関連業界が主なキャリアの場合は即NG`);
+  lines.push(`- 現在離職中（無職・求職中・退職済み）の場合は即NG。現在も正社員として在籍中の人のみOK対象`);
+  lines.push(`- 現在の雇用形態が契約社員・派遣社員・業務委託・パート・アルバイト等の非正規雇用の場合は即NG。正社員のみOK対象`);
+
+  if (isBizreach) {
+    lines.push(`\n【Bizreach専用基準】`);
+    lines.push(`※年収はBizreachサイト側のフィルターで1000万円以上に絞り込み済みのため、年収チェックは不要`);
+
+    lines.push(`\n▼絶対NG（Bizreach専用追加条件）`);
+    lines.push(`- 現職・過去職歴を問わず、アクセンチュア（Accenture）に在籍したことがある場合は即NG`);
+    lines.push(`- 現職・過去職歴を問わず、ベイカレント（BayCurrent）に在籍したことがある場合は即NG（年齢・職種・現職問わず例外なし）`);
+    lines.push(`- 現職・過去職歴を問わず、野村総合研究所（NRI）に在籍したことがある場合は即NG`);
+    lines.push(`- 現職・過去職歴を問わず、BIG4（デロイト トーマツ・PwC・EY・KPMG、およびそれらのコンサルティング・監査法人・グループ会社）に在籍したことがある場合は即NG`);
+    lines.push(`- 投資銀行（ゴールドマン・サックス・モルガン・スタンレー・JPモルガン・UBS・クレディ・スイス・野村証券IB部門・大和証券CM部門等）でのIBD・M&A・引受業務等が主なキャリアの場合は即NG`);
+    lines.push(`- 金融・証券におけるディーラー（トレーダー・為替ディーラー・債券ディーラー・株式ディーラー・デリバティブトレーダー等）が主な職種・キャリアの場合は即NG`);
+    lines.push(`- 特許・知的財産（特許出願・知財管理・ライセンシング・特許調査・特許翻訳等）が主な職種・キャリアの場合は即NG`);
+    lines.push(`- 現職の社格（最重要）：以下の【現職OK基準】のいずれかに明確に当てはまる会社に在籍中の場合のみOK。会社名を見て「知らない」「小さそう」と感じたら即NG。判断に迷う場合は必ずNG。ただし④の「業界内大手」については、会社規模・知名度から明らかに大手と判断できる場合はOKとしてよい（過度に厳格にしすぎず、大手なのに落とさないよう注意）。\n  ※「現職」のみで判断すること。過去の在籍企業の社格が低くても、現職がOK基準を満たせば社格でNGにしない。\n  【現職OK基準 ①〜④のいずれか1つに該当すればOK】\n  ① 東証プライム上場企業（旧東証一部相当）。東証スタンダード・グロース上場のみは一般知名度次第でNG判断。株式会社シフト・レバレジーズ株式会社は東証プライムとしてOK。\n  ② 外資系企業またはその日本法人（本社が海外の多国籍企業・グループ会社含む。アクセンチュア・BIG4等は別途絶対NGルール参照）\n  ③ 著名大手・メガベンチャー（以下リスト内の企業のみ。リスト外の未上場ベンチャーは全てNG）：リクルート・パーソル・レバレジーズ（レバテック）・サイバーエージェント・DeNA・MIXI・GMO・メルカリ・SmartHR・freee・マネーフォワード・LayerX・Sansan・Visional・エン・ジャパン・M3等の誰もが知る大手名門企業\n  ④ 業界内で明確に知名度がある大手（大手総合商社・三菱・三井・住友・丸紅・伊藤忠等の大手商社／三菱UFJ・三井住友・みずほ等のメガバンク／野村・大和・SMBC日興等の大手証券／日本生命・第一生命・東京海上・損保ジャパン等の大手保険／トヨタ・ソニー・パナソニック・日立・富士通・NEC・東芝・本田・日産等の大手製造業／NTTグループ（NTT・NTT西日本・NTT東日本・NTTデータ・NTTコミュニケーションズ・NTTドコモ・NTTソフトウェア・NTTロジスコ等）・KDDI・ソフトバンク・楽天モバイル等の通信／JRグループ（JR東日本・JR西日本・JR東海・JR九州・JR北海道・JR四国・JR貨物等）・私鉄大手（東急・小田急・京王・西武・東武・阪急・近鉄・京阪等）等の交通／東京電力・関西電力・中部電力・東北電力・九州電力・北海道電力・中国電力・四国電力・北陸電力・沖縄電力等の地域電力各社／東京ガス・大阪ガス・東邦ガス・西部ガス等の都市ガス会社／ENEOS・出光興産・コスモエネルギー等の石油元売り／その他誰もが名前を知っている上場大手企業）\n  【即NGの例】「〇〇コンサルティング」「〇〇ソリューションズ」等の無名IT・コンサル、非上場で知名度のない中小・スタートアップ（③リスト外は全てNG）`);
+    lines.push(`- 現職の会社の従業員数が500人以下の場合は即NG（プロフィールに記載がある場合のみ適用）`);
+    lines.push(`- 現職の会社の設立・創業から10年未満の新興企業の場合は即NG（プロフィールに記載がある場合のみ適用）`);
+
+    lines.push(`\n▼経験社数（転職回数）`);
+    lines.push(`- 36歳以上：3社まで OK、4社以上 → NG`);
+    lines.push(`- 28〜35歳：2社まで OK、3社以上 → NG`);
+    lines.push(`- 27歳以下：1社のみ OK、2社以上 → NG`);
+    lines.push(`  ※同一グループ・親子会社間の異動・出向は1社としてカウントする`);
+    lines.push(`  ※経験社数が読み取れない場合は経験社数でNGにしない`);
+
+    lines.push(`\n▼職種の分類（最初にこれを確認する）`);
+    lines.push(`「ITエンジニア・デジタル系」に該当するのは以下のみ：`);
+    lines.push(`  ソフトウェアエンジニア・SE・Webエンジニア・インフラエンジニア・クラウドエンジニア・データエンジニア・データサイエンティスト・データアナリスト・DXコンサル・ITコンサル・ITプロジェクトマネージャー（IT系PM）`);
+    lines.push(`「それ以外の全職種」は学歴・社格の審査対象：`);
+    lines.push(`  営業・コンサル（IT以外）・マーケ・経営企画・財務・人事・金融・テレビ制作・出版・MR・医療営業・製造技術・生産技術・土木・機械設計・電気設計・臨床開発・研究職（製薬・化学・材料等）・品質管理・その他すべて`);
+
+    lines.push(`\n▼学歴・社格基準（「それ以外の全職種」に適用）`);
+    lines.push(`- 社格：東証プライム上場企業・外資系・著名大手・メガベンチャーでの勤務経験が必要。知名度のない中小・無名企業のみのキャリアはNG。判断に迷う会社はNG`);
+    lines.push(`- 学歴：以下のいずれかに該当すること（いずれにも該当しない場合はNG）`);
+    lines.push(`  ① 早慶上智（早稲田・慶應・上智）`);
+    lines.push(`  ② MARCH・東京理科大（明治・青山学院・立教・中央・法政・東京理科大）`);
+    lines.push(`  ③ 国立大学（旧帝大・東工大・一橋・筑波・横浜国立・小樽商科・北海道・東北・名古屋・大阪・九州・神戸・広島・岡山・千葉・埼玉・金沢・信州・静岡・熊本・長崎・鹿児島・琉球等、国が設置する全ての大学）`);
+    lines.push(`  ④ 関関同立（関西大・関西学院大・同志社大・立命館大）かつ大手企業・外資系・有名上場企業に現在在籍中`);
+    lines.push(`  ⑤ 海外大学卒（どの国・地域でも可）`);
+    lines.push(`  ⑥ 公立大学（横浜市立大学・大阪市立大学・大阪公立大学・名古屋市立大学・京都府立大学・東京都立大学（首都大学東京）・兵庫県立大学等、都道府県・市区町村が設置する大学）`);
+    lines.push(`  ※学歴が不明・記載なしの場合は学歴でNGにしない。社格・経験社数で判断すること`);
+
+    lines.push(`\n▼Bizreach判定方針（迷う場合は必ずNG）`);
+    lines.push(`以下の順番で判定すること：`);
+    lines.push(`1. 絶対NG条件に該当 → 即NG`);
+    lines.push(`2. 経験社数が年齢別上限を超える → NG`);
+    lines.push(`3. 社格NG（現職OK基準①〜④のいずれにも当てはまらない）→ NG　※「ITエンジニア・デジタル系」はこのステップをスキップ`);
+    lines.push(`4. 「それ以外の全職種」で学歴NG（①〜⑥のいずれにも非該当、かつ学歴が明記されている場合）→ NG`);
+    lines.push(`5. 上記1〜4のいずれにも該当しない → OK`);
+    lines.push(`※「要確認」は絶対に使用しないこと。必ずOKかNGを返すこと`);
+    lines.push(`※「ITエンジニア・デジタル系」は社格チェック（ステップ3）をスキップ。学歴チェック（ステップ4）もスキップ。それ以外の技術職（製造・土木・研究等）はスキップしない`);
+  } else {
+    lines.push(`\n【職種判定】候補者の「直近・現在の職種」で以下のどちらかに分類し、対応する基準を適用してください。過去の経歴や学歴は分類に影響しません。`);
+    lines.push(`- 「ITエンジニア系（IT・理系・技術職）」: 現在の職種がソフトウェアエンジニア・SE・インフラ・クラウド・データエンジニア・データサイエンティスト・データアナリスト・DXコンサル・ITコンサル・PMO・研究職（バイオ・化学・材料等）・建築設計・土木・機械設計・電気設計・製造技術・生産技術・品質管理等の技術職`);
+    lines.push(`- 「文系職」: 現在の職種がコンサル（IT以外）・営業・マーケ・経営企画・事業企画・財務・人事・金融・その他ビジネス職。理系出身・研究職経験があっても現職が経営企画等のビジネス職であれば文系職として分類する`);
+
+    const ai2 = criteria.ageIncome || {};
+    const inc20s    = ai2.age20s    || 500;
+    const inc30to35 = ai2.age30to35 || 700;
+    const inc36to39 = ai2.age36to39 || 800;
+    const inc40to42 = ai2.age40to42 || 1000;
+    const inc43to45 = ai2.age43to45 || 1200;
+    lines.push(`\n【文系職の年収基準】`);
+    lines.push(`- 20代: ${inc20s}万円未満 → NG`);
+    lines.push(`- 30〜35歳: ${inc30to35}万円未満 → NG`);
+    lines.push(`- 36〜39歳: ${inc36to39}万円未満 → NG`);
+    lines.push(`- 40〜42歳: ${inc40to42}万円未満 → NG`);
+    lines.push(`- 43〜45歳: ${inc43to45}万円未満 → NG`);
+    lines.push(`- 46歳以上: ${inc43to45}万以上かつ財務・経理・FP&A職歴あり → 要確認、それ以外 → NG`);
+    lines.push(`※年収が明記されており基準を下回る場合は必ずNG。年収が不明・記載なしの場合は「要確認」`);
+    lines.push(`※年収が幅（例：750〜1000万円）で記載されている場合は上限値（1000万円）で判断すること。上限値が基準以上であればNGにしない。`);
+
+    lines.push(`\n【ITエンジニア系の年収基準】`);
+    lines.push(`- 20代: 350万円未満 → NG`);
+    lines.push(`- 30〜35歳: 500万円未満 → NG`);
+    lines.push(`- 36〜39歳: 700万円未満 → NG`);
+    lines.push(`- 40〜45歳: 800万円未満 → NG`);
+    lines.push(`※年収が明記されており基準を下回る場合は必ずNG。年収が不明・記載なしの場合は「要確認」`);
+    lines.push(`※年収が幅（例：750〜1000万円）で記載されている場合は上限値（1000万円）で判断すること。上限値が基準以上であればNGにしない。`);
+
+    lines.push(`\n【文系職の社格・学歴・転職回数】`);
+    lines.push(`- 社格: 職歴全体を通じて上場企業・大手グループ・外資系企業での勤務経験が1社以上あることが必要。中小企業・無名企業のみのキャリアで大手経験が一切ない場合は即NG（年収が高くても）`);
+    lines.push(`- 例外: 公認会計士・税理士（監査法人・会計事務所勤務）は業態上、上場企業勤務がないのが通常のため社格要件を問わない。ただし年収基準は適用する`);
+    lines.push(`- 学歴: 国立大学・早慶上智・MARCH・東京理科大はOK。日東駒専（日本大学・東洋大学・駒澤大学・専修大学）・産近甲龍（京都産業大学・近畿大学・甲南大学・龍谷大学）、およびこれらと同等以下の知名度の私立大学が最終学歴の場合は、社格・年収に関わらず即NG。それ以外（関関同立等、上記どちらにも該当しない大学）は社格・年収でカバーされればOK`);
+    lines.push(`- 転職回数: 20代最大2社、30代最大3社（3社目は年収高ければOK）、40代最大4社`);
+
+    lines.push(`\n【ITエンジニア系の社格・学歴・転職回数】`);
+    lines.push(`- 社格: 問わない（大手でなくてもOK）`);
+    lines.push(`- 学歴: 問わない（高卒以上OK、スキル重視）`);
+    lines.push(`- 転職回数: 20代最大3社、30代最大4社、40代最大5社。1社の在籍が1年未満の場合は注意`);
+  }
+
+  if (!isBizreach) {
+    lines.push(`\n【判定方針】`);
+    lines.push(`以下の順番で判定すること：`);
+    lines.push(`1. 絶対NG条件（アクセンチュア・ベイカレント・秘書・保守運用のみ・46歳以上IT理系技術職・46歳以上文系で財務経理歴なし・医師・教授・弁護士・記者・自衛官・士業・文系フリーランス・特定業界・離職中・非正規雇用）に該当する → 即NG`);
+    lines.push(`2. 年収が明記されており基準を明確に下回る → NG`);
+    lines.push(`3. 在籍期間基準に明確に違反している → NG`);
+    lines.push(`4. 文系職で大手・上場・外資勤務経験が一切ない（公認会計士・税理士は除く） → NG`);
+    lines.push(`5. 文系職で最終学歴が日東駒専・産近甲龍またはそれ以下の私立大学の場合（【文系職の社格・学歴・転職回数】の学歴条件を参照）→ NG。社格・年収が高くてもこの条件では免除しない`);
+    lines.push(`6. 不動産売買仲介・賃貸仲介の専業営業職（不動産エージェント・仲介営業のみのキャリア）、または保険外交員専業のキャリアの場合 → 要確認（上記1〜5を通過していても）`);
+    lines.push(`7. 上記1〜6のいずれにも該当しない場合 → 必ずOKとすること`);
+    lines.push(`8. 年収・在籍期間が不明で判断できない場合のみ「要確認」`);
+    lines.push(`※公認会計士・税理士は医師・教授・弁護士・記者とは異なり即NG対象外。年収基準のみ適用`);
+  }
+
+  // 追加条件（設定タブで入力された場合）
+  if (criteria.ageMin || criteria.ageMax) {
+    const parts = [];
+    if (criteria.ageMin) parts.push(`${criteria.ageMin}歳以上`);
+    if (criteria.ageMax) parts.push(`${criteria.ageMax}歳以下`);
+    lines.push(`- 年齢追加条件: ${parts.join('かつ')}`);
+  }
+  const tiers = (criteria.companyTiers || []).filter(t => t && t !== '不問');
+  if (tiers.length > 0) {
+    lines.push(`- 社格条件（追加）: 現職が${tiers.join('・')}のいずれかであること`);
+  }
+  if (criteria.educationReq && criteria.educationReq !== '不問') {
+    lines.push(`- 学歴条件（追加）: ${criteria.educationReq}を満たすこと`);
+  }
+  // minTenure未設定時はデフォルト2年を適用
+  const tenureYears = criteria.minTenure || 2;
+  lines.push(`- 在籍期間: 異なる会社への転職で${tenureYears}年未満の在籍が1社でもある場合はNG。同一会社内での部署異動・職種変更・昇格・同社への複数行記入は同じ会社の在籍としてまとめて計算すること。出向・兼務の場合は出向元（親会社）の在籍期間に含め、出向先の短期在籍は別会社としてカウントしない。在籍期間が読み取れない場合はスキップ`);
+  if (criteria.requiredKeywords) lines.push(`- 必須経験: ${criteria.requiredKeywords}`);
+  if (criteria.excludeCompanies) lines.push(`- 除外企業（追加）: 職歴に${criteria.excludeCompanies}が含まれる場合は即NG`);
+  if (criteria.excludeKeywords)  lines.push(`- 除外: ${criteria.excludeKeywords}`);
+  return lines.join('\n');
+}
+
+// -------------------------------------------------------
+// 詳細パネル自動AI判定（候補者を開いた瞬間に判定バッジを表示）
+// -------------------------------------------------------
+let _detailJudgeTimer = null;
+let _lastDetailText = '';
+
+async function runDetailPanelJudge() {
+  const platform = getPlatform();
+  if (!['rds', 'dodax', 'ambi'].includes(platform)) return;
+
+  // スカウト作成/送信フォームが開いている間は自動判定しない。
+  // 本文入力欄やスカウト送信系ボタンが画面上にあると、判定対象の innerText に
+  // 候補者プロフィールではなくスカウトメールの本文（宛先企業名等）が混入し、
+  // 「スカウト送信内容からアクセンチュア関連の経歴があると判断」のような
+  // 誤判定を招くため。
+  const composeButtonTexts = ['送信', '送信する', '確認', '確定'];
+  const hasComposeButton = Array.from(document.querySelectorAll('button, a')).some(
+    b => composeButtonTexts.includes((b.innerText || '').trim())
+  );
+  if (hasComposeButton) return;
+
+  let panel = null;
+  if (platform === 'rds') panel = findRDSDetailPanel();
+  else if (platform === 'dodax') panel = findDodaxDetailPanel();
+  else panel = findAMBIDetailPanel();
+  if (!panel) return;
+
+  const panelText = (panel.innerText || '').trim();
+  if (panelText.length < 100) return;
+  // 前回と同じパネルなら再判定しない
+  if (panelText.slice(0, 300) === _lastDetailText.slice(0, 300)) return;
+  _lastDetailText = panelText;
+
+  // 設定取得
+  let stored = {};
+  try { stored = await chrome.storage.local.get(['apiKey', 'screeningCriteria', 'currentPosition']); } catch (_) { return; }
+  const apiKey = (stored.apiKey || '').replace(/[^\x21-\x7E]/g, '').trim();
+  if (!apiKey || apiKey.length < 20) return;
+  const criteria = stored.screeningCriteria || {};
+  if (!Object.keys(criteria).length) return;
+
+  // 既存バッジを削除・「判定中」バッジを表示
+  document.getElementById('snow-we-detail-badge')?.remove();
+  const badge = document.createElement('div');
+  badge.id = 'snow-we-detail-badge';
+  badge.style.cssText = `
+    position:fixed;bottom:80px;right:12px;z-index:2147483647;
+    background:#1e293b;color:#e2e8f0;padding:8px 14px;border-radius:8px;
+    font-size:12px;font-family:sans-serif;box-shadow:0 2px 12px rgba(0,0,0,0.35);
+    display:flex;align-items:center;gap:6px;border:1px solid #334155;
+    max-width:280px;
+  `;
+  badge.innerHTML = '<span style="animation:spin 1s linear infinite;display:inline-block">⏳</span><span>AI判定中...</span>';
+  document.body.appendChild(badge);
+
+  try {
+    // extractProfile() を優先（プラットフォーム別のキーワード抽出が効く）
+    let profileText = '';
+    try { profileText = extractProfile(); } catch (_) {}
+    if (!profileText || profileText.trim().length < 50) {
+      profileText = removeNonProfileSections(extractMainText(panel, 5000));
+    }
+    if (!profileText || profileText.trim().length < 50) { badge.remove(); return; }
+
+    const result = await judgeSingleCandidate(apiKey, profileText, criteria);
+    const { verdict, reason, confidence } = result;
+
+    badge.remove();
+    const resultBadge = document.createElement('div');
+    resultBadge.id = 'snow-we-detail-badge';
+    const [bg, border, icon] = verdict === 'OK'
+      ? ['#052e16', '#166534', '✅']
+      : verdict === 'NG'
+      ? ['#450a0a', '#991b1b', '❌']
+      : ['#1c1917', '#78716c', '⚠️'];
+    resultBadge.style.cssText = `
+      position:fixed;bottom:80px;right:12px;z-index:2147483647;
+      background:${bg};color:#f1f5f9;padding:8px 14px;border-radius:8px;
+      font-size:12px;font-family:sans-serif;box-shadow:0 2px 12px rgba(0,0,0,0.35);
+      border:1px solid ${border};max-width:300px;cursor:pointer;
+    `;
+    const confText = confidence != null ? ` (${confidence}%)` : '';
+    resultBadge.innerHTML = `
+      <div style="font-weight:600;margin-bottom:3px;">${icon} ${escapeHtml(verdict)}${confText}</div>
+      ${reason ? `<div style="font-size:11px;color:#94a3b8;">${escapeHtml(reason)}</div>` : ''}
+    `;
+    resultBadge.title = 'クリックで閉じる';
+    resultBadge.addEventListener('click', () => resultBadge.remove());
+    document.body.appendChild(resultBadge);
+    // 60秒後に自動削除
+    setTimeout(() => resultBadge.remove(), 60000);
+  } catch (_) {
+    badge.remove();
+  }
+}
+
+// スカウト済み通知を詳細パネルに表示
+async function showScoutedNoticeInPanel(panel) {
+  if (!panel) return;
+  const existing = document.getElementById('snow-we-scouted-notice');
+  if (existing) existing.remove();
+
+  const history = await getScoutHistory();
+  if (!Object.keys(history).length) return;
+
+  let matchRecord = null;
+
+  // ① パネル内にプロフィールURLがあればIDとして直接照合
+  const pUrl = findProfileUrl(panel);
+  if (pUrl) {
+    const cleanUrl = pUrl.replace(/[?#].*$/, '');
+    if (history[cleanUrl]) matchRecord = history[cleanUrl];
+  }
+
+  // ② 現在のページURL（プロフィール専用ページの場合）
+  if (!matchRecord) {
+    const pageUrl = location.href.replace(/[?#].*$/, '');
+    if (history[pageUrl]) matchRecord = history[pageUrl];
+  }
+
+  // ③ 会社名の部分一致（リスト画面で同一会社の候補者を検出）
+  if (!matchRecord) {
+    const panelInfo = extractBasicInfo(panel);
+    const panelCompany = (panelInfo.company || '').trim();
+    if (panelCompany.length >= 2) {
+      const maxAge = 180 * 24 * 60 * 60 * 1000;
+      const now = Date.now();
+      for (const rec of Object.values(history)) {
+        if (!rec.company || !rec.date || now - rec.date > maxAge) continue;
+        const stored = rec.company.trim();
+        if (stored && (stored.includes(panelCompany) || panelCompany.includes(stored))) {
+          matchRecord = rec; break;
+        }
+      }
+    }
+  }
+
+  if (!matchRecord) return;
+
+  const daysAgo = Math.floor((Date.now() - matchRecord.date) / (1000 * 60 * 60 * 24));
+  const notice = document.createElement('div');
+  notice.id = 'snow-we-scouted-notice';
+  notice.style.cssText = `
+    position:fixed;top:55px;right:12px;z-index:2147483647;
+    background:#1e3a5f;color:#bfdbfe;padding:6px 12px;border-radius:6px;
+    font-size:11px;font-family:sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3);
+    border:1px solid #2563eb;cursor:pointer;
+  `;
+  notice.textContent = `📨 ${daysAgo === 0 ? '本日' : daysAgo + '日前'}にスカウト済み${matchRecord.position ? ' (' + matchRecord.position + ')' : ''}`;
+  notice.title = 'クリックで閉じる';
+  notice.addEventListener('click', () => notice.remove());
+  document.body.appendChild(notice);
+  setTimeout(() => notice.remove(), 30000);
+}
+
+function initDetailPanelObserver() {
+  const platform = getPlatform();
+  if (!['rds', 'dodax', 'ambi'].includes(platform)) return;
+
+  // MutationObserver on body は高コストのためポーリングに変更（2秒間隔）
+  let _pollTimer = null;
+  const poll = () => {
+    clearTimeout(_detailJudgeTimer);
+    _detailJudgeTimer = setTimeout(async () => {
+      const p = platform === 'rds' ? findRDSDetailPanel()
+              : platform === 'dodax' ? (findDodaxProfilePane() || findDodaxDetailPanel())
+              : findAMBIDetailPanel();
+      await showScoutedNoticeInPanel(p);
+      // 詳細パネル自動AI判定は無効化済み（誤判定の温床だったため）。
+      // 判定は手動ボタン（一括判定・自動追加・選択中の1人を判定）からのみ実行する。
+    }, 1500);
+  };
+
+  // ページクリックを契機にパネル変化を検知（カードクリック = 候補者切り替え）
+  document.addEventListener('click', poll, true);
+  // 初回チェック（ページロード時に詳細が開いている場合）
+  setTimeout(poll, 3000);
+}
+
+// ページロード後に自動追加の再開チェック（sessionStorageのみ使用）
+window.addEventListener('load', () => {
+  // autoScreenCandidates抑制フラグ：再開フラグを即チェック（1sタイムアウト前に設定）
+  try {
+    const _raw = sessionStorage.getItem('snowWeAutoAdd');
+    if (_raw && JSON.parse(_raw).resume) _autoAddResuming = true;
+  } catch (_) {}
+
+  setTimeout(async () => {
+    injectStyles();
+    initDetailPanelObserver();
+    snowweInitAutoFindFromUrlHash();
+    try {
+      const raw = sessionStorage.getItem('snowWeAutoAdd');
+      if (!raw) {
+        // 再開フラグなし → running フラグをリセットして終了
+        await saveAutoAddProgress({ running: false });
+        return;
+      }
+      const resume = JSON.parse(raw);
+      sessionStorage.removeItem('snowWeAutoAdd'); // 即座に削除して二重起動防止
+      if (resume.resume) {
+        // 夜間自動実行モード復元
+        if (resume.autoRun) {
+          _isAutoRunMode = true;
+          _autoRunMaxPages = resume.autoRun.maxPages || 2;
+          _autoRunPageCount = resume.autoRun.pageCount || 0;
+          // ページ遷移でスクリプトが再注入されるとモジュール変数は初期値(0)に戻るため、
+          // どのスロットの続きかをsessionStorage経由で復元する。これを忘れると
+          // 全スロットがslot0のprogressキーに書き込むようになり、複数スロット
+          // 並列実行時に進捗を上書きし合う（このコメントの上にある衝突対策が無意味になる）
+          _autoRunSlotId = resume.autoRun.slotId ?? 0;
+        }
+        // 再開時は進捗を running:true で復元してから triggerAutoAdd を呼ぶ
+        // ← これをしないと isFreshStart=true になり最初からやり直しになる
+        await saveAutoAddProgress({
+          added:     resume.added     || 0,
+          processed: resume.processed || 0,
+          running:   true,
+          ts:        Date.now(),
+        });
+        await sleep(1500);
+        triggerAutoAdd();
+      } else {
+        await saveAutoAddProgress({ running: false });
+      }
+    } catch (_) {
+      await saveAutoAddProgress({ running: false });
+    }
+  }, 1000);
+});
+
+// -------------------------------------------------------
+// 一括判定：プラットフォーム別カード検出で全候補者を取得
+// -------------------------------------------------------
+function extractAllCandidateCards() {
+  const cards = findCandidateCardsByPlatform();
+
+  return cards.slice(0, 2000).map(el => {
+    const text = (el.innerText || '').trim();
+    const ageMatch = text.match(/(\d{2})歳/);
+    // カンマ区切り対応（1,000 ～ 1,199万円 → 1000）
+    const numPat = '(?:\\d{1,2},\\d{3}|\\d{3,4})';
+    const incomeMatch = text.match(new RegExp(`(${numPat})\\s*[〜~～]\\s*${numPat}万`)) ||
+                        text.match(new RegExp(`(${numPat})万円?`)) ||
+                        text.match(/(\d{4})万/);
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+
+    return {
+      el,
+      text,
+      age:        ageMatch   ? parseInt(ageMatch[1]) : null,
+      incomeText: incomeMatch ? incomeMatch[1].replace(/,/g, '') + '万' : null,
+      summary:    lines.slice(0, 12).join(' / ')
+    };
+  });
+}
+
+// -------------------------------------------------------
+// ユーティリティ：セレクターで要素を取得しテキスト結合
+// -------------------------------------------------------
+function extractBySelectors(selectors, root) {
+  root = root || document;
+  const seen = new Set();
+  const parts = [];
+  for (const sel of selectors) {
+    try {
+      root.querySelectorAll(sel).forEach(el => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        const t = el.innerText || el.textContent || '';
+        const trimmed = t.trim();
+        if (trimmed.length > 20) parts.push(trimmed);
+      });
+    } catch (e) {}
+  }
+  // 複数セレクターが同じ内容を持つ入れ子要素（親div/section/tableなど）に
+  // 重複してヒットするため、他の抽出関数と同じ重複除去を通す
+  return dedupeTextBlocks(parts).join('\n');
+}
+
+// -------------------------------------------------------
+// ユーティリティ：キーワードを含むテキストブロックを収集
+// -------------------------------------------------------
+// テキストブロック配列から重複・準重複を除去する。
+// RDS/dodax等のカード・詳細パネルは、入れ子要素や「続きを読む」の
+// 折りたたみ版・展開版が同じ内容をわずかに異なる文言で複数回含むことがあり、
+// 完全な部分文字列一致だけでは検出できない。先頭の空白除去済み文字列を
+// フィンガープリントとして併用し、抽出系の関数はすべてこれを通す。
+function dedupeTextBlocks(blocks) {
+  const normalize = t => t.replace(/\s+/g, '');
+  const result = [];
+  for (const t of blocks) {
+    if (!t) continue;
+    const normT = normalize(t);
+    let dupIdx = -1;
+    for (let i = 0; i < result.length; i++) {
+      const prev = result[i];
+      if (prev.includes(t) || t.includes(prev)) {
+        dupIdx = i;
+        break;
+      }
+      // 「見出しの文言が偶然一致しただけ」の別ブロックを誤って統合しないよう、
+      // 短い方の全文が長い方の先頭と完全一致する場合のみ「省略版 vs 展開版」の重複とみなす
+      const normPrev = normalize(prev);
+      const [shorter, longer] = normT.length <= normPrev.length ? [normT, normPrev] : [normPrev, normT];
+      if (shorter.length >= 20 && longer.startsWith(shorter)) {
+        dupIdx = i;
+        break;
+      }
+    }
+    if (dupIdx === -1) result.push(t);
+    else if (t.length > result[dupIdx].length) result[dupIdx] = t; // より詳細な方を残す
+  }
+  return result;
+}
+
+function extractByKeywords(keywords, root, minLen, maxLen) {
+  root = root || document;
+  minLen = minLen || 30;
+  maxLen = maxLen || 6000;
+  const candidates = [];
+
+  root.querySelectorAll('div, section, article, li, tr, td, dl, dt, dd, p, span').forEach(el => {
+    const t = (el.innerText || '').trim();
+    if (t.length < minLen || t.length > maxLen) return;
+    if (!keywords.some(kw => t.includes(kw))) return;
+    candidates.push(t);
+  });
+
+  const collected = dedupeTextBlocks(candidates);
+  collected.sort((a, b) => b.length - a.length);
+  return collected.slice(0, 5).join('\n\n');
+}
+
+// -------------------------------------------------------
+// ユーティリティ：メインエリアのテキストをクリーンに取得
+// -------------------------------------------------------
+// スカウト履歴・評価・メモなど採用管理UIセクションを除去
+function removeNonProfileSections(text) {
+  const stopMarkers = SCOUT_BOILERPLATE_MARKERS;
+  // マーカーが先頭200文字以内に現れる場合の判断：
+  //   テキスト全体にプロフィールキーワード(≥2個)あり → タブラベル（スキップ）
+  //   なし → パネル全体がスカウト履歴 → 空を返す
+  const profileKws = ['職務経歴', '職歴', 'スキル', '学歴', '業務内容', '自己PR', '資格', '転職理由'];
+  // 全文でのキーワード数を先に計算（ループ内で再利用）
+  const totalKwHits = profileKws.filter(kw => text.includes(kw)).length;
+  let cutIdx = text.length;
+  for (const marker of stopMarkers) {
+    const firstIdx = text.indexOf(marker);
+    if (firstIdx < 0) continue;
+    let idx = firstIdx;
+
+    if (idx < 200) {
+      if (totalKwHits >= 2) {
+        // 全文にプロフィールキーワードが2個以上 → 先頭付近の出現はタブラベルの可能性が
+        // あるため、次の出現（実際のスカウト履歴セクション本体）を探す。
+        // ただしマーカーが1回しか現れない場合（タブがアクティブでスカウト履歴の内容
+        // そのものが先頭に表示されているケース）は次が見つからず idx=-1 になり、
+        // 以前はこの場合にマーカーを無視して汚染データがそのまま残ってしまっていた。
+        // 次が見つからない場合は元の出現位置を境界として使う（安全側に倒す）
+        let nextIdx = text.indexOf(marker, idx + marker.length);
+        while (nextIdx >= 0 && nextIdx < 200) nextIdx = text.indexOf(marker, nextIdx + marker.length);
+        idx = nextIdx >= 0 ? nextIdx : firstIdx;
+      } else {
+        // パネルがスカウト履歴そのもの → 空を返す
+        return '';
+      }
+    }
+
+    if (idx >= 0 && idx < cutIdx) cutIdx = idx;
+  }
+  return text.substring(0, cutIdx).trim();
+}
+
+function extractMainText(root, limit) {
+  limit = limit || 2500;
+  const excludeTags = ['script','style','noscript','nav','footer','header',
+    'aside','button','select','option','meta','link'];
+  const excludeRoles = ['navigation','banner','contentinfo','complementary'];
+
+  function shouldExclude(el) {
+    if (excludeTags.includes((el.tagName || '').toLowerCase())) return true;
+    const role = el.getAttribute ? (el.getAttribute('role') || '') : '';
+    if (excludeRoles.includes(role)) return true;
+    const cls = (el.getAttribute ? (el.getAttribute('class') || '') : '').toLowerCase();
+    if (/\b(nav|menu|header|footer|sidebar|breadcrumb|pagination)\b/.test(cls)) return true;
+    return false;
+  }
+
+  const target = root ||
+    document.querySelector('main') ||
+    document.querySelector('[role="main"]') ||
+    document.querySelector('#main') ||
+    document.body;
+
+  let text = '';
+  target.querySelectorAll('*').forEach(el => {
+    if (shouldExclude(el)) return;
+    el.childNodes.forEach(node => {
+      if (node.nodeType === 3) {
+        const t = node.textContent.trim();
+        if (t.length > 1) text += t + '\n';
+      }
+    });
+  });
+
+  return text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().substring(0, limit);
+}
+
+// -------------------------------------------------------
+// プロフィールらしいテキストかを判定
+// -------------------------------------------------------
+const PROFILE_KEYWORDS = ['職務経歴', '職歴', '学歴', 'スキル', '自己PR', '資格', '語学', '業務内容', '転職理由', '希望年収'];
+
+function hasProfileContent(text) {
+  return PROFILE_KEYWORDS.filter(kw => text.includes(kw)).length >= 2;
+}
+
+// 大学名から学部・研究科サフィックスを除去する
+function cleanUnivName(raw) {
+  let s = raw.replace(/[（(（(].*/, '').trim();
+  // [\S]*(?:大学院|大学|高専|専門学校) をグリーディに使うと
+  // "早稲田大学法学部" → "早稲田大学"、"東京大学大学院工学系研究科" → "東京大学大学院" になる
+  // 「大学校」は「大学」より先に試す。逆だと「日本航空大学校」が「日本航空大学」になる
+  const m = s.match(/[\S]*(?:大学院|大学校|大学|高専|専門学校|高等学校|高校)/);
+  s = m ? m[0] : s;
+  // Greenは学校名の末尾に学校種別を連結して表示するため、種別が重複する(実データで確認)。
+  //   シンガポール国立大学+大学 / 首都大学東京+大学 / 東北電子専門学校+専門学校 /
+  //   山梨県立産業技術短期大学校+専門学校 / 金沢大学大学院+大学院
+  // 学校名の側にすでに学校を表す語があれば、末尾の種別は付け足されたものとして落とす。
+  // ただし「芝浦工業大学大学院」のように「…大学」+「大学院」は正当な表記なので残す
+  const dup = s.match(/^(.+?)(大学院|大学|専門学校|短期大学|高専)$/);
+  if (dup) {
+    const [, name, type] = dup;
+    const nameIsSchool = /(大学|専門学校|高専)/.test(name);
+    const legitGrad = type === '大学院' && /大学$/.test(name);
+    if (nameIsSchool && !legitGrad) return name;
+  }
+  return s;
+}
+
+// -------------------------------------------------------
+// doda X「スカウト送信」画面の、左側にある候補者プロフィール欄を特定する
+// -------------------------------------------------------
+// 座標ベースの推測(findDodaxDetailPanel)は、一覧ページのDOMが背後に残っている状態だと
+// 絞り込みフィルター欄など無関係な要素を安定して選んでしまうため、ここでは内容で特定する。
+// 候補者プロフィール欄は必ず「基本情報」と「在籍企業」の両方を含み、右側の送信フォーム
+// （差出人・宛先・件名・本文）は含まない。条件を満たす要素のうち最も内側（最小）のものが、
+// 余計な周辺要素を含まない目的の欄になる
+// プロフィール欄に含まれる見出し。「基本情報」と「在籍企業」だけを条件に最小の要素を
+// 選ぶと、基本情報のテーブルだけを囲む小さな要素（希望条件・経験業種・マネジメント経験を
+// 含まない）が選ばれてしまい、取得できるプロフィールが100文字程度になる事故が起きた。
+// 含んでいる見出しの種類が多いものを優先し、同点のときだけ最も内側（最小）を選ぶ
+const DODAX_PROFILE_SECTION_MARKERS = ['希望条件', '経験職種', '経験業種', '学歴', 'マネジメント'];
+const DODAX_PROFILE_MIN_LEN = 300;
+
+function findDodaxProfilePane() {
+  const formMarkers = ['差出人', '宛先', '件名', '本文', '注目した'];
+
+  const pick = (minLen) => {
+    let best = null;
+    let bestLen = Infinity;
+    let bestSections = -1;
+    document.querySelectorAll('div, section, article, main').forEach(el => {
+      const t = (el.innerText || '').trim();
+      if (t.length < minLen || t.length > 20000) return;
+      if (!t.includes('基本情報') || !t.includes('在籍企業')) return;
+      if (DODAX_PAGE_CHROME_MARKERS.some(m => t.includes(m))) return;
+      // 送信フォーム側まで含んでしまっている広い要素は、スカウト本文が混入するため除外する
+      if (formMarkers.filter(m => t.includes(m)).length >= 3) return;
+      const sections = DODAX_PROFILE_SECTION_MARKERS.filter(m => t.includes(m)).length;
+      if (sections > bestSections || (sections === bestSections && t.length < bestLen)) {
+        bestSections = sections;
+        bestLen = t.length;
+        best = el;
+      }
+    });
+    return best ? { el: best, len: bestLen, sections: bestSections } : null;
+  };
+
+  // まず十分な分量のある欄を探し、見つからない場合だけ従来どおり小さい要素も許容する
+  // （項目が少ない候補者でプロフィール欄を丸ごと見失うより、狭くても取れた方がよい）
+  const hit = pick(DODAX_PROFILE_MIN_LEN) || pick(100);
+  if (hit) {
+    console.log('[Snow-we] findDodaxProfilePane: プロフィール欄を特定 len=' + hit.len + ' 見出し数=' + hit.sections);
+    return hit.el;
+  }
+  return null;
+}
+
+/**
+ * 画面に本当に出ている要素かを判定する。
+ *
+ * display:none の要素は innerText も矩形も空になるので自然に外れるが、
+ * visibility:hidden・opacity:0・画面の外に逃がしてある要素は、innerText も
+ * 矩形もそのまま返ってくる。doda X の候補者一覧には、中身が入っていない
+ * 候補者詳細の下敷き（「更新日 undefined歳」「入力なし」だけが並ぶ）が
+ * この状態で置かれており、これを詳細パネルとして掴んでしまって、
+ * ハッシュIDと空の会社名で記録しようとしていた（実機の診断で確認）
+ */
+function isElementOnScreen(el, opts) {
+  try {
+    if (!el || !el.getClientRects || el.getClientRects().length === 0) return false;
+    const st = window.getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.visibility === 'collapse') return false;
+    // 親の opacity は子の computedStyle に出ないため、祖先もたどる
+    for (let a = el; a && a.nodeType === 1; a = a.parentElement) {
+      if (parseFloat(window.getComputedStyle(a).opacity || '1') < 0.05) return false;
+    }
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    // 引き出しの待機状態など、画面の外に逃がしてあるもの
+    if (r.right <= 0 || r.left >= window.innerWidth) return false;
+    // ボタンは下にスクロールした先にあるのが普通なので、縦は見ない指定ができる
+    if (!(opts && opts.allowScroll)) {
+      if (r.bottom <= 0 || r.top >= window.innerHeight) return false;
+    }
+    return true;
+  } catch (_) { return false; }
+}
+
+/**
+ * 値が流し込まれていない下敷き（テンプレート）かどうか。
+ * 「undefined歳」のように、置き換えられなかった変数がそのまま文字として
+ * 出ているものは、候補者の情報ではない
+ */
+function isUnfilledPanelText(t) {
+  return /undefined/.test(t || '');
+}
+
+// -------------------------------------------------------
+// doda X 詳細パネルを特定する（カードクリックで開く右パネル）
+// -------------------------------------------------------
+function findDodaxDetailPanel() {
+  const viewportWidth = window.innerWidth;
+  const candidates = [];
+  const keywords = ['職務経歴', '転職意向', '転職を', '職歴', '業務内容', '学歴', '年収'];
+  // 候補者プロフィールと誤認識されやすい2種類の非プロフィール要素を除外する：
+  // ①スカウト作成フォーム（差出人・宛先・テンプレート選択・件名等。「職務経歴書」
+  //   という添付ラベルが「職務経歴」キーワードに誤ってヒットしていた）
+  // ②候補者検索結果の絞り込みフィルター欄（「候補者検索結果」「一括スカウト送信」等。
+  //   「経験社数」「年収」等の項目名がキーワードに誤ってヒットしていた）
+  const nonProfileMarkers = ['差出人', '宛先', 'を挿入', 'テンプレートを呼び出す', '候補者検索結果', 'ポジティブアクション', '一括スカウト送信'];
+  // 「スカウトを作成」ボタン押下後は、候補者プロフィールが画面左側・スカウト作成
+  // フォームが右側に並ぶレイアウトになるページがあり（通常の一覧→詳細パネルの
+  // ページとは逆）、右側限定で探すと候補者プロフィールを取りこぼしていた。
+  // 左右どちらでもよいことにし、代わりに画面幅いっぱいの巨大なコンテナ（候補者
+  // 一覧全体等）を除外することで、正しい範囲だけを拾うようにする。
+  document.querySelectorAll('div, section, article, aside, main').forEach(el => {
+    const rect = el.getBoundingClientRect();
+    const t = (el.innerText || '').trim();
+    if (nonProfileMarkers.some(m => t.includes(m))) return;
+    if (isUnfilledPanelText(t)) return;
+    if (rect.width > 200 && rect.width < viewportWidth * 0.7 && t.length > 100 && t.length < 30000) {
+      if (!isElementOnScreen(el)) return;
+      // 一致した種類の数を優先スコアに加える。候補者一覧全体のような大きい
+      // コンテナは文字数は多くても一致キーワードの種類は偏りやすいため、
+      // 単純な文字数だけで選ぶと候補者一覧側に負けてしまうことがある
+      const matchCount = keywords.filter(kw => t.includes(kw)).length;
+      if (matchCount > 0) candidates.push({ el, score: t.length + matchCount * 2000, left: Math.round(rect.left) });
+    }
+  });
+  console.log('[Snow-we] findDodaxDetailPanel: 候補数=' + candidates.length,
+    candidates.slice(0, 3).map(c => `left=${c.left} len=${c.score}`).join(', '));
+  if (candidates.length === 0) {
+    // キーワードなしでも候補者情報らしきパネルを探す（ローディング中対策）
+    document.querySelectorAll('div, section, aside').forEach(el => {
+      const rect = el.getBoundingClientRect();
+      const t = (el.innerText || '').trim();
+      if (nonProfileMarkers.some(m => t.includes(m))) return;
+      if (isUnfilledPanelText(t)) return;
+      if (rect.width > 200 && rect.width < viewportWidth * 0.7 && t.length > 50) {
+        if (!isElementOnScreen(el)) return;
+        candidates.push({ el, score: t.length, left: Math.round(rect.left) });
+      }
+    });
+    console.log('[Snow-we] findDodaxDetailPanel(緩): 候補数=' + candidates.length,
+      candidates.slice(0, 3).map(c => `left=${c.left} len=${c.score}`).join(', '));
+    if (candidates.length === 0) return null;
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].el;
+}
+
+// -------------------------------------------------------
+// AMBI詳細パネルを特定する
+// -------------------------------------------------------
+function findAMBIDetailPanel() {
+  // 実機DOM調査で判明：スカウト送信スライドパネル内の.leftCellに実際の職歴等の
+  // プロフィール本文が入っている（隣の.rightCellは送信フォーム側で無関係）。
+  // このパネルは幅が256px程度しかなく、下の座標ヒューリスティックが要求していた
+  // 「幅300px以上」を満たさないため、これまで一度も検出できていなかった
+  const specific = document.querySelector('.slide_desc_scout .leftCell')
+    || document.querySelector('.leftCell.ui-resizable');
+  if (specific && (specific.innerText || '').trim().length > 100) return specific;
+
+  // フォールバック：上記のクラス名が見つからない画面状態向けの座標ヒューリスティック
+  const viewportWidth = window.innerWidth;
+  const candidates = [];
+  document.querySelectorAll('div, section, article, main').forEach(el => {
+    const rect = el.getBoundingClientRect();
+    const t = (el.innerText || '').trim();
+    if (rect.left > viewportWidth * 0.3 && rect.width > 200 && t.length > 200 && t.length < 15000) {
+      const hasKeyword = ['職務経歴', '職歴', 'スキル', '経験職種', '学歴', '語学'].some(kw => t.includes(kw));
+      if (hasKeyword) candidates.push({ el, score: t.length });
+    }
+  });
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].el;
+}
+
+// -------------------------------------------------------
+// Green詳細モーダルを特定する（候補者クリックで開くモーダル）
+// -------------------------------------------------------
+function findGreenDetailPanel() {
+  // 実機DOM調査で確認：候補者をクリックすると.MuiModal-root.MuiDialog-rootの
+  // モーダルが開き、「職務経歴書」「■最終学歴」「経験企業」等の全文プロフィールが入る
+  const specific = document.querySelector('.MuiModal-root.MuiDialog-root');
+  if (specific && (specific.innerText || '').trim().length > 100) return specific;
+
+  // フォールバック：モーダル特有のクラス名が変わった場合向けの座標・キーワードヒューリスティック
+  const candidates = [];
+  document.querySelectorAll('div, section, article').forEach(el => {
+    const rect = el.getBoundingClientRect();
+    const t = (el.innerText || '').trim();
+    if (rect.width > 300 && rect.height > 300 && t.length > 200 && t.length < 15000) {
+      const hasKeyword = ['職務経歴', '最終学歴', '経験企業', '会社名'].some(kw => t.includes(kw));
+      if (hasKeyword) candidates.push({ el, score: t.length });
+    }
+  });
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].el;
+}
+
+// -------------------------------------------------------
+// Bizreach詳細パネルを特定する（カードクリックで開く右パネル）
+// -------------------------------------------------------
+function findBizreachDetailPanel() {
+  // 方法1: Bizreach固有のAngularコンポーネント名で直接特定。
+  //
+  // ess-resume-pane を先頭に置く。年齢(34歳)は ess-resume-detail の外、
+  // ヘッダー側にあり、detail だけを見ていると年齢が取れない。実機で確認した：
+  //   ess-resume-detail … 在籍企業名あり / 年齢なし
+  //   ess-resume-pane   … 在籍企業名あり / 年齢あり / 件名(送信欄)なし
+  // 年齢は突き合わせにも使う項目なので、落とすと検証が弱くなる。
+  //
+  // 画面に出ていない要素は掴まない。古いパネルが残っていた場合に
+  // 別の候補者の情報を拾うため
+  const componentSelectors = [
+    'ess-resume-pane', 'ess-resume-detail', 'ess-resume-view', 'ess-resume-detail-content',
+    '[class*="resume-detail"]', '[class*="resume-view"]', '[class*="candidate-detail"]',
+  ];
+  for (const sel of componentSelectors) {
+    for (const el of document.querySelectorAll(sel)) {
+      const t = (el.innerText || '').trim();
+      if (t.length <= 100) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      return el;
+    }
+  }
+
+  // 方法2: キーワード＋位置ヒューリスティック。
+  //
+  // 以前は「年収」「資格」「職歴」のような緩い語が2つ当たれば候補にし、
+  // いちばん文字数が多いものを返していた。スカウト作成のモーダル（求人票や
+  // テンプレート本文を含む）はこの条件にそのまま当てはまり、しかも文字数が
+  // 大きいので最有力として選ばれる。その結果、候補者の勤務先ではなく求人票の
+  // 箇条書きが会社名として記録されていた（実データ：
+  // 「・ERP・グループ共通システムの導入・刷新」）。
+  //
+  // 候補者の履歴書にしか出ない見出しを必須にし、作成モーダルは除外する。
+  // 送信時はモーダルが開いていて、その後ろに履歴書がある状態なので、
+  // モーダルを外すことは正しい
+  const viewportWidth = window.innerWidth;
+  const keywords = ['在籍企業名', '学歴', '経験職種', '希望年収', '経験業種', '職務経歴', '資格', '年収', '在籍', '職歴'];
+  // 候補者の履歴書にしか出ない見出し。どれか1つは必ず含まれていること
+  const resumeOnly = ['在籍企業名', '経験職種', '経験業種', '職務経歴'];
+  // スカウト作成・テンプレート選択の画面に出る語。含むものは履歴書ではない
+  const composeMarkers = ['スカウトを送信', 'テンプレートを選択', 'テンプレート一覧', '件名'];
+  const candidates = [];
+  document.querySelectorAll('div, section, article, main').forEach(el => {
+    const rect = el.getBoundingClientRect();
+    const t = (el.innerText || '').trim();
+    // 位置条件を 0.4 → 0.25 に緩和（レイアウト差異を吸収）
+    if (rect.left > viewportWidth * 0.25 && rect.width > 250 && t.length > 150 && t.length < 25000) {
+      if (!resumeOnly.some(kw => t.includes(kw))) return;
+      const matchCount = keywords.filter(kw => t.includes(kw)).length;
+      if (matchCount < 2) return;
+      // 作成画面を含むものは、履歴書だけの要素が他に無い場合の最後の手段として残す。
+      // 除外してしまうと候補が1つも無くなり、候補者を特定できず記録が丸ごと
+      // 消える（誤った会社名で記録されるより悪い）
+      let penalty = 0;
+      if (composeMarkers.some(kw => t.includes(kw))) penalty += 100000;
+      try { if (el.closest('[role="dialog"], [class*="modal"], [class*="dialog"]')) penalty += 100000; } catch (_) {}
+      candidates.push({ el, score: t.length + matchCount * 500 - penalty });
+    }
+  });
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].el;
+}
+
+// -------------------------------------------------------
+// RDS詳細パネルを特定する
+// -------------------------------------------------------
+function findRDSDetailPanel() {
+  const candidates = [];
+
+  // 方法1: 「候補者詳細」見出しを持つ親コンテナ
+  document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span').forEach(el => {
+    const t = (el.innerText || el.textContent || '').trim();
+    if (t !== '候補者詳細' && t !== '候補者 詳細') return;
+    let parent = el.parentElement;
+    for (let i = 0; i < 8; i++) {
+      if (!parent) break;
+      const rect = parent.getBoundingClientRect();
+      const innerText = (parent.innerText || '').trim();
+      if (rect.width > 300 && innerText.length > 200) {
+        candidates.push({ el: parent, score: innerText.length });
+        break;
+      }
+      parent = parent.parentElement;
+    }
+  });
+
+  // 方法2: 右側寄りの大きなコンテナをスコアリング
+  if (candidates.length === 0) {
+    const viewportWidth = window.innerWidth;
+    document.querySelectorAll('div, section, article, main').forEach(el => {
+      const rect = el.getBoundingClientRect();
+      if (rect.left > viewportWidth * 0.35 && rect.width > 300 && rect.height > 400) {
+        const innerText = (el.innerText || '').trim();
+        if (innerText.length > 200) candidates.push({ el, score: innerText.length });
+      }
+    });
+  }
+
+  // 方法3: モーダル・ダイアログ（中央配置レイアウト対応）
+  if (candidates.length === 0) {
+    const profileKeywords = ['職務経歴', '職歴', 'スキル', '学歴', '自己PR'];
+    document.querySelectorAll('[role="dialog"],[class*="modal" i],[class*="dialog" i],[class*="overlay" i]').forEach(modal => {
+      const innerText = (modal.innerText || '').trim();
+      if (innerText.length > 200 && profileKeywords.some(kw => innerText.includes(kw))) {
+        candidates.push({ el: modal, score: innerText.length });
+      }
+    });
+  }
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].el;
+}
+
+// -------------------------------------------------------
+// マイナビの詳細パネルを特定する
+// -------------------------------------------------------
+function findMynaviDetailPanel() {
+  const keywords = ['職務経歴', '職歴', 'スキル', '自己PR', '保有資格', '最終学歴'];
+  const viewportWidth = window.innerWidth;
+
+  const candidates = [];
+  document.querySelectorAll('div, section, article, main').forEach(el => {
+    const t = (el.innerText || '').trim();
+    if (t.length < 200 || t.length > 15000) return;
+
+    const hasKeyword = keywords.some(kw => t.includes(kw));
+    if (!hasKeyword) return;
+
+    const rect = el.getBoundingClientRect();
+    const isRightPane = rect.left > viewportWidth * 0.3;
+    const score = t.length * (isRightPane ? 2 : 1);
+    candidates.push({ el, score });
+  });
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].el;
+}
+
+// -------------------------------------------------------
+// メイン抽出関数
+// -------------------------------------------------------
+// プロフィールから取り出す文字数の上限。
+//
+// 既定の2,500字は、一次選定の一括処理（候補者ごとにAIを呼ぶ）で費用が膨らまない
+// ようにするための値。一方でポジション提案には短すぎた。実機で、詳細パネルに
+// 5,386字ある職務経歴書が2,500字で切られており、切り落とされていたのは末尾の
+// 前職・前々職だった（アクセンチュア戦略本部6年・営業変革5年超）。その結果、
+// 営業改革系と戦略系の求人が1件も提案されなかった。
+//
+// 職務経歴書は「職務要約 → 現職 → 前職 → 前々職」の順に書かれるため、
+// 末尾を切ると古い経歴から順に消える。提案のときは長く取る
+const PROFILE_MAX_CHARS_DEFAULT = 2500;
+const PROFILE_MAX_CHARS_FULL = 8000;
+
+function extractProfile(maxChars) {
+  const host = location.hostname;
+  const url  = location.href;
+  let text   = '';
+  let detailPanel = null;
+
+  if (host.includes('bizreach') || host.includes('es-support')) {
+    detailPanel = findBizreachDetailPanel();
+    const bzRoot = detailPanel || null;
+    const byKeyword = extractByKeywords([
+      '職務経歴', '職歴', 'スキル', '業務内容', '実績',
+      '学歴', '語学', '資格', '自己PR', '希望条件',
+      '経験業種', '経験職種', '希望年収', '年収'
+    ], bzRoot, 30, 12000);
+    const bySelector = extractBySelectors([
+      '[class*="profile"]', '[class*="career"]',
+      '[class*="resume"]', '[class*="skill"]',
+      '[class*="pr"]', '[class*="history"]', '[class*="work"]',
+      '[class*="scout"]', '[class*="Scout"]',
+      'section', 'article'
+    ], bzRoot);
+    text = byKeyword.length >= bySelector.length ? byKeyword : bySelector;
+    if (text) text = removeNonProfileSections(text);
+    if (!text || text.trim().length < 100) {
+      text = detailPanel ? removeNonProfileSections(extractMainText(detailPanel, 5000)) : '';
+    }
+
+  } else if (host.includes('doda-x') || host.includes('dodax') || host.includes('x.doda')) {
+    // findDodaxDetailPanelはページ全体を対象にした座標+キーワードヒューリスティックのため、
+    // 「スカウトを作成」クリック後の画面状態では、絞り込みフィルター欄など無関係な要素を
+    // 安定して選び続けてしまう事故が実機で確認された（3秒待つリトライを入れても、その間
+    // ずっと同じ誤ったパネルを返し続けるため改善しなかった）。dodaXは候補者一覧の
+    // カード自体に職務経歴等の全文が展開表示される作りのため、直前にクリックして
+    // 選択済みのカード(_selectedCard、getCandidateId等でも使っている同じ要素)を
+    // 優先的に使う方が、無関係な要素を拾わず確実に候補者本人のデータだけを取得できる
+    // ただし「スカウト送信」画面に遷移すると一覧のカードがDOMから外れることがあり、
+    // 切り離された古い要素が_selectedCardに残ると、前の候補者の内容でそのまま生成して
+    // しまう（実機で、画面上の候補者とはまったく別人の経歴で生成される事象を確認）。
+    // document.containsで、今も画面に存在する要素かどうかを必ず確認する。
+    // またスカウト送信画面では左側のプロフィール欄が最も確実な情報源のため、そちらを優先する
+    const profilePane = findDodaxProfilePane();
+    const selectedCardText = (_selectedCard && document.contains(_selectedCard))
+      ? (_selectedCard.innerText || '').trim() : '';
+    const selectedCardLooksValid = selectedCardText.length > 200
+      && !DODAX_PAGE_CHROME_MARKERS.some(m => selectedCardText.includes(m))
+      && ['職務経歴', '在籍企業', '学歴'].some(kw => selectedCardText.includes(kw));
+    detailPanel = profilePane || (selectedCardLooksValid ? _selectedCard : findDodaxDetailPanel());
+    const ddRoot = detailPanel || null;
+
+    const byKeyword = extractByKeywords([
+      '職務経歴', '職歴', '業務内容', '仕事内容',
+      'スキル', '技術', '開発言語', '資格',
+      '学歴', '最終学歴', '大学', '大学院',
+      '語学', '英語', 'TOEIC',
+      '自己PR', 'PR', 'アピール',
+      '転職理由', '希望年収', '希望職種',
+      '経験業種', '経験職種', '経験社数', '年収'
+    ], ddRoot, 30, 12000);
+
+    const bySelector = extractBySelectors([
+      '[class*="workHistory"]', '[class*="work-history"]',
+      '[class*="career"]', '[class*="summary"]',
+      '[class*="skill"]', '[class*="resume"]',
+      '[class*="profile"]', 'section', 'article'
+    ], ddRoot);
+
+    text = byKeyword.length >= bySelector.length ? byKeyword : bySelector;
+    if (text) text = removeNonProfileSections(text);
+
+    // 閾値が100文字だったため、経験職種の行だけを拾った104文字が「取得成功」と判定され、
+    // パネル全文を取り直す処理が動かないことがあった。プロフィールとして使える分量には
+    // 届いていないので基準を上げ、さらに取り直した方が長ければそちらを採用する
+    if (!text || text.trim().length < DODAX_PROFILE_MIN_LEN) {
+      const whole = detailPanel ? removeNonProfileSections(extractMainText(detailPanel, 5000)) : '';
+      if (whole.trim().length > (text || '').trim().length) text = whole;
+    }
+
+  } else if (host.includes('rikunabi') || host.includes('hrtech')) {
+    detailPanel = findRDSDetailPanel();
+
+    if (detailPanel) {
+      const byKeyword = extractByKeywords([
+        '職務経歴', '職歴', '職務要約', '業務内容',
+        'スキル', '技術', '開発言語', '資格',
+        '学歴', '最終学歴', '大学', '大学院',
+        '語学', '英語', 'TOEIC',
+        '自己PR', 'PR', 'アピール',
+        '希望', '年収', '転職理由',
+        '経験業種', '経験職種', '経験社数'
+      ], detailPanel, 30, 12000);
+
+      const bySelector = extractBySelectors([
+        '[class*="resume"]', '[class*="Resume"]',
+        '[class*="career"]', '[class*="Career"]',
+        '[class*="history"]', '[class*="History"]',
+        '[class*="skill"]', '[class*="Skill"]',
+        '[class*="profile"]', '[class*="Profile"]',
+        '[class*="summary"]', '[class*="Summary"]',
+        '[class*="experience"]', '[class*="Experience"]',
+        '[class*="education"]', '[class*="Education"]',
+        'section', 'article', 'table'
+      ], detailPanel);
+
+      // 再送（既にスカウト済み）の候補者は詳細パネルの先頭に過去のスカウト送信
+      // 履歴が入り込むことがあり、素の文字数だけでbyKeyword/bySelectorを選ぶと
+      // 汚染データの方が長くて選ばれてしまう。AMBIと同様、クリーンアップ後に
+      // 実際に残るプロフィール本文の量で比較する。
+      const cleanedKeyword  = byKeyword  ? removeNonProfileSections(byKeyword)  : '';
+      const cleanedSelector = bySelector ? removeNonProfileSections(bySelector) : '';
+      text = cleanedKeyword.length >= cleanedSelector.length ? cleanedKeyword : cleanedSelector;
+
+      if (text.length < 100) {
+        text = removeNonProfileSections(extractMainText(detailPanel, 5000));
+      }
+    } else {
+      text = removeNonProfileSections(extractByKeywords([
+        '職務経歴', '職歴', '職務要約',
+        'スキル', '資格', '学歴',
+        '語学', '自己PR', 'アピール',
+        '希望年収', '年収', '転職理由'
+      ]));
+
+      if (text.length < 100) {
+        text = removeNonProfileSections(extractBySelectors([
+          '[class*="resume"]', '[class*="career"]',
+          '[class*="history"]', '[class*="skill"]',
+          '[class*="profile"]', '[class*="summary"]',
+          '[class*="candidate"]', '[class*="detail"]',
+          'section', 'article', 'table'
+        ]));
+      }
+    }
+
+  } else if (host.includes('green-japan')) {
+    // 詳細モーダル(.MuiModal-root.MuiDialog-root)にスコープしないと、ページ全体
+    // (候補者一覧・保存した検索条件のタグ名一覧等)から拾ってしまい無関係な
+    // テキストが混入する（実機で確認）
+    detailPanel = findGreenDetailPanel();
+    text = extractByKeywords([
+      '職務要約', '職務経歴', '経験業種', 'スキル', '最終学歴', '語学',
+      '経験企業', '経験業界', '経験職種', '資格', 'スカウト希望', '希望業界',
+      '希望職種', '希望勤務地', '転職先に求める', '自己PR'
+    ], detailPanel);
+    if (text) text = removeNonProfileSections(text);
+    if (!text || text.length < 100) {
+      text = detailPanel ? removeNonProfileSections(extractMainText(detailPanel, maxChars || PROFILE_MAX_CHARS_DEFAULT)) : '';
+    }
+
+  } else if (host.includes('ambi') || host.includes('en-ambi')) {
+    detailPanel = findAMBIDetailPanel();
+    console.log('[Snow-we] AMBI抽出診断 detailPanel:', !!detailPanel,
+      detailPanel ? (detailPanel.innerText || '').trim().length + '文字 冒頭50字=' + (detailPanel.innerText || '').trim().slice(0, 50) : '');
+    const ambiRoot = detailPanel || null;
+    const byKeyword = extractByKeywords([
+      '職務経歴', '職歴', '業務内容', '仕事内容',
+      'スキル', '技術', '開発言語', '資格',
+      '学歴', '最終学歴', '大学',
+      '語学', '英語', 'TOEIC',
+      '自己PR', 'PR', 'アピール',
+      '希望条件', '希望職種', '希望業界', '希望年収',
+      '経験業種', '経験職種', '転職理由'
+    ], ambiRoot, 30, 10000);
+    const bySelector = extractBySelectors([
+      '[class*="career"]', '[class*="resume"]',
+      '[class*="profile"]', '[class*="skill"]',
+      '[class*="history"]', 'section', 'article'
+    ], ambiRoot);
+    console.log('[Snow-we] AMBI抽出診断 byKeyword長さ=', byKeyword.length, '冒頭50字=', byKeyword.slice(0, 50));
+    console.log('[Snow-we] AMBI抽出診断 bySelector長さ=', bySelector.length, '冒頭50字=', bySelector.slice(0, 50));
+    // 生の長さではなく、不要セクション除去後の長さで比較する。.leftCellは先頭に
+    // 「プロフィール/興味あり履歴/スカウト履歴/エントリー履歴/見た求人」という
+    // タブ見出しが並ぶ構造で、byKeywordがこの見出し込みでパネル全体を拾って
+    // しまうと、除去ロジックがタブ名の「スカウト履歴」だけを見てそれ以降を
+    // 全部切り捨ててしまい、実際の職歴本文（bySelectorには含まれている）が
+    // 失われる事故が実機で確認された
+    const cleanedKeyword = byKeyword ? removeNonProfileSections(byKeyword) : '';
+    const cleanedSelector = bySelector ? removeNonProfileSections(bySelector) : '';
+    console.log('[Snow-we] AMBI抽出診断 除去後 byKeyword=', cleanedKeyword.length, '/ bySelector=', cleanedSelector.length);
+    text = cleanedKeyword.length >= cleanedSelector.length ? cleanedKeyword : cleanedSelector;
+    if (!text || text.trim().length < 100) {
+      console.log('[Snow-we] AMBI抽出診断 → フォールバック(extractMainText)へ');
+      // タブ見出しの直後に来る「ユーザー情報」を起点にすることで、フォールバック側でも
+      // 同じタブ見出し起因の誤カットを避ける
+      let mainText = extractMainText(detailPanel, maxChars || PROFILE_MAX_CHARS_DEFAULT);
+      const anchorIdx = mainText.indexOf('ユーザー情報');
+      if (anchorIdx > 0 && anchorIdx < 100) mainText = mainText.slice(anchorIdx);
+      text = detailPanel ? removeNonProfileSections(mainText).slice(0, maxChars || PROFILE_MAX_CHARS_DEFAULT) : '';
+      console.log('[Snow-we] AMBI抽出診断 extractMainText後 長さ=', text.length, '冒頭50字=', text.slice(0, 50));
+    }
+
+  } else if (host.includes('mynavi')) {
+    detailPanel = findMynaviDetailPanel();
+    const root = detailPanel || null;
+
+    const byKeyword = extractByKeywords([
+      '職務経歴', '職歴', '業務内容', '仕事内容',
+      'スキル', '保有資格', '資格', '語学',
+      '学歴', '最終学歴', '大学',
+      '自己PR', 'アピール',
+      '希望条件', '希望職種', '希望業界', '希望年収',
+      '現在の年収', '転職理由', '直近', '経験職種'
+    ], root);
+
+    const bySelector = extractBySelectors([
+      '[class*="profile"]', '[class*="Profile"]',
+      '[class*="career"]', '[class*="Career"]',
+      '[class*="resume"]', '[class*="Resume"]',
+      '[class*="skill"]', '[class*="Skill"]',
+      '[class*="history"]', '[class*="History"]',
+      '[class*="work"]', '[class*="Work"]',
+      '[class*="experience"]', '[class*="Experience"]',
+      '[class*="education"]', '[class*="Education"]',
+      '[class*="candidate"]', '[class*="Candidate"]',
+      '[class*="detail"]', '[class*="Detail"]',
+      '[class*="info"]', '[class*="Info"]',
+      '[class*="summary"]', '[class*="Summary"]',
+      'section', 'article', 'table'
+    ], root);
+
+    text = byKeyword.length >= bySelector.length ? byKeyword : bySelector;
+    if (text) text = removeNonProfileSections(text);
+    if (!text || text.length < 100) {
+      text = detailPanel ? removeNonProfileSections(extractMainText(root, maxChars || PROFILE_MAX_CHARS_DEFAULT)) : '';
+    }
+
+  } else if (host.includes('recruitdirect') || host.includes('rds')) {
+    detailPanel = findRDSDetailPanel();
+    const rdsRoot = detailPanel || null;
+    const byKeyword = extractByKeywords([
+      '職務経歴', '職歴', '業務内容', '仕事内容',
+      'スキル', '技術', '開発言語', '資格',
+      '学歴', '最終学歴', '大学',
+      '語学', '英語', 'TOEIC',
+      '自己PR', 'PR', 'アピール',
+      '転職理由', '希望年収', '希望職種',
+      '経験業種', '経験職種', '年収'
+    ], rdsRoot, 30, 12000);
+    const bySelector = extractBySelectors([
+      '[class*="profile"]', '[class*="career"]',
+      '[class*="resume"]', '[class*="skill"]',
+      '[class*="history"]', '[class*="work"]',
+      '[class*="candidate"]', '[class*="detail"]',
+      'section', 'article', 'table'
+    ], rdsRoot);
+    text = byKeyword.length >= bySelector.length ? byKeyword : bySelector;
+    if (text) text = removeNonProfileSections(text);
+    if (!text || text.trim().length < 100) {
+      text = detailPanel ? removeNonProfileSections(extractMainText(detailPanel, 5000)) : '';
+    }
+
+  } else {
+    text = extractMainText(null, maxChars || PROFILE_MAX_CHARS_DEFAULT);
+  }
+
+  if (!text || text.trim().length < 80) {
+    text = extractMainText(null, maxChars || PROFILE_MAX_CHARS_DEFAULT);
+  }
+
+  // dodaXの候補者検索結果ページには、絞り込みフィルター欄の見出しに「学歴」「経験業種」
+  // 「年収」等、実際のプロフィールとまったく同じ語が使われている。詳細パネルの検出に
+  // 失敗しdocument全体を対象にフォールバックした場合、このフィルター欄がプロフィールと
+  // 誤認識され、無関係な文面でパーソナライズ文が生成される事故が実機で確認された
+  // （生成文の冒頭が毎回「候補者検索結果／一括スカウト送信は、最大500件まで送信できます」
+  // という同一の定型文になっていた）。既知の非プロフィール定型文が含まれる場合は、
+  // このまま返さず空にして、呼び出し元の「プロフィールを取得できませんでした」という
+  // 明確なエラー表示に倒す
+  if (DODAX_PAGE_CHROME_MARKERS.some(m => text.includes(m))) {
+    console.warn('[Snow-we] extractProfile: ページの検索結果/フィルター欄を誤検出したため破棄します');
+    text = '';
+  }
+
+  return text
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .substring(0, maxChars || PROFILE_MAX_CHARS_DEFAULT);
+}
+
+// -------------------------------------------------------
+// メッセージリスナー
+// -------------------------------------------------------
+// -------------------------------------------------------
+// 画面診断：いまの画面で何が取れるかを、拡張機能自身に答えさせる
+// -------------------------------------------------------
+//
+// これが無いと、媒体が画面を変えるたびに「開発者ツールでこの1行を実行してください」を
+// 繰り返すことになる。実際にビズリーチとLinkedInで何度も往復した。
+// 記録に使うのと同じ処理をその場で走らせて結果を見せれば、誰でも、どの媒体の
+// どの画面でも、2秒で「正しく取れているか」を確認できる。
+//
+// 読み取るだけで、記録も送信もしない。
+function diagnoseCurrentPage() {
+  const platform = getPlatform();
+  const out = {
+    platform,
+    url: location.pathname,
+    version: (() => { try { return chrome.runtime.getManifest().version; } catch (_) { return ''; } })(),
+    netHook: isNetHookAlive(),
+    sendRequestRegistered: !!SEND_REQUESTS[platform],
+    bulkRequestRegistered: !!BULK_SEND_REQUESTS[platform],
+  };
+
+  // 実際に記録されるのは、スカウト開始のボタンを押した時点で控えた内容
+  // (pendingScout)。診断が画面を読み直すと、ページ最初の候補者を拾ってしまい、
+  // 送ろうとしている相手とは別人の値を見せることになる。控えがあればそれを出す
+  try {
+    const raw = sessionStorage.getItem('pendingScout');
+    if (raw) {
+      const p = JSON.parse(raw);
+      out.pending = {
+        candidateId: p.id || '(なし)',
+        company: (p.info && p.info.company) || '(取れません)',
+        univ: (p.info && p.info.univ) || '(取れません)',
+        age: (p.info && p.info.age) || '(取れません)',
+        // 控えの時点ではテンプレートはまだ選ばれていないことが多く、ここに入るのは
+        // 「拡張機能で選択中のポジション」。記録されるのは送信時に読むテンプレート名が
+        // 優先なので、控えの値だけを見せると画面と違う名前が出て誤解を招く（実機で確認）。
+        // 実際に記録される値は下の positionToRecord で出す
+        fallbackPosition: p.templateName || p.templateRaw || p.fallbackPosition || '',
+        agoSec: p.ts ? Math.round((Date.now() - p.ts) / 1000) : null,
+      };
+    }
+  } catch (_) {}
+
+  // 候補者をどこから読むか。記録時と同じ優先順にする
+  let el = null;
+  let source = '';
+  try {
+    if (platform === 'linkedin') {
+      // 作成中のメッセージが開いているなら、その宛先が送信相手。開いたまま診断すると
+      // 一覧の先頭行（全く別の候補者）を読んで見せてしまい、控えと食い違って見える
+      const compose = findLinkedinDetailPanel();
+      if (compose) { el = compose; source = '作成中のメッセージ'; }
+    }
+    if (platform === 'linkedin' && !el) {
+      const b = document.querySelector('[data-test-component="message-icon-btn"]');
+      let p = b;
+      for (let i = 0; p && i < 15; i++, p = p.parentElement) {
+        if (p.querySelector && p.querySelector('a[href*="/talent/profile/"]')) { el = p; source = '一覧の行'; break; }
+      }
+    }
+    if (!el) {
+      const panel = findDetailPanelForPlatform(platform);
+      if (panel) { el = panel; source = '詳細パネル'; }
+    }
+    if (!el) {
+      const cards = findCandidateCardsByPlatform();
+      if (cards.length) { el = cards[0]; source = `一覧カード(${cards.length}件中の1件目)`; }
+    }
+  } catch (e) {
+    out.error = e.message;
+  }
+
+  out.source = source || '見つかりません';
+  if (el) {
+    try {
+      out.candidateId = getCandidateId(el) || '(取れません)';
+      // 作成中のメッセージには /talent/profile/ のリンクが無く、ここからは識別子を
+      // 取れない。記録には控えのIDを使うので問題ないが、不具合と誤解されないようにする
+      if (out.candidateId === '(取れません)' && source === '作成中のメッセージ') {
+        out.candidateId = '(この画面には出ません。控えのIDを使います)';
+      }
+    } catch (e) { out.candidateId = 'エラー: ' + e.message; }
+    try {
+      const info = extractBasicInfo(el);
+      out.company = info.company || '(取れません)';
+      out.univ = info.univ || '(取れません)';
+      out.age = info.age || '(取れません)';
+    } catch (e) {
+      out.company = out.univ = out.age = 'エラー: ' + e.message;
+    }
+    // 読み取り元の中身。値が画面と違うとき、どの行を見て間違えたのかが
+    // これで分かる。これが無いと、毎回「開発者ツールでこの1行を実行して」の
+    // 往復になる（実際にビズリーチとLinkedInで繰り返した）
+    try {
+      out.lines = (el.innerText || '').split('\n').map(l => l.trim()).filter(Boolean).slice(0, 20);
+    } catch (_) {}
+    // 会社名がどの行から来たのかを出す。値が画面と違うときの原因は2通りしかなく、
+    // 「読み取り元にその文字列があるか」で一度に切り分けられる:
+    //   ある  → 読み取り規則の問題（過去の職歴・業種表記などを拾っている）
+    //   ない  → 別の画面・別の候補者を読んでいる（控えが古い等）
+    // これが無いと、毎回「この1行を開発者ツールで実行して」の往復になる
+    try {
+      const all = (el.innerText || '').split('\n').map(l => l.trim()).filter(Boolean);
+      const where = (v) => {
+        if (!v || v.startsWith('(') || v.startsWith('エラー')) return '';
+        const i = all.findIndex(l => l.includes(v));
+        return i >= 0
+          ? `${i + 1}行目「${all[i].slice(0, 60)}」`
+          : '読み取り元のどの行にも無い（クラス指定で取得した値か、別の画面の値）';
+      };
+      out.companyWhere = where(out.company);
+      out.univWhere = where(out.univ);
+      // 年齢は、職務経歴の文章の中の年齢を拾う事故が実際にあった。
+      // 会社名と同じように、どの行から来たのかを出す
+      out.ageWhere = where(out.age);
+      if (out.age && !out.ageWhere) {
+        out.ageWhere = '読み取り元のどの行にも無い（画面の見出しから取得した値）';
+      }
+      if (out.pending && out.pending.company) out.pendingCompanyWhere = where(out.pending.company);
+    } catch (_) {}
+  }
+
+  try {
+    const snap = readSendFormSnapshot(platform);
+    out.template = snap.templateRaw || '(取れません)';
+    // Greenはテンプレートのチップを押した記録から覚える方式で、送信フォームからは読めない
+    if (platform === 'green' && !snap.templateRaw && _cachedGreenTemplate) {
+      out.template = _cachedGreenTemplate + '（選択を記憶した値）';
+    }
+    out.bodyLength = (snap.bodyText || '').length;
+    // 記録されるポジション名は recordScoutSent と同じ順序で決める。
+    // 送信フォームのテンプレート名が最優先で、取れないときだけ控えた値を使う
+    const tmpl = snap.templateRaw || (platform === 'green' ? _cachedGreenTemplate : '') || '';
+    const fb = (out.pending && out.pending.fallbackPosition) || '';
+    out.positionToRecord = tmpl || fb || '(なし)';
+    out.positionSource = tmpl ? '送信フォームのテンプレート'
+      : (fb ? '拡張機能で選択中のポジション（テンプレートが読めないため）' : '');
+  } catch (_) {}
+  // Greenには候補者ごとの「スカウト開始」ボタンが無く、送信時に詳細モーダルから
+  // 組み立てる設計。控えが無いのが正常なので、不具合と誤解されないようにする
+  out.pendingExpected = platform !== 'green';
+
+  // 画面にある、送信・スカウトに関わるボタンの文言。何に当たるかも併せて出す。
+  // 判定は記録側とまったく同じ関数（classifyScoutButton）を使う。以前はここに
+  // 同じ判定をもう一度書いており、診断が「認識対象」と出したボタンが実際には
+  // 対象外、ということが起きていた
+  let hasSendBtn = false;
+  let hasStartBtn = false;
+  try {
+    // 表示件数で打ち切ると、認識対象のボタンが一覧から溢れて「送信ボタンが無い」と
+    // 誤判定する。実機で、作成画面の送信ボタンが14件目以降にあり、送信できる画面
+    // なのに⛔と出た。判定は全ボタンを見て行い、打ち切るのは表示だけにする。
+    // 認識対象（○）は必ず表示する
+    const known = [];
+    const others = [];
+    for (const b of document.querySelectorAll('button, a, [role="button"]')) {
+      const { text: t, textCore: core } = readButtonLabel(b);
+      if (!t || t.length > 40) continue;
+      if (!/スカウト|送信|送る|メッセージ|確定|確認/.test(t)) continue;
+      // 閉じた引き出しの中など、見えていないボタンは押せないので数えない。
+      // doda X の一覧画面で、隠れた送信フォームの「送信する」を○と数えていた
+      if (!isElementOnScreen(b, { allowScroll: true })) continue;
+      const k = classifyScoutButton(b, t, core);
+      if (k.isSend) hasSendBtn = true;
+      if (k.isStart) hasStartBtn = true;
+      const role = k.isSend ? '送信' : k.isStart ? 'スカウト開始'
+        : k.isConfirm ? '確認' : k.isTemplateConfirm ? '確定' : '';
+      // 複数行の文字が入ると一覧が崩れる（実機で「11＋改行＋未確認の候補者」が出た）
+      const label = t.replace(/\s+/g, ' ').slice(0, 24);
+      const line = `${role ? '○' : '×'} ${label}${role ? `（${role}）` : ''}`;
+      const bucket = role ? known : others;
+      if (!bucket.includes(line)) bucket.push(line);
+    }
+    out.buttons = known.concat(others.slice(0, Math.max(0, 16 - known.length)));
+  } catch (_) {}
+
+  // doda Xは、1人だけ選んで送っても一括送信の通信（bulkSendScout）を通る。
+  // この経路は、画面で選んだ候補者をボタンを押した時点で控える作りなので、
+  // 送らずに「いま選ばれている人から何が取れるか」をそのまま確認できる
+  if (platform === 'dodax') {
+    try {
+      const picked = captureSelectedCandidateIds();
+      out.bulkSelected = picked.length;
+      out.bulkSamples = picked.slice(0, 3).map(it => ({
+        id: it.id,
+        company: (it.info && it.info.company) || '',
+        univ: (it.info && it.info.univ) || '',
+        age: (it.info && it.info.age) || '',
+      }));
+    } catch (_) {}
+  }
+
+  // ── ここから「送ったら記録されるか」の事前判定 ──
+  // これまでの診断は「画面から何が読めるか」しか見ていなかった。記録が成立するには
+  // その先に「送信を検知できるか」「候補者を特定できるか」が必要で、そこから先は
+  // 実際に送ってみるまで分からなかった。実データでLinkedInでは、送信1件につき
+  // 失敗が1つずつ見つかる進め方になり、そのたびに未記録のスカウトが出た。
+  // 記録側とまったく同じ手順を、送信せずにここで走らせる
+  try {
+    // 更新が必要な版では、そもそも送信を止める。判定の一番上に出す
+    if (_blockSendUntilUpdate) {
+      out.verdict = 'ng';
+      out.verdictReason = `更新が必要です（いま v${out.version} / 必要 v${_blockSendMin}）。`
+        + 'この版では送信そのものを止めています。update を実行し、'
+        + 'chrome://extensions の「更新」→ ページを再読み込みしてください';
+      out.buttonsNote = '更新するまで、送信・スカウト開始のボタンは押しても進みません';
+      return out;
+    }
+    const canDetect = (SEND_REQUESTS[platform] && isNetHookAlive()) || hasSendBtn;
+    out.detectBy = (SEND_REQUESTS[platform] && isNetHookAlive()) ? '送信の通信（確実）'
+      : hasSendBtn ? '送信ボタンの文言' : '';
+
+    // 候補者の特定。記録側と同じ順序：控え → 送信時に詳細パネルから復元
+    let id = '';
+    let idSource = '';
+    let info = null;
+    try {
+      const raw = sessionStorage.getItem('pendingScout');
+      if (raw) {
+        const p = JSON.parse(raw);
+        if (p && p.id && Date.now() - p.ts < 30 * 60 * 1000) {
+          id = p.id;
+          idSource = 'スカウト開始を押した時点の控え';
+          info = p.info || {};
+        }
+      }
+    } catch (_) {}
+    if (!id) {
+      const panel = findDetailPanelForPlatform(platform);
+      if (panel) {
+        id = getCandidateId(panel) || '';
+        if (id) {
+          idSource = '送信時に画面から復元（詳細パネル）';
+          info = extractBasicInfo(panel);
+        }
+      }
+    }
+    out.willRecordId = id || '';
+    out.willRecordIdSource = idSource;
+    if (info) {
+      out.willRecordCompany = info.company || '';
+      out.willRecordUniv = info.univ || '';
+      out.willRecordAge = info.age || '';
+    }
+
+    // 送信画面を開く前の一覧でも押されるため、「まだ送信画面ではない」状態を
+    // 失敗と区別する。ここを分けないと、一覧を開くたびに⛔が出て狼少年になる
+    if (!canDetect) {
+      if (hasStartBtn) {
+        out.verdict = 'wait';
+        out.verdictReason = 'この画面にはまだ送信ボタンがありません。'
+          + 'スカウト開始のボタン（封筒／メッセージ 等）を押して送信画面を開いてから、もう一度調べてください';
+      } else {
+        out.verdict = 'ng';
+        out.verdictReason = 'この画面の送信を検知できません（送信ボタンを認識できず、送信APIも未登録）';
+      }
+    } else if (out.bulkSelected && (platform === 'dodax' || !id)) {
+      // 一括送信の経路は控えも詳細パネルも使わない。選ばれている人数で判断する。
+      // doda X は1人でも一括送信の通信を通り、記録も選ばれた人から作るので、
+      // 詳細パネルから候補者が取れていてもこちらを優先する。以前は一覧画面の
+      // 見えない下敷きから作った空の候補者で ✅ と出ていた
+      if (platform === 'dodax' && id) {
+        out.willRecordId = '';
+        out.willRecordIdSource = '';
+        out.willRecordCompany = '';
+        out.willRecordUniv = '';
+        out.willRecordAge = '';
+      }
+      out.verdict = 'ok';
+      out.verdictReason = `一括送信として、いま選ばれている${out.bulkSelected}人を記録します`;
+    } else if (!id) {
+      if (hasStartBtn) {
+        out.verdict = 'wait';
+        out.verdictReason = '候補者がまだ特定されていません。'
+          + 'スカウト開始のボタンを押してから、もう一度調べてください';
+      } else {
+        out.verdict = 'ng';
+        out.verdictReason = '候補者を特定できません（この画面から送ると記録が残りません）';
+      }
+    } else {
+      out.verdict = 'ok';
+      out.verdictReason = `${out.detectBy}で検知し、${idSource}から候補者を特定します`;
+    }
+  } catch (e) {
+    out.verdict = 'ng';
+    out.verdictReason = '判定できませんでした: ' + e.message;
+  }
+
+  return out;
+}
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // async処理を含むハンドラはIIFEでラップ
+  // 承認待ちポップアップから、同じスカウトルーム（room_url）を既に開いているタブが
+  // あった場合に、新しいタブを増やさずそのタブへ直接メッセージで探索を依頼するために使う
+  // （URLのhash書き換えだけではSPAの同一ページ内遷移になり、ページロードが発生せず
+  // content.js側のトリガーが再実行されないため、メッセージ経由で直接呼び出す）
+  if (request.action === 'diagnosePage') {
+    try { sendResponse({ ok: true, result: diagnoseCurrentPage() }); }
+    catch (e) { sendResponse({ ok: false, error: e.message }); }
+    return false;
+  }
+
+  if (request.action === 'snowweFindCandidate') {
+    if (getPlatform() === 'rds' && request.params?.company) {
+      snowweFindAndHighlightCandidate(request.params);
+    }
+    return false;
+  }
+  if (request.action === 'getBatchCandidates') {
+    (async () => {
+      try {
+        injectStyles();
+        showAutoStatus('📥 候補者を全件読み込み中...');
+        await loadAllCandidatesIntoDOM();
+        const cards = extractAllCandidateCards();
+        cards.forEach(c => {
+          if (getComputedStyle(c.el).position === 'static') c.el.style.position = 'relative';
+          c.el.classList.add('snow-we-selected');
+          const badge = document.createElement('div');
+          badge.className = 'snow-we-badge checking';
+          badge.textContent = '🔍 判定中...';
+          c.el.appendChild(badge);
+        });
+        sendResponse({ success: true, cards: cards.map(c => ({ summary: c.summary, age: c.age, incomeText: c.incomeText, text: c.text.substring(0, 900) })) });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+  if (request.action === 'setBatchResults') {
+    try {
+      const cards = extractAllCandidateCards();
+      const results = request.results || [];
+      results.forEach((r, i) => {
+        if (!cards[i]) return;
+        const el = cards[i].el;
+        el.querySelectorAll('.snow-we-badge').forEach(b => b.remove());
+        const [cls, text] = r.overall === 'OK' ? ['ok', '✅ スカウト推奨']
+                          : r.overall === 'NG' ? ['ng', '❌ 見送り']
+                          : ['warn', '⚠️ 要確認'];
+        setBatchBadge(el, cls, text, r.reason || '', cards[i]?.summary?.substring(0, 200) || '', r.overall);
+      });
+      // Bizreach: 仮想スクロールでバッジが消えないよう監視を開始
+      if (getPlatform() === 'bizreach') startBizreachBadgeObserver();
+      sendResponse({ success: true });
+    } catch (e) {
+      sendResponse({ success: false, error: e.message });
+    }
+  }
+
+  if (request.action === 'showBadgeChecking') {
+    injectStyles();
+    showBadge('checking', '🔍 判定中...');
+    sendResponse({ success: true });
+  }
+
+  if (request.action === 'showBadgeResult') {
+    const map = { OK: ['ok', '✅ スカウト推奨'], NG: ['ng', '❌ 見送り'], '要確認': ['warn', '⚠️ 要確認'] };
+    const [cls, text] = map[request.overall] || ['warn', '⚠️ 要確認'];
+    showBadge(cls, text, request.reason || '', request.profileSummary || '', request.overall || '');
+    sendResponse({ success: true });
+  }
+
+  if (request.action === 'clearBadge') {
+    document.querySelectorAll('.snow-we-badge').forEach(b => b.remove());
+    document.querySelectorAll('.snow-we-selected').forEach(el => el.classList.remove('snow-we-selected'));
+    _selectedCard = null;
+    sendResponse({ success: true });
+  }
+
+  if (request.action === 'getProfile') {
+    (async () => {
+      try {
+        const isRDS = location.hostname.includes('rikunabi') || location.hostname.includes('hrtech') || location.hostname.includes('recruitdirect');
+        if (isRDS) {
+          // スカウト履歴タブが表示されている場合はレジュメタブに切り替える
+          await tryClickRDSResumeTab();
+          await sleep(500);
+          // 詳細パネル内のみスクロール（パネルが見つからない場合は全体スクロールしない）
+          const rdsPanel = findRDSDetailPanel();
+          if (rdsPanel) {
+            let scrollTarget = rdsPanel;
+            rdsPanel.querySelectorAll('*').forEach(el => {
+              const s = window.getComputedStyle(el);
+              if (s.overflowY !== 'scroll' && s.overflowY !== 'auto') return;
+              const rect = el.getBoundingClientRect();
+              if (rect.height > 200) scrollTarget = el;
+            });
+            scrollTarget.scrollTop = scrollTarget.scrollHeight;
+            await sleep(1000);
+          }
+        } else if (getPlatform() === 'ambi') {
+          // AMBIの候補者スライドパネルは中身が非同期に読み込まれるため、開いた直後だと
+          // .leftCellがまだ空(またはメタ情報だけ)のことがある。実機で「文生成」直後に
+          // ページ共通メニューのテキストを誤って抽出する事故を確認したため、内容が
+          // ある程度の長さになるまで最大3秒ほど待ってから抽出する
+          for (let i = 0; i < 10; i++) {
+            const p = findAMBIDetailPanel();
+            if (p && (p.innerText || '').trim().length > 200) break;
+            await sleep(300);
+          }
+        } else {
+          await scrollRightPanelToBottom();
+        }
+        // dodaXは候補者を連続してクリックした際、詳細パネルの表示切り替えが
+        // 完了する前に抽出が走ると、直前の状態（絞り込みフィルター欄等、実
+        // プロフィールと同じ語を見出しに使う非プロフィール要素）を誤って拾って
+        // しまう事故が実機ログで確認された。findDodaxDetailPanel単体の事前
+        // チェックだけでは、その直後にextractProfile内部で改めて呼び出す
+        // findDodaxDetailPanelが別のタイミングの状態を拾ってしまい効果が
+        // なかった（実機で再現）ため、extractProfile自体を結果が安定するまで
+        // リトライする（AMBIの.leftCell待機と同じ考え方）
+        // 呼び出し側が fullProfile を指定した場合は長く取る（ポジション提案用）。
+        // 既定のままだと前職・前々職が切り落とされ、検索に効かない
+        const maxChars = request.fullProfile ? PROFILE_MAX_CHARS_FULL : PROFILE_MAX_CHARS_DEFAULT;
+        let profileText;
+        if (getPlatform() === 'dodax') {
+          profileText = '';
+          for (let i = 0; i < 10; i++) {
+            profileText = extractProfile(maxChars);
+            if (profileText.trim().length > 200) break;
+            await sleep(300);
+          }
+        } else {
+          profileText = extractProfile(maxChars);
+        }
+        // デバッグ表示用のパネル取得もプラットフォームに合わせる（以前はAMBI以外だと
+        // 常にRDS用の関数にフォールバックしていたため、dodaX等の調査時にログの
+        // 「detailPanel」欄が実際には無関係なRDS向け検出結果を指しており、
+        // 誤った手がかりで原因調査が混乱する事故があった）
+        const _platformForDebugPanel = getPlatform();
+        const panel = isRDS ? findRDSDetailPanel()
+          : _platformForDebugPanel === 'ambi' ? findAMBIDetailPanel()
+          : _platformForDebugPanel === 'dodax' ? findDodaxDetailPanel()
+          : _platformForDebugPanel === 'bizreach' ? findBizreachDetailPanel()
+          : _platformForDebugPanel === 'green' ? findGreenDetailPanel()
+          : _platformForDebugPanel === 'mynavi' ? findMynaviDetailPanel()
+          : findRDSDetailPanel();
+        console.log('[Snow-we] extractProfile 結果:', profileText.length, '文字');
+        console.log('[Snow-we] detailPanel:', panel ? `あり (${(panel.innerText||'').trim().length}文字)` : 'なし');
+        console.log('[Snow-we] プロフィール先頭100文字:', profileText.substring(0, 100));
+
+        // RDSで取得できなかった場合の判定
+        const looksEmpty = profileText.trim().length < 50;
+        // スカウト履歴タブが開いたままの場合（removeNonProfileSectionsが空を返した）
+        const rdsPanel2 = isRDS ? findRDSDetailPanel() : null;
+        const rdsPanel2Text = rdsPanel2 ? (rdsPanel2.innerText || '') : '';
+        // 先頭付近だけを見る（スカウト履歴タブ内のメッセージ本文に職務経歴等の語が
+        // 含まれるケースがあり、パネル全体をincludes()すると誤検知するため）
+        const rdsPanel2Head = rdsPanel2Text.trim().slice(0, 200);
+        const profileKwsForPanel = ['職務経歴', '職歴', 'スキル', '学歴', '業務内容', '自己PR', '資格', '経験'];
+        const panelHasProfileContent = profileKwsForPanel.some(kw => rdsPanel2Head.includes(kw));
+        const panelIsScoutHistory = isRDS && rdsPanel2
+          && rdsPanel2Head.includes('スカウト履歴')
+          && !panelHasProfileContent;
+
+        if (isRDS && (looksEmpty || panelIsScoutHistory)) {
+          const errMsg = panelIsScoutHistory
+            ? 'レジュメタブを開いてから文生成してください（現在スカウト履歴タブが表示中）'
+            : '候補者が選択されていません';
+          sendResponse({
+            success: false,
+            needsCandidateSelection: true,
+            profileText: '',
+            error: errMsg
+          });
+        } else {
+          sendResponse({
+            success: true,
+            profileText,
+            url: location.href,
+            hostname: location.hostname,
+            length: profileText.length
+          });
+        }
+      } catch (e) {
+        sendResponse({
+          success: false,
+          profileText: '',
+          error: e.message
+        });
+      }
+    })();
+    return true; // 非同期レスポンスのためtrueを返す
+  }
+
+  if (request.action === 'ping') {
+    sendResponse({ ok: true });
+  }
+
+  if (request.action === 'triggerAutoAdd') {
+    triggerAutoAdd().catch(e => {
+      const msg = e?.message || '';
+      if (!msg.includes('Extension context invalidated') && !msg.includes('message channel closed')) {
+        console.error('[Snow-we] triggerAutoAdd 予期しないエラー:', msg);
+      }
+    });
+    sendResponse({ success: true });
+  }
+
+  if (request.type === 'autoRun') {
+    _isAutoRunMode = true;
+    _autoRunPageCount = 0;
+    _autoRunMaxPages = request.maxPages || 2;
+    _autoRunSlotId = request.slotId ?? 0;
+    console.log(`[Snow-we] 夜間自動実行開始 スロット${_autoRunSlotId} (最大${_autoRunMaxPages}ページ, ${request.urlIndex + 1}/${request.totalUrls})`);
+    showAutoStatus(`🌙 自動実行中... (${request.urlIndex + 1}/${request.totalUrls}件目)`);
+    // doda-X 検索条件リストページは専用処理
+    if (location.href.includes('search_list')) {
+      autoRunListPage(request).catch(e => console.error('[Snow-we] リスト自動実行エラー:', e?.message));
+    // BizReach 検索条件タブ一覧ページ（/resumes/{id}/list）
+    } else if (getPlatform() === 'bizreach' && /\/resumes\/\d+\/list/.test(location.pathname)) {
+      autoRunBizreachListPage(request).catch(e => console.error('[Snow-we] Bizreachリスト自動実行エラー:', e?.message));
+    } else {
+      triggerAutoAdd().catch(e => console.error('[Snow-we] 自動実行エラー:', e?.message));
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (request.action === 'debugDOM') {
+    try {
+      const info = {
+        url: location.href,
+        hostname: location.hostname,
+        detailPanelFound: !!findRDSDetailPanel(),
+        selectorHits: {
+          'resume': document.querySelectorAll('[class*="resume"]').length,
+          'career': document.querySelectorAll('[class*="career"]').length,
+          'history': document.querySelectorAll('[class*="history"]').length,
+          'candidate': document.querySelectorAll('[class*="candidate"]').length,
+          'detail': document.querySelectorAll('[class*="detail"]').length,
+          'section': document.querySelectorAll('section').length,
+        },
+        headings: Array.from(document.querySelectorAll('h1,h2,h3,h4')).map(h => h.innerText?.trim()).filter(Boolean).slice(0, 20),
+        previewText: extractProfile().substring(0, 200)
+      };
+      sendResponse({ success: true, info });
+    } catch (e) {
+      sendResponse({ success: false, error: e.message });
+    }
+  }
+
+  return true;
+});

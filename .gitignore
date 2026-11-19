@@ -1,0 +1,16 @@
+# 拡張機能の署名鍵（絶対にコミットしない）
+*.pem
+
+# macOS が作る表示設定
+.DS_Store
+
+# 引っ越し前のフォルダに残っている、このリポジトリでは管理しないもの
+positions.csv
+node_modules/
+package.json
+package-lock.json
+.claude/
+modules/
+diary.db
+/*.py
+__pycache__/

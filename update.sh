@@ -1,0 +1,117 @@
+#!/bin/bash
+# Mac / Linux 用の更新スクリプト。
+# update.command はこのファイルを呼ぶだけなので、案内文はここだけ直せばよい。
+# Windows 用の update.bat だけは別言語のため内容が重複している。文言を変えるときは
+# 両方直すこと（以前、update.sh だけ案内が食い違っており、Chromeの再読み込みを
+# しないまま「更新できた」と思い込む状態になっていた）。
+cd "$(dirname "$0")" || exit 1
+
+echo "================================"
+echo " Snow-we 拡張機能 アップデート"
+echo "================================"
+echo ""
+
+# 取得先を毎回入れ直す。
+# 一時期このリポジトリを非公開にしており、その間はトークン入りのURLで
+# 取得していた。その設定が手元に残っていると、トークンを失効させたあとに
+# 取得できなくなる。ここで毎回入れ直すことで、古い設定のまま止まらない。
+REPO="https://github.com/taichi536/snowwe-extension.git"
+git remote set-url origin "$REPO"
+echo "取得先を設定しました。"
+echo ""
+
+# 認証が通らないとき、既定ではGitHubのログイン画面が出る。メンバーはGitHub
+# アカウントを持っていないので答えようがなく、何が悪いのか分からないまま止まる。
+# その場で失敗させて原因を出す
+export GIT_TERMINAL_PROMPT=0
+
+# git の処理が途中で止まると .git/index.lock が残り、それ以降の更新が何度やっても
+# 同じエラーで止まり続ける（「Unable to create ... index.lock: File exists」）。
+# 実際にメンバーの端末（Windows・OneDrive配下）で発生した。
+# git が動いていないことを確かめてから片付ける。動いている最中に消すと
+# そちらの処理を壊すため、その場合は消さずに止める
+if [ -f .git/index.lock ]; then
+  if pgrep -x git > /dev/null 2>&1; then
+    echo "❌ 別の更新がまだ動いています。"
+    echo ""
+    echo "開いている「アップデート」のウィンドウを全部閉じて、"
+    echo "1分ほど待ってから、もう一度このファイルを実行してください。"
+    echo ""
+    read -r -p "Enterキーを押すと閉じます..." || true
+    exit 1
+  fi
+  rm -f .git/index.lock
+  echo "前回の更新が途中で止まった跡を片付けました。"
+  echo ""
+fi
+
+# git pull の成否を必ず見る。以前は失敗しても「更新完了」と表示していたため、
+# ネットワークが切れていても、ローカルに変更が残って pull が止まっていても、
+# 画面上は成功したように見えていた
+# Python を動かすと __pycache__ フォルダが残る。gitの管理対象外なので更新では
+# 消されないが、gitが削除しようとしているフォルダの中に残っていると
+# 「Deletion of directory failed」で更新が止まる。実際にメンバーの端末で、
+# 別プロジェクトの modules フォルダがこれで消せず止まった。
+# 消しても必要になれば作り直されるだけのものなので、先に片付ける
+clean_pycache() {
+  find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+}
+clean_pycache
+
+pull_ok=0
+if git pull; then
+  pull_ok=1
+else
+  # 更新を妨げるものを片付けて一度だけやり直す。メンバーはこのフォルダの
+  # 中身を編集しない前提なので、手元の書き換えは元に戻してよい。
+  # index.lock は、たった今失敗したgit自身が残したもの（別のgitが動いている
+  # 場合は冒頭のチェックで既に止めている）なので、消して安全
+  echo ""
+  echo "更新を妨げているものを片付けて、もう一度試します..."
+  echo "（このフォルダの中で書き換わったファイルは元に戻します）"
+  echo ""
+  rm -f .git/index.lock
+  clean_pycache
+  git checkout -- . > /dev/null 2>&1 || true
+  if git pull; then
+    pull_ok=1
+  fi
+fi
+
+if [ "$pull_ok" -ne 1 ]; then
+  echo ""
+  echo "❌ 更新に失敗しました。"
+  echo ""
+  echo "上に表示されているメッセージを、そのまま管理者に伝えてください。"
+  echo ""
+  echo "よくある原因："
+  echo "  ・インターネットに接続できていない"
+  echo "  ・このフォルダの中のファイルを直接編集してしまった"
+  echo "  ・フォルダを移動・コピーした"
+  echo ""
+  echo "「index.lock」と出ている場合は、クラウド同期（OneDrive・iCloud など）が"
+  echo "邪魔をしています。同期を一時停止して、もう一度このファイルを実行してください。"
+  echo ""
+  echo "「Authentication failed」と出ている場合は、管理者に連絡してください。"
+  echo ""
+  echo "※ このまま Chrome を再読み込みしても、バージョンは変わりません。"
+  echo ""
+  read -r -p "Enterキーを押すと閉じます..."
+  exit 1
+fi
+
+VERSION=$(grep -m1 '"version"' manifest.json | sed -E 's/.*"version"[^"]*"([^"]+)".*/\1/')
+
+echo ""
+echo "✅ 更新完了！（バージョン ${VERSION}）"
+echo ""
+echo "次に Chrome で以下を行ってください："
+echo "  1. アドレスバーに chrome://extensions と入力してEnter"
+echo "  2. 「Snow-we」の「再読み込み」ボタンを押す"
+echo ""
+echo "※ 2 を行わないと、新しいバージョンは反映されません。"
+echo "   再読み込み後、サイドパネル右上の表示が v${VERSION} になっていれば成功です。"
+echo ""
+# read は端末が無い場合にEOFで失敗する。ここは待つためだけなので成否を見ない
+read -r -p "Enterキーを押すと閉じます..." || true
+exit 0

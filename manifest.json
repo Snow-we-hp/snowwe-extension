@@ -1,0 +1,121 @@
+{
+  "manifest_version": 3,
+  "name": "Snow-we スカウト パーソナライズ生成",
+  "version": "1.92.0",
+  "description": "候補者プロフィールからパーソナライズ文を1〜2文で自動生成します",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "unlimitedStorage",
+    "clipboardWrite",
+    "alarms",
+    "tabs",
+    "sidePanel",
+    "identity"
+  ],
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "https://raw.githubusercontent.com/taichi536/snowwe-extension/*",
+    "https://script.google.com/*",
+    "https://script.googleusercontent.com/*",
+    "https://bizreach.biz/*",
+    "https://www.bizreach.biz/*",
+    "https://*.bizreach.biz/*",
+    "https://es-support.jp/*",
+    "https://doda-x.jp/*",
+    "https://x.doda.jp/*",
+    "https://search.doda-x.jp/*",
+    "https://ambi.jp/*",
+    "https://en-ambi.com/*",
+    "https://www.green-japan.com/*",
+    "https://mynavi-agent.jp/*",
+    "https://www.mynavi-agent.jp/*",
+    "https://agent.mynavi.jp/*",
+    "https://rds.recruitdirect.jp/*",
+    "https://ats.hrtech.rikunabi.com/*",
+    "https://*.rikunabi.com/*",
+    "https://*.hrtech.jp/*",
+    "https://*.hrtech.rikunabi.com/*",
+    "https://*.supabase.co/*",
+    "https://143-198-195-132.nip.io/*",
+    "https://www.linkedin.com/talent/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "パーソナライズ文を生成（サイドパネルで開く）",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://bizreach.biz/*",
+        "https://www.bizreach.biz/*",
+        "https://*.bizreach.biz/*",
+        "https://es-support.jp/*",
+        "https://doda-x.jp/*",
+        "https://x.doda.jp/*",
+        "https://search.doda-x.jp/*",
+        "https://ambi.jp/*",
+        "https://en-ambi.com/*",
+        "https://www.green-japan.com/*",
+        "https://mynavi-agent.jp/*",
+        "https://www.mynavi-agent.jp/*",
+        "https://agent.mynavi.jp/*",
+        "https://rds.recruitdirect.jp/*",
+        "https://ats.hrtech.rikunabi.com/*",
+        "https://*.rikunabi.com/*",
+        "https://*.hrtech.jp/*",
+        "https://*.hrtech.rikunabi.com/*",
+        "https://www.linkedin.com/talent/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://bizreach.biz/*",
+        "https://www.bizreach.biz/*",
+        "https://*.bizreach.biz/*",
+        "https://es-support.jp/*",
+        "https://doda-x.jp/*",
+        "https://x.doda.jp/*",
+        "https://search.doda-x.jp/*",
+        "https://ambi.jp/*",
+        "https://en-ambi.com/*",
+        "https://www.green-japan.com/*",
+        "https://mynavi-agent.jp/*",
+        "https://www.mynavi-agent.jp/*",
+        "https://agent.mynavi.jp/*",
+        "https://rds.recruitdirect.jp/*",
+        "https://ats.hrtech.rikunabi.com/*",
+        "https://*.rikunabi.com/*",
+        "https://*.hrtech.jp/*",
+        "https://*.hrtech.rikunabi.com/*",
+        "https://www.linkedin.com/talent/*"
+      ],
+      "js": [
+        "net-hook.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ]
+}

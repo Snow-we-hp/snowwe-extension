@@ -1,0 +1,1813 @@
+// background.js — GAS中継 & ポジション一覧の管理
+
+// 通常のポップアップ（action.default_popup）は、ページ上をクリックしたりタブを切り替えたり
+// すると自動的に閉じてしまい、承認待ちレビュー中にRDSの候補者詳細を見ながら操作できない・
+// 閉じて承認待ちリストの続きを見失う、という問題が繰り返し起きていた。サイドパネルは
+// ページと重ならず開いたまま閉じないため、この問題自体を解消できる。アイコンクリックで
+// ポップアップの代わりにサイドパネルが開くようにする（manifest.json側もdefault_popupを
+// 外し、side_panel.default_pathに切り替え済み）
+chrome.sidePanel
+  .setPanelBehavior({ openPanelOnActionClick: true })
+  .catch((error) => console.error('[Snow-we] サイドパネル設定失敗:', error));
+
+// ポジション一覧（ここだけ編集すれば popup・content 両方に反映される）
+const POSITION_LIST = [
+  'ファンクションコンサルタント(営業/Eコマース)-song',
+  'Customerコンサルタント（オープンポジション）- song',
+  'Customerストラテジスト(成長戦略コンサルタント)-song',
+  '製品・サービス開発DXコンサルタント/アーキテクト - IND',
+  'ファンクションコンサルタント（マーケティング）- song',
+  'PRコンサルタント - OPE',
+  '人材・組織コンサルタント - BUS',
+  '製造プロセスDXコンサルタント/ アーキテクト・エンジニア- IND',
+  'テクノロジーコンサルタント（製造・流通領域）- TEC',
+  '財務・経営管理コンサルタント（CFO＆EV）- BUS',
+  'クラウドアーキテクト / エンジニア / コンサルタント – TEC',
+  'サプライチェーン＆オペレーションコンサルタント【マネジャー候補】- BUS',
+  'Webシステムエンジニア / Webシステムコンサルタント - song',
+  'プロダクトマネジャー - song',
+  'プロジェクトマネージャー - OPE',
+  '社会インフラ・建設・不動産領域コンサルタント/エンジニア - IND',
+  'ソリューション・エンジニア - TEC',
+  'システムコンサルタント - TEC',
+  '購買・調達担当（スペシャリスト）- CORP',
+  'テクノロジーセールス（リセールサポート）- TEC',
+  'インダストリーコンサルタント（ライフサイエンス領域）- BUS',
+  'ソリューション・エンジニア（金融領域）- TEC',
+  'DXソリューションコンサルタント(自動車領域)-IND',
+  'テクノロジーコンサルタント（公共サービス・医療健康領域）- TEC',
+  'UIUXデザイナー / UIUX Designer - ソング本部',
+  'インダストリーコンサルタント（化学領域）- BUS',
+  'テクノロジーコンサルタント（通信・メディア・ハイテク領域）- TEC',
+  'フィールドコンサルタント – OPE',
+  'ファンクションコンサルタント（カスタマーサービス/チェンジマネジメント）- song',
+  'データサイエンティスト/データドリブン コンサルタント - AIグループ - BUS',
+  'Customer Data＆AI コンサルタント - song',
+  'ECエンジニア / ECコンサルタント - song',
+  'サーバーサイドリードエンジニア - song',
+  'メディアプロモーター - OPE',
+  'モバイルエクスペリエンスコンサルタント / エンジニア - TEC',
+  '法務・コンプライアンス担当（シニア・アナリスト）-CORP',
+  'M&Aコンサルタント - BUS',
+  'テクノロジープラットフォーム戦略コンサルタント – TEC',
+  'デジタル・テクノロジーアーキテクト - TEC',
+  'BC(SAP)',
+  '仙台オープンポジション - TEC',
+  'マーケティングシステムエンジニア / マーケティングシステムコンサルタント - song',
+  'BC(IT)',
+  'BC(クリエイティブ)',
+  'クオリティ&テスティングコンサルタント / エンジニア - TEC',
+  'BC(文系)',
+  'テクノロジーコンサルタント（インテグレーションアーキテクト）-TEC',
+  'BC(半導体)',
+  'KPMG_宇宙',
+  'BC(ポテンシャル)',
+  'BC(プロディース部)',
+  'dirbato',
+  'BC(不動産)',
+  'インダストリーコンサルタント（石油・エネルギー領域）-BUS',
+  'テクノロジーコンサルタント（サプライチェーン&オペレーション）-TEC',
+  'インダストリーコンサルタント（素材領域）-BUS',
+  'インダストリーコンサルタント（カスタマーフロント）【金融サービス領域】- song',
+  'BC(事務職)',
+  'リスク&コンプライアンスコンサルタント(CFO&EV)-BUS',
+  'AC(IT)',
+  'フロントエンドエンジニア - OPE',
+  'インダストリーコンサルタント（電力・ガス領域）- BUS',
+  'インダストリーコンサルタント（銀行領域）- BUS',
+  'インダストリーコンサルタント（保険領域）- BUS',
+  'ソフトウェアエンジニア（Java）- TEC',
+  'インダストリーコンサルタント（公共サービス領域）- BUS',
+  'Salesforce コンサルタント / エンジニア - TEC',
+  'インダストリーコンサルタント（通信・メディア領域）- BUS',
+  'BC（FAS）',
+  '品質管理エキスパート（CQA）- テクノロジー コンサルティング本部 (QE&A)',
+  'インフラエンジニア',
+  'サステナビリティコンサルタント - ビジネス コンサルティング本部',
+  'AIエンジニア - TEC (Data&AI)',
+  'インダストリーコンサルタント（証券領域）- BUS',
+  'インダストリーコンサルタント（消費財・サービス領域）-BUS',
+
+  // ── ここから下:Accenture公式採用サイト(findjobs API)から取得した求人タイトルを
+  // マージしたもの(2026-07-31時点、コンサル・テクノロジー系のみ。コーポレート職/
+  // 障がい者採用枠/新卒手続き用等の非スカウト対象は除外済み)。上のリストは
+  // 社内管理用の略記(BC/AC/-song等)がスプレッドシートのドロップダウンと一致する
+  // 前提で作られているため、既存分は書き換えず追加のみ行っている
+  'Oracleコンサルタント / エンジニア_管理職',
+  'Oracleコンサルタント / エンジニア',
+  '第二新卒／キャリアチェンジ採用ポジション',
+  'ストラテジックデザイナー / Strategic Designer_管理職_Song',
+  'ストラテジックデザイナー / Strategic Designer_Song',
+  'ビジュアルデザイナー / Visual Designer_管理職_Song',
+  'エクスペリエンス マネジメント / Experience management_管理職_Song',
+  'エクスペリエンス マネジメント / Experience management_Song',
+  '3DCGアーティスト_Song',
+  'リアルタイムソフトウェアデベロッパー_管理職_Song',
+  'リアルタイムソフトウェアデベロッパー_Song',
+  'プログラム・プロジェクト・サービスマネジメント',
+  'コーポレート・ディベロップメント - M＆A PMI推進担当（アナリスト - スペシャリスト）',
+  '【首都圏エリア】契約社員 - オペレーションズ コンサルティング本部',
+  'Customer Tech エンジニア（オープンポジション）_Staff_Direct_Song',
+  'Business Development Director (Japan) – SAP',
+  'Business Development Director (Japan) – Oracle',
+  'テクノロジーコンサルタント（金融領域）',
+  '〔IT未経験歓迎 - リスキル採用〕ITトランスフォーメーション＆オプティマイゼーション',
+  'デザイナー/アートディレクター/シニアアートディレクター_Song',
+  'デザイナー/アートディレクター/シニアアートディレクター_管理職_Song',
+  'ファンクションコンサルタント（Eコマース）_管理職_Song',
+  '名古屋オープンポジション',
+  'インダストリーコンサルタント（電力・ガス,石油・エネルギー,化学,素材領域）',
+  'インテリジェントオートメーション コンサルタント / エンジニア（業務変革×AI）',
+  'Software Development Engineer in Test',
+  'データサイエンティスト/データドリブン コンサルタント/ AIアーキテクト（オープンポジション)',
+  'データエンジニア',
+  'SAPコンサルタント / エンジニア',
+  'シニアプロデューサー - ソング本部（Droga5）_管理職_Song',
+  'サプライチェーン & オペレーションコンサルタント_管理職',
+  'Digital Core_オープンポジション（管理職候補）',
+  'BPO業務改革プロジェクトリーダー/チームリーダー',
+  'CDP・BIエンジニア / CDP・BIコンサルタント_Song',
+  'クラウドアーキテクト_Song',
+  'インダストリーコンサルタント（カスタマーフロント）【公共サービス・医療健康領域】_管理職_Song',
+  '品質管理エキスパート',
+  'インダストリーコンサルタント（カスタマーフロント）【製造・流通領域】_管理職_Song',
+  'セキュリティコンサルタント',
+  'システムコンサルタント / ソリューションエンジニア（ServiceNow)_管理職',
+  '名古屋オープンポジション_管理職',
+  'ソリューション・エンジニア（素材・エネルギー領域）',
+  'データ・AI戦略コンサルタント_管理職',
+  'ファンクションコンサルタント（Eコマース）_Song',
+  'インダストリーコンサルタント（電力・ガス,石油・エネルギー,化学,素材領域）_管理職',
+  'データコンサルタント_管理職',
+  'クリエイティブディレクター_Song',
+  'クラウド戦略コンサルタント',
+  '福岡オープンポジション_管理職',
+  'AIエンジニア_管理職',
+  'サステナビリティコンサルタント_管理職',
+  'インダストリーコンサルタント（カスタマーフロント）【公共サービス・医療健康領域】_Song',
+  'AI駆動開発コンサルタント/エンジニア_管理職',
+  'ITアーキテクト_管理職_Song',
+  'インダストリーコンサルタント（通信・メディア, ハイテク, ソフトウェア＆プラットフォーム領域）_管理職',
+  'ITトランスフォーメーション・リアライゼイション',
+  'コピーライター/シニアコピーライター_管理職_Song',
+  'アジャイル CoE',
+  'インダストリーコンサルタント（カスタマーフロント）【製造・流通領域】_Song',
+  '製造オートメーションコンサルタント',
+  'フィジカルAIコンサルタント/エンジニア',
+  '関西オープンポジション_管理職',
+  'AI駆動開発コンサルタント/エンジニア',
+  'アジャイル CoE_管理職',
+  'アプリケーションマネージドサービスコンサルタント',
+  'CDP・BIエンジニア / CDP・BIコンサルタント_管理職_Song',
+  'エクスペリエンステクノロジーコンサルタント_Song',
+  'コピーライター/シニアコピーライター_Song',
+  'インダストリーコンサルタント（通信・メディア, ハイテク, ソフトウェア＆プラットフォーム領域）',
+  'データ・AI戦略コンサルタント',
+  'アカウントマネジャー/アカウントスーパーバイザー_管理職_Song',
+  '前橋オープンポジション',
+  'テクノロジーアドバイザリー コンサルタント(テクノロジーストラテジー＆アドバイザリー)(HPS)_管理職',
+  'テクノロジーコンサルタント (カスタマーフロント：顧客・従業員接点領域) _Song',
+  'SAPコンサルタント / エンジニア_管理職',
+  'アプリケーションマネージドサービスコンサルタント_管理職',
+  'Microsoftコンサルタント_管理職',
+  'ファンクションコンサルタント（新規事業/プロダクト開発）_Song',
+  'DXソリューションアーキテクト/エンジニア',
+  'ビジネスコンサルタント（オープンポジション）_M+_Direct',
+  'ビジュアルデザイナー / Visual Designer_Song',
+  'ソリューション・エンジニア（通信・メディア・ハイテク領域）_管理職',
+  'インダストリーコンサルタント（銀行、証券、保険領域）_管理職',
+  'インダストリーコンサルタント（カスタマーフロント）【素材・エネルギー領域】_Song',
+  'フロントエンドリードエンジニア_管理職_Song',
+  'デリバリリード / スクラムマスタ',
+  'アカウントマネジャー/アカウントスーパーバイザー_Song',
+  'データサイエンティスト/データドリブン コンサルタント/ AIアーキテクト（オープンポジション）_管理職',
+  'テクノロジーアドバイザリー コンサルタント(金融領域)_管理職',
+  'インダストリーコンサルタント（産業機械、自動車、製薬、消費財・サービス、小売り領域）_管理職',
+  'ITアーキテクト_Song',
+  'ディレクター',
+  'テクノロジーセールス（リセール担当）',
+  'AMOコンサルタント / エンジニア / インフラエンジニア',
+  'インダストリーコンサルタント（カスタマーフロント）【素材・エネルギー領域】_管理職_Song',
+  'ファンクションコンサルタント（新規事業/プロダクト開発）_管理職_Song',
+  '3DCGアーティスト_管理職_Song',
+  'ファンクションコンサルタント（営業改革）_管理職_Song',
+  'Software Development Engineer in Test（SDET）_管理職',
+  'テクノロジーコンサルタント（素材・エネルギー領域）',
+  'システムコンサルタント・エンジニア（製造・流通領域）',
+  'デザイナー / アートディレクター',
+  'ファンクションコンサルタント（営業改革）_Song',
+  'ソリューション・エンジニア（通信・メディア・ハイテク領域）',
+  'テクノロジーコンサルタント (カスタマーフロント：顧客・従業員接点領域)_管理職_Song',
+  'テクノロジーコンサルタント（素材・エネルギー領域）_管理職',
+  '戦略コンサルタント',
+  'シニアブランドストラテジスト / コミュニケーション・ストラテジー ディレクター_Song',
+  'クラウドファーストネットワーク コンサルタント_管理職',
+  '製造オートメーションコンサルタント_管理職',
+  'リスク＆コンプライアンスコンサルタント_管理職',
+  '戦略コンサルタント_管理職',
+  'プログラム・プロジェクト・サービスマネジメント_管理職',
+  '関西オープンポジション',
+  'デリバリリード / スクラムマスタ_管理職',
+  'ソリューション・エンジニア（素材・エネルギー領域）_管理職',
+  'クラウドアーキテクト_管理職_Song',
+  'テクノロジー 戦略/アドバイザリー コンサルタント',
+  'エクスペリエンステクノロジーコンサルタント_管理職_Song',
+  'シニアプロデューサー_Song',
+  '業務改革BPO（製薬PV領域）プロジェクトリーダー候補',
+  '財務・経営管理/M&Aコンサルタント_管理職',
+  '福岡オープンポジション',
+  'テクノロジー 戦略/アドバイザリー コンサルタント _管理職',
+  'オペレーショントランスフォーメーションコンサルタント（Experience Business）',
+  'システムコンサルタント・エンジニア（製造・流通領域）_管理職',
+  'インフラマネージドサービスコンサルタント_管理職',
+  'フロントエンドリードエンジニア_Song',
+  'Microsoftコンサルタント',
+  'セキュリティコンサルタント_管理職',
+  'テクノロジーセールス（IP-Asset）_管理職',
+  'フィジカルAIコンサルタント/エンジニア_管理職',
+  'モバイルリードエンジニア（iOS/Android/KMP/Flutter）_管理職_Song',
+  'DXソリューションアーキテクト/エンジニア_管理職',
+  'シニアブランドストラテジスト / コミュニケーション・ストラテジー ディレクター_管理職_Song',
+  'システムコンサルタント / ソリューションエンジニア（ServiceNow)',
+  'AMOコンサルタント / エンジニア / インフラエンジニア_管理職',
+  'モバイルリードエンジニア（iOS/Android/KMP/Flutter）_Song',
+  'プランナー',
+  'オペレーショントランスフォーメーションコンサルタント',
+  '【リスキル採用】クラウド ファースト アプリケーション コンサルタント / エンジニア',
+  '前橋オープンポジション_管理職',
+  'ソリューション・エンジニア（公共サービス・医療健康領域）',
+  'プロジェクトマネジャー',
+  'AIエンジニア',
+  '業務改革BPOプロジェクトメンバー / オペレーター（地域・職種限定）',
+  'クリエイティブディレクター_管理職_Song',
+  'インダストリーコンサルタント（銀行、証券、保険領域）',
+  'インダストリーコンサルタント（カスタマーフロント）【通信・メディア・ハイテク領域】_管理職_Song',
+  'サプライチェーン & オペレーションコンサルタント',
+  'データエンジニア_管理職',
+  'インダストリーコンサルタント（カスタマーフロント）【通信・メディア・ハイテク領域】_Song',
+  '財務・経営管理/M&Aコンサルタント',
+  'インフラマネージドサービスコンサルタント',
+  'ソリューション・エンジニア（公共サービス・医療健康領域）_管理職',
+  'クラウド戦略コンサルタント_管理職',
+  'テクノロジーセールス（リセール担当）_管理職',
+  'プロジェクトマネジャー_管理職',
+  '品質管理エキスパート_管理職',
+  'ITトランスフォーメーション・リアライゼイション_管理職',
+  'データコンサルタント',
+  'クラウドファーストネットワーク コンサルタント',
+  'テクノロジーアドバイザリー コンサルタント(テクノロジーストラテジー＆アドバイザリー)(HPS)',
+  'リスク＆コンプライアンスコンサルタント',
+  'ソフトウェアエンジニア（Non-Java)_管理職',
+  'インテリジェントオートメーション コンサルタント / エンジニア（業務変革×AI）_管理職',
+  'テクノロジーコンサルタント(金融領域)_管理職',
+  'インダストリーコンサルタント（産業機械、自動車、製薬、消費財・サービス、小売り領域）',
+  'テクノロジーアドバイザリー コンサルタント(金融領域)',
+  '【首都圏エリア】契約社員 - ビジネス コンサルティング本部',
+  'セールス （通信・メディア・ハイテク領域）- クライアント・グループ',
+  'Cybersecurity Business Group Role',
+  '【九州エリア】契約社員 - オペレーションズ コンサルティング本部',
+  '【関西エリア】契約社員 - オペレーションズ コンサルティング本部',
+  '【首都圏エリア】契約社員 - オペレーションズ コンサルティング本部(インサイドセールス)',
+];
+
+// ── API利用額トラッキング（バックグラウンド側で一元管理） ──────────────────
+// popup.js/content.jsは短命（ポップアップは閉じるとJSが即終了、content.jsは
+// ページ遷移で破棄される）なため、chrome.storage.localへの書き込みが完了する
+// 前にコンテキストごと消えて記録が失われることがある。永続的なservice worker
+// 側で一元的に書き込むことで、この取りこぼしを防ぐ。
+// 価格は100万トークンあたりのドル。モデルを足したらここにも必ず足すこと。
+// 載っていないモデルは費用が集計されず、上限にも当たらないまま使い続けられる
+const CLAUDE_PRICING = {
+  // 相談タブ（社内ナレッジへの質問）で使う。ナレッジを毎回まるごと送るため
+  // プロンプトキャッシュを効かせている
+  'claude-opus-4-8': { input: 5.00, output: 25.00 },
+  'claude-sonnet-5': { input: 3.00, output: 15.00 },
+  'claude-sonnet-4-6': { input: 3.00, output: 15.00 },
+  'claude-haiku-4-5-20251001': { input: 1.00, output: 5.00 },
+};
+
+async function recordApiCostInBackground(model, usage) {
+  const pricing = CLAUDE_PRICING[model];
+  // 黙って0円として扱うと、上限を設けた意味が無くなる。気づけるように残す
+  if (!pricing) console.warn(`[Snow-we] 価格表に無いモデルです。費用が集計されません: ${model}`);
+  if (!pricing || !usage) return null;
+  const cost = ((usage.input_tokens || 0) / 1e6) * pricing.input
+    + ((usage.output_tokens || 0) / 1e6) * pricing.output;
+  const today = new Date().toISOString().slice(0, 10);
+  const r = await chrome.storage.local.get(['apiCostStats']);
+  const stats = r.apiCostStats || { totalUSD: 0, byDate: {} };
+  stats.totalUSD = (stats.totalUSD || 0) + cost;
+  stats.byDate[today] = (stats.byDate[today] || 0) + cost;
+  const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+  for (const d of Object.keys(stats.byDate)) {
+    if (new Date(d).getTime() < cutoff) delete stats.byDate[d];
+  }
+  await chrome.storage.local.set({ apiCostStats: stats });
+  return stats;
+}
+
+// ── API利用額の上限 ───────────────────────────────────────────────
+// 利用額を表示するだけでは、気づいたときには使い切っている。「止まる仕組み」が
+// 無いと、使うほど際限なく積み上がる。呼び出しの直前に必ず上限を確認し、
+// 超えていたらAPIを叩かない。
+//
+// 上限は端末ごと（chrome.storage.local）。担当者ごとに歯止めがかかる形になる。
+// 0を設定すると無制限。設定タブから変更できる
+const API_BUDGET_DEFAULT = { dailyUSD: 10, monthlyUSD: 150 };
+
+async function getApiBudget() {
+  const { apiBudget } = await chrome.storage.local.get(['apiBudget']);
+  return {
+    dailyUSD: Number.isFinite(apiBudget?.dailyUSD) ? apiBudget.dailyUSD : API_BUDGET_DEFAULT.dailyUSD,
+    monthlyUSD: Number.isFinite(apiBudget?.monthlyUSD) ? apiBudget.monthlyUSD : API_BUDGET_DEFAULT.monthlyUSD,
+  };
+}
+
+function apiSpendSummary(stats) {
+  const today = new Date().toISOString().slice(0, 10);
+  const month = today.slice(0, 7);
+  const byDate = stats?.byDate || {};
+  const monthUSD = Object.entries(byDate)
+    .filter(([d]) => d.startsWith(month))
+    .reduce((sum, [, v]) => sum + (v || 0), 0);
+  return { todayUSD: byDate[today] || 0, monthUSD };
+}
+
+// APIを呼ぶ前に必ず通す。超えていたら ok:false を返し、呼び出し側は中止する。
+// 今回の費用は呼ぶ前には分からないため、厳密な上限ではなく歯止めとして扱う
+// （止まるのは上限を1回分超えた時点）
+async function checkApiBudget() {
+  const [budget, { apiCostStats }] = await Promise.all([
+    getApiBudget(),
+    chrome.storage.local.get(['apiCostStats']),
+  ]);
+  const spend = apiSpendSummary(apiCostStats);
+  if (budget.dailyUSD > 0 && spend.todayUSD >= budget.dailyUSD) {
+    return { ok: false, ...spend, budget,
+      reason: `本日のAPI利用額が上限に達しました（$${spend.todayUSD.toFixed(2)} / 上限 $${budget.dailyUSD.toFixed(2)}）。`
+        + '続ける場合は設定タブで上限を引き上げてください。' };
+  }
+  if (budget.monthlyUSD > 0 && spend.monthUSD >= budget.monthlyUSD) {
+    return { ok: false, ...spend, budget,
+      reason: `今月のAPI利用額が上限に達しました（$${spend.monthUSD.toFixed(2)} / 上限 $${budget.monthlyUSD.toFixed(2)}）。`
+        + '続ける場合は設定タブで上限を引き上げてください。' };
+  }
+  return { ok: true, ...spend, budget };
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'snowWeAutoRun') startAutoRun();
+  if (alarm.name === 'snowWeAnomalyCheck') checkAnomalies();
+  if (alarm.name === 'snowWeGasQueueFlush') flushGasScoutQueue();
+  if (alarm.name === 'snowWeSupabaseQueueFlush') flushSupabaseScoutQueue();
+  if (alarm.name === 'snowWeHeartbeat') sendHeartbeat('alarm');
+});
+
+// ── スカウト記録のバッチ送信キュー ──────────────────────────────────────
+// 以前は候補者を1件処理するたびに即座にGASへPOSTしていたが、RDSの一括送信等で
+// 候補者が短時間に連続処理されると、GAS側・拡張機能側の両方で書き込みが競合
+// しやすかった（このセッションで繰り返し見つかった不具合の根本原因）。
+// 個別リクエストを都度投げるのをやめ、いったんキューに積んでおいて数秒〜1分
+// おきにまとめて1回のリクエストで送る方式に変更。同時書き込みの発生回数
+// そのものを減らすことで、競合が起きる余地自体を小さくする。
+let _gasQueueChain = Promise.resolve();
+function withQueueLock(fn) {
+  const result = _gasQueueChain.then(fn, fn);
+  _gasQueueChain = result.catch(() => {});
+  return result;
+}
+
+function genQueueId() {
+  return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function enqueueGasScout(payload) {
+  return withQueueLock(async () => {
+    const { gasScoutQueue } = await chrome.storage.local.get(['gasScoutQueue']);
+    const queue = gasScoutQueue || [];
+    queue.push({ ...payload, _queueId: genQueueId() });
+    await chrome.storage.local.set({ gasScoutQueue: queue });
+  });
+}
+
+// enqueueGasScoutと同じ直列化キュー(withQueueLock)を通すことで、
+// 「キューを読む→送信対象として空にする」処理と新規追加が競合しないようにしている
+let _quickFlushTimer = null;
+function scheduleQuickFlush() {
+  if (_quickFlushTimer) return;
+  _quickFlushTimer = setTimeout(() => {
+    _quickFlushTimer = null;
+    flushGasScoutQueue();
+  }, 12000); // 12秒デバウンス：連続する候補者処理をより大きな1回のバッチにまとめて
+             // GASへのリクエスト本数自体を減らし、同時実行数の圧迫を緩和する
+             // （以前は4秒だったが、複数メンバーが同時にスカウト送信する時間帯に
+             // リクエストが集中し、GAS側の同時実行数上限に近づいていたと考えられるため延長）
+}
+
+chrome.alarms.get('snowWeGasQueueFlush', (existing) => {
+  if (!existing) {
+    // setTimeoutはサービスワーカーが途中で休止すると失われるため、
+    // 1分おきのアラームを取りこぼし時の保険にする
+    chrome.alarms.create('snowWeGasQueueFlush', { delayInMinutes: 1, periodInMinutes: 1 });
+  }
+});
+
+// 連続失敗に応じて再送間隔を自動的に延ばすサーキットブレーカー。
+// サービスワーカーはアイドル時に頻繁に再起動されメモリ上の変数が消えるため、
+// chrome.storage.localに状態を持たせて再起動をまたいでも機能するようにする
+// （30秒/1分/2分/4分/8分…と倍々に延ばし、最大15分でキャップ。GAS側の同時実行数
+// 上限を拡張機能側から圧迫し続けて悪化させる「再送の嵐」を防ぐのが目的。
+// キューの中身自体は消さないので、記録が失われることはなく間隔が空くだけ）
+async function getGasBackoffUntil() {
+  const { gasBackoff } = await chrome.storage.local.get(['gasBackoff']);
+  return gasBackoff?.nextRetryTs || 0;
+}
+async function recordGasSuccess() {
+  await chrome.storage.local.set({ gasBackoff: { consecutiveFailures: 0, nextRetryTs: 0 } });
+}
+async function recordGasFailure() {
+  const { gasBackoff } = await chrome.storage.local.get(['gasBackoff']);
+  const consecutiveFailures = (gasBackoff?.consecutiveFailures || 0) + 1;
+  const waitMs = Math.min(30000 * Math.pow(2, consecutiveFailures - 1), 15 * 60 * 1000);
+  await chrome.storage.local.set({
+    gasBackoff: { consecutiveFailures, nextRetryTs: Date.now() + waitMs }
+  });
+  console.warn(`[Snow-we] GASサーキットブレーカー作動: 連続失敗${consecutiveFailures}回、次回再送まで約${Math.round(waitMs / 1000)}秒待機`);
+}
+
+async function flushGasScoutQueue() {
+  return withQueueLock(async () => {
+    // バックオフ期間中は今回のフラッシュをスキップ（キューの中身はそのまま残る）
+    const backoffUntil = await getGasBackoffUntil();
+    if (Date.now() < backoffUntil) return;
+
+    const { gasSettings, gasScoutQueue } = await chrome.storage.local.get(['gasSettings', 'gasScoutQueue']);
+    const queue = gasScoutQueue || [];
+    if (queue.length === 0) return;
+    const secret = gasSettings?.secret || 'snowwe2024';
+    const urls = [gasSettings?.url, gasSettings?.dbUrl].filter((u, i, arr) => u && arr.indexOf(u) === i);
+    if (urls.length === 0) return; // GAS未設定。次回のアラームで再試行
+
+    // 送信対象をこの場でメモリ上に確保するだけで、保存領域からはまだ消さない。
+    // 以前は先にキューを空にしてから送信し、完了後に失敗分だけ書き戻していたが、
+    // 空にした直後〜書き戻す前にService Workerが強制終了されると、その回の
+    // 送信分がまるごと失われる（Manifest V3のService Workerはアイドル判定等で
+    // 処理の途中でも終了させられることがある）。実機でSupabase側の記録が原因不明で
+    // 大量欠落する事故があり、同じ構造の問題がこちらにも無いよう対策しておく。
+    // 取り除くのは結果が確定してから、かつ _queueId で個別に指定して行う
+    const body = JSON.stringify({ secret, action: 'recordScoutBatch', items: queue });
+    const results = await Promise.allSettled(urls.map(async url => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 25000);
+      try {
+        const r = await fetch(url, { method: 'POST', body, signal: controller.signal });
+        return await r.json();
+      } finally {
+        clearTimeout(timer);
+      }
+    }));
+    const anySuccess = results.some(r => r.status === 'fulfilled' && r.value?.ok !== false);
+
+    let removeIds = [];
+    let requeueItems = [];
+    if (anySuccess) {
+      await recordGasSuccess();
+      for (const item of queue) {
+        if (item.candidateId) await patchScoutHistoryEntry(item.candidateId, { gasSent: true });
+      }
+      removeIds = queue.map(it => it._queueId);
+      console.log(`[Snow-we] スカウト記録バッチ送信成功: ${queue.length}件`);
+    } else {
+      await recordGasFailure();
+      // 失敗の実際の理由を記録する（原因調査のため。rejectedならエラー内容、
+      // fulfilledでもok:falseならGASが返したエラーメッセージを出す）
+      results.forEach((r, i) => {
+        if (r.status === 'rejected') {
+          console.warn('[Snow-we] スカウト記録送信失敗の詳細 url=' + urls[i] + ':', r.reason?.message || r.reason);
+        } else if (r.value?.ok === false) {
+          console.warn('[Snow-we] スカウト記録送信、GASがエラーを返却 url=' + urls[i] + ':', r.value?.error || '(詳細不明)');
+        }
+      });
+      console.warn('[Snow-we] スカウト記録バッチ送信、全URLで失敗。キューに残します');
+      const retried = queue.map(it => ({ ...it, _attempts: (it._attempts || 0) + 1 }));
+      const giveUp = retried.filter(it => it._attempts >= 8); // 8回(約8分〜)失敗し続けたら諦めて人の確認に回す
+      const keep = retried.filter(it => it._attempts < 8);
+      for (const it of giveUp) {
+        if (it.candidateId) await patchScoutHistoryEntry(it.candidateId, { gasSent: false, retryCount: 8 });
+      }
+      removeIds = giveUp.map(it => it._queueId);
+      requeueItems = keep; // _attempts更新後の内容で戻すため、対象を消してから追加し直す
+    }
+
+    // このタイミングまでに新規追加された分と合流させる（withQueueLock内なので安全）。
+    // 今回処理した項目(成功・諦め)だけをidで取り除き、リトライする失敗分は更新後の
+    // 内容に差し替える
+    const removeSet = new Set(removeIds);
+    const requeueSet = new Set(requeueItems.map(it => it._queueId));
+    const { gasScoutQueue: currentQueue } = await chrome.storage.local.get(['gasScoutQueue']);
+    const merged = (currentQueue || [])
+      .filter(it => !removeSet.has(it._queueId) && !requeueSet.has(it._queueId))
+      .concat(requeueItems);
+    await chrome.storage.local.set({ gasScoutQueue: merged });
+  });
+}
+
+// ── Supabase(scoutsテーブル)への記録キュー ──────────────────────────────
+// GASと同じ「背景でキューに積んで自動リトライ」の考え方をSupabaseにも適用する。
+// ただしGASのバッチ方式（複数件を1リクエストにまとめる）はあえて採用しない。
+// 過去にGASで「1件のデータ不備でリクエスト全体がエラー扱いになり、既に成功
+// していた分まで含めて丸ごと再送され重複した」事故が起きたため、Supabaseでは
+// 1件ずつ完全に独立したリクエストとして送信する。ある1件が失敗しても他の件には
+// 一切影響しないので、束ねることで生まれる「巻き込まれ」の構造そのものがない。
+const SUPABASE_URL = 'https://ovwnyivqnqqiagutjxoo.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_tEQ4TOve0uCydsGiEm1cDA_D1LQ49wN';
+
+// ── 会社の Google アカウントでのログイン（Supabase Auth）─────────────────────
+// 公開キー（上の SUPABASE_KEY）は拡張に書かれていて誰でも読めるため、公開キーだけで
+// 承認待ちリスト（候補者の情報）を読み書きできる状態は危ない。会社の Google アカウント
+// （@snow-we.jp）でログインした人は、ログインした鍵で scouts / scout_queue を読み書きする。
+// 段階A：ログインしていない人は今までどおり公開キーで動く（何も止めない）。
+// 段階B：全員のログインを確かめてから、公開キーでの読み書きを Supabase 側で閉じる。
+const SUPABASE_AUTH_STORAGE = 'supabaseAuth';
+const SUPABASE_ALLOWED_EMAIL_DOMAIN = '@snow-we.jp';
+
+function _b64url(bytes) {
+  let s = '';
+  bytes.forEach(b => { s += String.fromCharCode(b); });
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function _pkcePair() {
+  const verifier = _b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return { verifier, challenge: _b64url(new Uint8Array(digest)) };
+}
+
+function _isAllowedEmail(email) {
+  return typeof email === 'string' && email.toLowerCase().endsWith(SUPABASE_ALLOWED_EMAIL_DOMAIN);
+}
+
+async function _saveSupabaseSession(data) {
+  const email = data.user && data.user.email;
+  const expiresAt = Number(data.expires_at) || Math.floor(Date.now() / 1000) + (Number(data.expires_in) || 3600);
+  const session = { access_token: data.access_token, refresh_token: data.refresh_token, expires_at: expiresAt, email };
+  await chrome.storage.local.set({ [SUPABASE_AUTH_STORAGE]: session });
+  return session;
+}
+
+async function supabaseLogin() {
+  const redirectTo = chrome.identity.getRedirectURL('supabase');
+  const { verifier, challenge } = await _pkcePair();
+  const authUrl = `${SUPABASE_URL}/auth/v1/authorize?provider=google`
+    + `&redirect_to=${encodeURIComponent(redirectTo)}`
+    + `&code_challenge=${challenge}&code_challenge_method=s256`
+    + `&hd=snow-we.jp&prompt=select_account`;
+  const responseUrl = await chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true });
+  const u = new URL(responseUrl);
+  const params = new URLSearchParams(u.search || u.hash.replace(/^#/, ''));
+  if (params.get('error')) throw new Error(params.get('error_description') || params.get('error'));
+  const code = params.get('code');
+  if (!code) throw new Error('ログインの結果を受け取れませんでした（Supabase の Redirect URLs に chromiumapp.org が入っているか確認してください）');
+
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=pkce`, {
+    method: 'POST',
+    headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ auth_code: code, code_verifier: verifier }),
+  });
+  if (!res.ok) throw new Error(`ログインに失敗しました (HTTP ${res.status})`);
+  const data = await res.json();
+  const email = data.user && data.user.email;
+  if (!_isAllowedEmail(email)) {
+    // 会社以外のアカウントでは使わない（Supabase 側の権限も @snow-we.jp だけに絞っている）
+    await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
+      method: 'POST',
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${data.access_token}` },
+    }).catch(() => {});
+    throw new Error(`会社のアカウント（${SUPABASE_ALLOWED_EMAIL_DOMAIN}）でログインしてください（${email || '不明'} は使えません）`);
+  }
+  const session = await _saveSupabaseSession(data);
+  return { email: session.email };
+}
+
+async function supabaseLogout() {
+  const { [SUPABASE_AUTH_STORAGE]: s } = await chrome.storage.local.get([SUPABASE_AUTH_STORAGE]);
+  await chrome.storage.local.remove(SUPABASE_AUTH_STORAGE);
+  if (s && s.access_token) {
+    await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
+      method: 'POST',
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${s.access_token}` },
+    }).catch(() => {});
+  }
+}
+
+// 鍵の更新は1度に1つだけ走らせる（同時に更新すると、使い回し検知で両方とも無効にされる）
+let _supabaseRefreshing = null;
+
+// ログイン中ならその人の鍵（期限が近ければ更新してから）を、そうでなければ null を返す
+async function getSupabaseAccessToken() {
+  const { [SUPABASE_AUTH_STORAGE]: s } = await chrome.storage.local.get([SUPABASE_AUTH_STORAGE]);
+  if (!s || !s.access_token || !_isAllowedEmail(s.email)) return null;
+  if (Number(s.expires_at) - 60 > Date.now() / 1000) return s.access_token;
+  if (!s.refresh_token) return null;
+
+  if (!_supabaseRefreshing) {
+    _supabaseRefreshing = (async () => {
+      try {
+        const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+          method: 'POST',
+          headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: s.refresh_token }),
+        });
+        if (res.status >= 400 && res.status < 500) {
+          // 更新できない鍵（取り消された・長く使わず失効した）。ログアウト扱いにして公開キーに戻す
+          await chrome.storage.local.remove(SUPABASE_AUTH_STORAGE);
+          return null;
+        }
+        if (!res.ok) return null; // 一時的な障害。今回は公開キーで動かし、次の機会にまた更新する
+        const session = await _saveSupabaseSession(await res.json());
+        return session.access_token;
+      } catch (_) {
+        return null;
+      } finally {
+        _supabaseRefreshing = null;
+      }
+    })();
+  }
+  return _supabaseRefreshing;
+}
+
+async function getSupabaseAuthStatus() {
+  const { [SUPABASE_AUTH_STORAGE]: s } = await chrome.storage.local.get([SUPABASE_AUTH_STORAGE]);
+  return { loggedIn: !!(s && s.access_token && _isAllowedEmail(s.email)), email: (s && s.email) || null };
+}
+
+// scouts / scout_queue への読み書き。ログイン中はその人の鍵で送り、鍵が通らなかったとき（401）は
+// 公開キーで送り直す（段階Aでは公開キーでも書けるので、ログインの不調で記録を落とさない）
+async function supabaseUserFetch(url, init = {}) {
+  const token = await getSupabaseAccessToken().catch(() => null);
+  const withKey = key => ({ ...init, headers: { ...(init.headers || {}), apikey: SUPABASE_KEY, Authorization: `Bearer ${key}` } });
+  const res = await fetch(url, withKey(token || SUPABASE_KEY));
+  if (token && res.status === 401) return fetch(url, withKey(SUPABASE_KEY));
+  return res;
+}
+
+// ポジションマスタ（名称・募集要件）。スプレッドシート手動運用から脱却するため、
+// GASの「ポジション」シートではなくSupabaseの positions テーブルを正として参照する。
+// nameForFilter を渡すとその名称と完全一致する1件だけを取得する。
+async function fetchSupabasePositions(nameForFilter) {
+  const cols = 'name,source,business_overview,required_skills,preferred_skills,desired_profile';
+  const filter = nameForFilter ? `&name=eq.${encodeURIComponent(nameForFilter)}` : '&order=name.asc';
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/positions?select=${cols}${filter}`, {
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+  });
+  if (!res.ok) throw new Error(`Supabase positions取得失敗: ${res.status}`);
+  return res.json();
+}
+
+function buildPositionRequirementsText(row) {
+  const parts = [];
+  if (row.business_overview) parts.push('【業務概要】' + row.business_overview);
+  if (row.required_skills)   parts.push('【必須スキル・経験】' + row.required_skills);
+  if (row.preferred_skills)  parts.push('【歓迎スキル・経験】' + row.preferred_skills);
+  if (row.desired_profile)   parts.push('【求める人物像】' + row.desired_profile);
+  return parts.join(' / ').substring(0, 2000);
+}
+
+// ── 候補者管理システムのポジションAPI ──────────────────────────────────
+// ポジションマスタの正は候補者管理システム側に移した。Supabaseのpositionsは
+// アクセンチュア偏重(175/250)でURLを持たず、歓迎スキル・求める人物像は全件空
+// だったのに対し、こちらは全ファーム・全件にURLと職務内容・応募要件が揃っている。
+// Supabase経路はAPIに到達できないときのフォールバックとして残す。
+const POSITIONS_API_URL = 'https://143-198-195-132.nip.io/api/positions';
+const POSITIONS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+// firm列は英語表記で入っているため、スカウト文面にそのまま差し込めない
+const FIRM_JA = {
+  'Accenture': 'アクセンチュア',
+  'Deloitte': 'デロイト トーマツ コンサルティング',
+  'EY': 'EYストラテジー・アンド・コンサルティング',
+  'PwC': 'PwCコンサルティング',
+  'KPMG': 'KPMGコンサルティング',
+  'future': 'フューチャー',
+  'Dirbato': 'Dirbato',
+  'アビーム': 'アビームコンサルティング',
+  'ベイカレント': 'ベイカレント・コンサルティング',
+  'カタリス': 'カタリス',
+  '日立コンサルティング': '日立コンサルティング',
+};
+function firmToJa(firm) {
+  return FIRM_JA[firm] || firm || '';
+}
+
+// ポジションの表示名。同じ職種名が複数ファームに存在するため、ファーム名を
+// 含めないと選択・記録した求人がどのファームのものか判別できなくなる。
+// この文字列がそのまま currentPosition として保存され、Supabaseのscouts.position
+// にも記録される
+const POSITION_LABEL_SEPARATOR = '｜';
+function positionLabel(p) {
+  const firm = firmToJa(p.firm);
+  return firm ? `${firm}${POSITION_LABEL_SEPARATOR}${p.title}` : (p.title || '');
+}
+
+// ポジション提案のStep1（全件からの絞り込み）でAIに見せる1行。職務内容を読む前の
+// 段階なので、ここに何を入れるかで絞り込みの精度がそのまま決まる。
+//
+// ・勤務地は入れない。住所が丸ごと入っている求人があり（「本社：東京都千代田区
+//   大手町1-9-7 / 大手町フィナンシャルシティ / …（変更の範囲）…」）、850件分では
+//   万単位の文字数になる。先頭だけに切り詰めても「本社：東京都千代田区大手」の
+//   ような断片にしかならず判断材料にならない。勤務地はStep2（絞り込んだ十数件の
+//   詳細）に含まれており、そちらで考慮されるので、ここで持つ必要がない。
+// ・categoryLabelはファームによって英語（アクセンチュア: Consulting,
+//   Software Engineering）と日本語（EY: 戦略コンサルティング）が混在している。
+//   日本語の候補者プロフィールと突き合わせる以上、英語のファームが不利になるため、
+//   日本語で統一されている industry を使う。
+function buildPositionMatchText(p) {
+  return [p.title, p.industry].filter(Boolean).join(' / ');
+}
+
+const POSITION_REQUIREMENTS_MAX_CHARS = 1200;
+
+function buildApiPositionRequirementsText(p) {
+  const parts = [];
+  if (p.categoryLabel)  parts.push('【カテゴリ】' + p.categoryLabel);
+  if (p.location)       parts.push('【勤務地】' + p.location);
+  if (p.jobContent)     parts.push('【職務内容】' + p.jobContent);
+  if (p.qualification)  parts.push('【応募要件】' + p.qualification);
+  // 1件あたりの上限。最後の順位付けで30件ぶんをAIに渡すため、ここが費用を直接決める。
+  // 2,500字だと30件で約44,000トークン＝1回$0.049かかっていた（実測）。
+  // 募集要件の後半は「働き方」「選考プロセス」などの定型文が多く、
+  // どの候補者に合うかの判断にはほとんど効かないため、冒頭側を残して切る
+  return parts.join(' / ').substring(0, POSITION_REQUIREMENTS_MAX_CHARS);
+}
+
+// トークンを差し替えたら、サービスワーカー内のメモリキャッシュも捨てる。
+// storage側のキャッシュだけ消しても、こちらが生きていると古い一覧を返し続ける
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.positionsApiToken) _positionsMemCache = null;
+});
+
+// ポジションAPIは共有トークンを持たない。
+//
+// 一度、トークンをここに埋め、そのためにリポジトリを非公開にした。すると
+// 更新スクリプト自体を取りに行く git pull に認証が要るようになり、新しい
+// ファイルを全員に手渡ししないと更新できなくなった。運用が回らないので戻した。
+//
+// サーバー側は「Chrome拡張機能からの呼び出しであること」と呼び出し回数で
+// 絞っている。どちらも配るものが無いので、リポジトリを公開にしておける。
+//
+// 設定タブで入力があれば送る余地だけ残してある（サーバー側でトークンを
+// 有効にしたときや、拡張機能以外から確認したいときのため）。通常は空欄。
+async function getPositionsApiToken() {
+  const { positionsApiToken } = await chrome.storage.local.get(['positionsApiToken']);
+  return (positionsApiToken || '').trim();
+}
+
+// scout側のAPIに「拡張機能からの呼び出しである」と伝えるための印。
+//
+// もともとは Origin ヘッダ（chrome-extension://…）で判定していたが、拡張機能の
+// サービスワーカーから出す素のGETには Origin が付かない。実機で確認したところ、
+// /api/positions も /api/knowledge も401になっており、ポジション取得は
+// Supabaseへのフォールバックで動いていた。失敗しても次の手段で成功するため、
+// 誰も気づけなかった。
+//
+// 防御の強さは変わらない（Originもこのヘッダも、偽装の手間は同じ）。実際の
+// 歯止めは呼び出し回数の制限のほうで、こちらは変えていない。違うのは、
+// この印は拡張機能が自分で付けるので、確実に届くという点だけ
+const SNOWWE_CLIENT_HEADER = { 'X-Snowwe-Client': 'extension' };
+
+async function scoutApiHeaders(extra = {}) {
+  const token = await getPositionsApiToken();
+  return {
+    ...SNOWWE_CLIENT_HEADER,
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...extra,
+  };
+}
+
+// 社内ナレッジ（scout側のFAQ）。相談タブが参照する。
+// ポジションと同じ認証・同じ経路で取る。Supabaseの公開鍵で直接読むと、
+// 拡張機能のリポジトリが公開されている以上、誰でも読める状態になる
+const KNOWLEDGE_API_URL = 'https://143-198-195-132.nip.io/api/knowledge';
+
+async function fetchKnowledgeApi() {
+  const res = await fetch(KNOWLEDGE_API_URL, { headers: await scoutApiHeaders() });
+  if (!res.ok) {
+    throw new Error(res.status === 401
+      ? 'ナレッジAPIの認証に失敗しました。update を実行して拡張機能を最新にしてください。'
+      : `ナレッジ取得失敗: ${res.status}`);
+  }
+  const data = await res.json();
+  return data.items || [];
+}
+
+async function fetchPositionsApi(query) {
+  const res = await fetch(`${POSITIONS_API_URL}?${query}`, { headers: await scoutApiHeaders() });
+  if (!res.ok) {
+    throw new Error(res.status === 401
+      ? 'ポジションAPIの認証に失敗しました。拡張機能が古い可能性があります。update を実行して最新にしてください。'
+      : `ポジションAPI取得失敗: ${res.status}`);
+  }
+  const data = await res.json();
+  return data.positions || [];
+}
+
+// 軽量版の一覧。職務内容・応募要件を含む全件は約4MBあり、chrome.storageの
+// 容量を圧迫するうえAIにも渡しきれないため、一覧はこちらだけをキャッシュし、
+// 詳細は必要になった数件だけ fetchPositionDetails で取りに行く
+let _positionsMemCache = null;
+async function fetchPositionsCompact(forceRefresh) {
+  const now = Date.now();
+  if (!forceRefresh && _positionsMemCache && now - _positionsMemCache.fetchedAt < POSITIONS_CACHE_TTL_MS) {
+    return _positionsMemCache.positions;
+  }
+
+  const { positionsCache } = await chrome.storage.local.get(['positionsCache']);
+  const cached = positionsCache;
+  if (!forceRefresh && cached?.positions?.length && now - (cached.fetchedAt || 0) < POSITIONS_CACHE_TTL_MS) {
+    _positionsMemCache = cached;
+    return cached.positions;
+  }
+
+  try {
+    const positions = await fetchPositionsApi('compact=1');
+    if (positions.length > 0) {
+      const entry = { fetchedAt: now, positions };
+      _positionsMemCache = entry;
+      await chrome.storage.local.set({ positionsCache: entry });
+      console.log('[Snow-we] ポジションAPI: 一覧を更新', positions.length, '件');
+      return positions;
+    }
+    console.warn('[Snow-we] ポジションAPI: 応答が0件');
+  } catch (e) {
+    console.warn('[Snow-we] ポジションAPI取得失敗:', e.message);
+  }
+
+  // 取得できなかったときは期限切れのキャッシュでも使う。一覧が空になると
+  // ポジション選択そのものができなくなり、生成も記録も止まってしまうため
+  if (cached?.positions?.length) {
+    console.warn('[Snow-we] ポジションAPI: 期限切れキャッシュで代用', cached.positions.length, '件');
+    return cached.positions;
+  }
+  return [];
+}
+
+// ポジションごとのスカウト文面。候補者管理システムの画面にある「スカウト文を作成」と
+// 同じテンプレートを使う（ファームごとの年収レンジ・強み・残業訴求の出し分けを含む）。
+// 拡張機能側で作り直すと二重管理になり、テンプレートを直したときに片方だけ古いまま
+// 残ってしまうため、文面の組み立てはサーバーに任せる
+async function fetchScoutTemplate(id) {
+  const res = await fetch(`${POSITIONS_API_URL}/scout-template?id=${encodeURIComponent(id)}`, {
+    headers: await scoutApiHeaders(),
+  });
+  if (!res.ok) throw new Error(`スカウト文面の取得に失敗しました (${res.status})`);
+  return res.json();
+}
+
+// 候補者の職務経歴に近い求人を、候補者管理システムに探してもらう。
+//
+// 絞り込みをこちら側でやらないのは、方式を2度変えて2度とも同じ場所で失敗したため。
+//   ・AIに全件の求人名を見せて選ばせる → 一覧の途中がまるごと読み飛ばされる
+//     （実機でアクセンチュア352件から0件。先頭352行が無視されていた）
+//   ・語彙の辞書で機械的に採点する → 求人名の多くは中身を表しておらず
+//     （「戦略コンサルタント」等）、辞書に無い言い回しの候補者が落ちる
+// サーバー側では、求人を「どんな経歴の人に向いた仕事か」に要約したうえでベクトル化
+// してあり、候補者の職務経歴も同じ方法でベクトルにして意味の近さで比べる。
+// 「需給調整」と「S&OP」のように言い方が違うだけで落ちることがない。
+//
+// ベクトル化には別ベンダーのAPIキーが要るが、それをここに置くわけにはいかない
+// （このリポジトリに載る）ので、計算はサーバー側で完結させ、結果だけ受け取る。
+async function fetchPositionMatches(profileText, limit) {
+  const res = await fetch(`${POSITIONS_API_URL}/match`, {
+    method: 'POST',
+    headers: await scoutApiHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ profileText, limit }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `求人の検索に失敗しました (${res.status})`);
+  }
+  return data;
+}
+
+async function fetchPositionDetails(ids) {
+  const unique = [...new Set((ids || []).filter(Boolean))];
+  if (unique.length === 0) return [];
+  const out = [];
+  // APIは1リクエスト200件までなので分割して取得する
+  for (let i = 0; i < unique.length; i += 100) {
+    const chunk = unique.slice(i, i + 100);
+    out.push(...await fetchPositionsApi(`ids=${encodeURIComponent(chunk.join(','))}`));
+  }
+  return out;
+}
+
+// 表示名からポジションを引く。ファーム名付きの新形式だけでなく、旧形式
+// （Supabaseのポジション名そのまま）で保存された currentPosition からも
+// 引けるように、職種名だけの一致も見る
+async function findPositionByLabel(label) {
+  const target = (label || '').trim();
+  if (!target) return null;
+  const positions = await fetchPositionsCompact();
+  const exact = positions.find(p => positionLabel(p) === target);
+  if (exact) return exact;
+  return positions.find(p => (p.title || '').trim() === target) || null;
+}
+
+let _supabaseQueueChain = Promise.resolve();
+function withSupabaseQueueLock(fn) {
+  const result = _supabaseQueueChain.then(fn, fn);
+  _supabaseQueueChain = result.catch(() => {});
+  return result;
+}
+
+async function enqueueSupabaseScout(payload) {
+  return withSupabaseQueueLock(async () => {
+    const { supabaseScoutQueue } = await chrome.storage.local.get(['supabaseScoutQueue']);
+    const queue = supabaseScoutQueue || [];
+    queue.push({ ...payload, _queueId: genQueueId() });
+    await chrome.storage.local.set({ supabaseScoutQueue: queue });
+  });
+}
+
+let _supabaseQuickFlushTimer = null;
+function scheduleSupabaseQuickFlush() {
+  if (_supabaseQuickFlushTimer) return;
+  _supabaseQuickFlushTimer = setTimeout(() => {
+    _supabaseQuickFlushTimer = null;
+    flushSupabaseScoutQueue();
+  }, 12000);
+}
+
+chrome.alarms.get('snowWeSupabaseQueueFlush', (existing) => {
+  if (!existing) {
+    chrome.alarms.create('snowWeSupabaseQueueFlush', { delayInMinutes: 1, periodInMinutes: 1 });
+  }
+});
+
+// GASのサーキットブレーカーと同じ考え方だが、状態は別のキーで独立管理する
+// （Supabase側の不調がGAS送信を止めたり、その逆が起きたりしないようにするため）
+async function getSupabaseBackoffUntil() {
+  const { supabaseBackoff } = await chrome.storage.local.get(['supabaseBackoff']);
+  return supabaseBackoff?.nextRetryTs || 0;
+}
+async function recordSupabaseSuccess() {
+  await chrome.storage.local.set({ supabaseBackoff: { consecutiveFailures: 0, nextRetryTs: 0 } });
+}
+async function recordSupabaseFailure() {
+  const { supabaseBackoff } = await chrome.storage.local.get(['supabaseBackoff']);
+  const consecutiveFailures = (supabaseBackoff?.consecutiveFailures || 0) + 1;
+  const waitMs = Math.min(30000 * Math.pow(2, consecutiveFailures - 1), 15 * 60 * 1000);
+  await chrome.storage.local.set({
+    supabaseBackoff: { consecutiveFailures, nextRetryTs: Date.now() + waitMs }
+  });
+  console.warn(`[Snow-we] Supabaseサーキットブレーカー作動: 連続失敗${consecutiveFailures}回、次回再送まで約${Math.round(waitMs / 1000)}秒待機`);
+}
+
+const SUPABASE_PERMANENT_MAX_ATTEMPTS = 3;
+const SUPABASE_DEAD_LETTER_MAX = 200;
+
+// 送り直しても結果が変わらない失敗か。ステータスが無い（通信自体の失敗・タイムアウト）は
+// 一時的なものとして扱う
+function isPermanentSupabaseError(reason) {
+  const status = reason && reason.status;
+  if (!status) return false;
+  if (status === 408 || status === 429) return false;
+  return status >= 400 && status < 500;
+}
+
+async function moveToSupabaseDeadLetter(items) {
+  try {
+    const { supabaseDeadLetter } = await chrome.storage.local.get(['supabaseDeadLetter']);
+    const list = (supabaseDeadLetter || []).concat(items.map(it => ({ ...it, _deadAt: Date.now() })));
+    await chrome.storage.local.set({ supabaseDeadLetter: list.slice(-SUPABASE_DEAD_LETTER_MAX) });
+  } catch (_) {}
+
+  let recruiter = '';
+  let version = '';
+  try {
+    const r = await chrome.storage.local.get(['gasSettings', 'recruiterName']);
+    recruiter = (r.gasSettings && r.gasSettings.recruiter) || r.recruiterName || '';
+  } catch (_) {}
+  try { version = chrome.runtime.getManifest().version; } catch (_) {}
+
+  for (const it of items) {
+    try {
+      // content.js の reportRecordFailure と同じテーブル・同じ列。
+      // button_text にエラー内容、page_path に候補者IDを入れる
+      await fetch(`${SUPABASE_URL}/rest/v1/scout_record_failures`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          recruiter_name: recruiter,
+          platform: (it.data && it.data.platform) || '',
+          reason: 'Supabaseへの保存を諦めた',
+          button_text: it._lastError || '',
+          page_path: String(it.candidateId || '').slice(0, 300),
+          ext_version: version,
+        }),
+      });
+    } catch (_) {}
+  }
+}
+
+async function flushSupabaseScoutQueue() {
+  return withSupabaseQueueLock(async () => {
+    // バックオフ期間中は今回のフラッシュをスキップ（キューの中身はそのまま残る）
+    const backoffUntil = await getSupabaseBackoffUntil();
+    if (Date.now() < backoffUntil) return;
+
+    const { supabaseScoutQueue } = await chrome.storage.local.get(['supabaseScoutQueue']);
+    const queue = supabaseScoutQueue || [];
+    if (queue.length === 0) return;
+
+    // 送信対象をこの場でメモリ上に確保するだけで、保存領域からはまだ消さない。
+    // 以前は先にキューを空にしてから送信し、完了後に失敗分だけ書き戻していたが、
+    // 空にした直後〜書き戻す前にService Workerが強制終了されると、その回の
+    // 送信分がまるごと失われる（Manifest V3のService Workerはアイドル判定等で
+    // 処理の途中でも終了させられることがある）。実機でSupabase側の記録だけが
+    // 原因不明に大量欠落する現象が確認されており、これが原因だった可能性が高い。
+    // 取り除くのは結果が確定してから、かつ _queueId で個別に指定して行う
+
+    // 1件ずつ独立したリクエストとして送る（束ねない）。ある1件が失敗しても
+    // Promise.allSettledなので他の件の成否には一切影響しない
+    const results = await Promise.allSettled(queue.map(async item => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      try {
+        const res = await supabaseUserFetch(`${SUPABASE_URL}/rest/v1/scouts`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify(item.data),
+          signal: controller.signal,
+        });
+        // 409 は同じ行が既に入っている＝前回の送信は届いていた（応答だけ失われた）。
+        // 失敗として再送し続けると、最後に諦めて「届いていない」と誤って報告してしまう
+        if (res.status === 409) return;
+        if (!res.ok) {
+          const err = new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+          err.status = res.status;
+          throw err;
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }));
+
+    const succeeded = [];
+    const failed = [];
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') succeeded.push(queue[i]);
+      else failed.push({ item: queue[i], reason: r.reason });
+    });
+
+    for (const item of succeeded) {
+      if (item.candidateId) await patchScoutHistoryEntry(item.candidateId, { supabaseSent: true });
+    }
+
+    // 1件でも成功していれば疎通は問題ないと判断し、バックオフはリセットする
+    // （個別のデータ不備でリトライが必要な場合でも、他の送信まで遅らせない）
+    if (succeeded.length > 0) await recordSupabaseSuccess();
+    // 全件失敗した場合のみ、Supabase側/ネットワーク側の不調とみなしてバックオフを効かせる
+    if (failed.length > 0 && failed.length === queue.length) await recordSupabaseFailure();
+
+    let giveUp = [];
+    let keep = [];
+    if (failed.length > 0) {
+      failed.forEach(f => console.warn('[Snow-we] Supabase scouts保存失敗:', f.item.candidateId, f.reason?.message || f.reason));
+      // 以前は理由を問わず8回失敗したら捨てていた。再送は1分おきなので、通信障害や
+      // Supabase側の不調が8分続くだけで記録が消え、どこにも残らなかった（分類E）。
+      // 通信の失敗・5xx・408・429 は待てば通る見込みがあるので諦めない。
+      // 諦めるのは、何度送っても同じ結果になる 4xx（項目の不備・権限）だけにする
+      const retried = failed.map(f => ({
+        ...f.item,
+        _attempts: (f.item._attempts || 0) + 1,
+        _lastError: String(f.reason?.message || f.reason || '').slice(0, 200),
+        _permanent: isPermanentSupabaseError(f.reason),
+      }));
+      giveUp = retried.filter(it => it._permanent && it._attempts >= SUPABASE_PERMANENT_MAX_ATTEMPTS);
+      keep = retried.filter(it => !giveUp.includes(it));
+      for (const it of giveUp) {
+        if (it.candidateId) await patchScoutHistoryEntry(it.candidateId, { supabaseSent: false, supabaseRetryCount: it._attempts, supabaseGaveUp: true });
+        console.warn('[Snow-we] Supabase scouts保存を諦めました:', it.candidateId, it._lastError);
+      }
+      // 諦めた件は捨てずに端末に残し、何が起きたかを自己申告する。
+      // 記録の中身はあとから手で入れ直せるように保存しておく
+      if (giveUp.length > 0) await moveToSupabaseDeadLetter(giveUp);
+    } else if (succeeded.length > 0) {
+      console.log(`[Snow-we] Supabase scouts保存成功: ${succeeded.length}件`);
+    }
+
+    // このタイミングまでに新規追加された分と合流させる（withSupabaseQueueLock内なので安全）。
+    // 今回処理した項目(成功・諦め)だけをidで取り除き、リトライする失敗分は
+    // _attempts更新後の内容に差し替える
+    const removeSet = new Set([...succeeded, ...giveUp].map(it => it._queueId));
+    const keepSet = new Set(keep.map(it => it._queueId));
+    const { supabaseScoutQueue: currentQueue } = await chrome.storage.local.get(['supabaseScoutQueue']);
+    const merged = (currentQueue || [])
+      .filter(it => !removeSet.has(it._queueId) && !keepSet.has(it._queueId))
+      .concat(keep);
+    await chrome.storage.local.set({ supabaseScoutQueue: merged });
+  });
+}
+
+// ── 生存報告 ────────────────────────────────────────────────────────────
+// 自動記録のいちばんの盲点は「拡張が動いていない人がいても誰も気づけない」ことだった。
+// 実データで担当者ごとにバージョン1.27と1.36が混在していた。ある人の記録がゼロでも、
+// 送っていないのか、拡張が無効・古い・別プロファイル・別ブラウザなのかが区別できず、
+// 他のどの集計も信用できなくなる。
+//
+// ブラウザが動いている間だけ定期的に状態を報告する。報告が来ない＝その端末では
+// 拡張が動いていない、という読み方ができるようにするため、追記のみで履歴を残す
+// （1端末あたり1日6件程度）。最新の状態は install_id ごとの最新行を見る。
+async function getInstallId() {
+  const { snowWeInstallId } = await chrome.storage.local.get(['snowWeInstallId']);
+  if (snowWeInstallId) return snowWeInstallId;
+  // 同じ担当者が2台のPCやプロファイルで使っている場合を区別するための端末識別子。
+  // 個人を特定する情報は含めない（ランダム値）
+  const id = (self.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  await chrome.storage.local.set({ snowWeInstallId: id });
+  return id;
+}
+
+async function sendHeartbeat(trigger) {
+  try {
+    const store = await chrome.storage.local.get([
+      'gasSettings', 'recruiterName', 'scoutHistory', 'supabaseScoutQueue', 'gasScoutQueue', SUPABASE_AUTH_STORAGE,
+    ]);
+    const installId = await getInstallId();
+    const recruiter = (store.gasSettings && store.gasSettings.recruiter) || store.recruiterName || '';
+
+    // ローカルの記録から、その端末が実際に使われているかを数える。
+    // 未送信の滞留件数も一緒に出す（記録はしたが届いていない件が溜まっていても
+    // これまで誰も見ていなかった＝分類Eの盲点）
+    const now = Date.now();
+    const DAY = 24 * 60 * 60 * 1000;
+    let lastScoutAt = 0;
+    let scouts1d = 0;
+    let scouts7d = 0;
+    for (const h of Object.values(store.scoutHistory || {})) {
+      const t = Number(h && h.date) || 0;
+      if (!t) continue;
+      if (t > lastScoutAt) lastScoutAt = t;
+      if (now - t < DAY) scouts1d++;
+      if (now - t < 7 * DAY) scouts7d++;
+    }
+
+    let version = '';
+    try { version = chrome.runtime.getManifest().version; } catch (_) {}
+
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/extension_heartbeats`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        install_id: installId,
+        recruiter_name: recruiter,
+        ext_version: version,
+        trigger_source: trigger,
+        browser: (navigator.userAgent || '').slice(0, 200),
+        last_scout_at: lastScoutAt ? new Date(lastScoutAt).toISOString() : null,
+        scouts_1d: scouts1d,
+        scouts_7d: scouts7d,
+        queued_supabase: (store.supabaseScoutQueue || []).length,
+        queued_gas: (store.gasScoutQueue || []).length,
+        // 会社の Google アカウントでログインしているか（全員がログインしたかを確かめてから段階Bに進むため）
+        auth_email: (store[SUPABASE_AUTH_STORAGE] && store[SUPABASE_AUTH_STORAGE].email) || null,
+      }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    console.log(`[Snow-we] 生存報告を送信しました (${trigger}) 担当者:"${recruiter}" 版:${version}`);
+  } catch (e) {
+    // 報告が失敗しても本来の動作には影響させない。報告が届かないこと自体が
+    // 「その端末では動いていない」という同じ結論になる
+    console.warn('[Snow-we] 生存報告に失敗:', e && e.message);
+  }
+}
+
+// ── バージョンの確認 ──────────────────────────────────────────────────
+// 2026-10-01 の実データで、直近7日の記録に v1.35 以降が1件も無かった。いちばん多いのは
+// 1.27.0（RDS 355件・bizreach 298件）。更新は各自が update.bat を実行して
+// chrome://extensions で再読み込みする手作業で、古いままでも誰も気づかない。
+// どれだけ直しても届かないので、記録漏れの最大の原因になっていた（分類G）。
+//
+// ① 手元のファイルが新しくなっていたら（update.bat は実行したが再読み込みしていない）、
+//    自分で再読み込みする。開発者モードで読み込んだ拡張は、再読み込みでディスクから読み直す
+// ② GitHub の main と比べて古ければ、媒体の画面に警告を出す（content.js が表示する）
+const LATEST_MANIFEST_URL = 'https://raw.githubusercontent.com/taichi536/snowwe-extension/main/manifest.json';
+// 「この版より前では送らせない」最低バージョン。記録が誤った内容になる不具合を
+// 直したときだけ上げる。通常の更新では上げない（毎回止まると仕事にならない）
+const MIN_VERSION_URL = 'https://raw.githubusercontent.com/taichi536/snowwe-extension/main/min-version.json';
+
+function compareVersions(a, b) {
+  const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+async function checkVersions() {
+  let current = '';
+  try { current = chrome.runtime.getManifest().version; } catch (_) { return; }
+
+  // ①
+  try {
+    const disk = await (await fetch(chrome.runtime.getURL('manifest.json'), { cache: 'no-store' })).json();
+    if (disk && compareVersions(disk.version, current) > 0) {
+      // 送信の最中に再読み込みすると、開いているタブの記録処理が切り離される。
+      // 直近2分にスカウトの記録が無いときだけ行う（記録は退避の仕組みで失われないが、念のため）
+      const { scoutHistory } = await chrome.storage.local.get(['scoutHistory']);
+      const last = Math.max(0, ...Object.values(scoutHistory || {}).map(h => Number(h && h.date) || 0));
+      if (Date.now() - last > 2 * 60 * 1000) {
+        console.log(`[Snow-we] 手元のファイルが新しくなっているため再読み込みします: ${current} → ${disk.version}`);
+        await chrome.storage.local.set({ selfReloadedAt: Date.now(), selfReloadedFrom: current });
+        chrome.runtime.reload();
+        return;
+      }
+    }
+  } catch (_) {}
+
+  // ②
+  try {
+    const res = await fetch(LATEST_MANIFEST_URL, { cache: 'no-store' });
+    if (!res.ok) return;
+    const latest = (await res.json()).version;
+    await chrome.storage.local.set({
+      versionStatus: { current, latest, outdated: compareVersions(latest, current) > 0, checkedAt: Date.now() },
+    });
+  } catch (_) {}
+
+  // ③ 最低バージョン。これを下回る版では送信そのものを止める。
+  // 取得に失敗したときは何も保存しない（取得できないことを理由に止めない）
+  try {
+    const res = await fetch(MIN_VERSION_URL, { cache: 'no-store' });
+    if (!res.ok) return;
+    const j = await res.json();
+    if (!j || !j.min) return;
+    await chrome.storage.local.set({
+      minVersion: {
+        min: String(j.min),
+        message: String(j.message || ''),
+        blocked: compareVersions(j.min, current) > 0,
+        checkedAt: Date.now(),
+      },
+    });
+  } catch (_) {}
+}
+
+chrome.alarms.get('snowWeVersionCheck', (existing) => {
+  if (!existing) chrome.alarms.create('snowWeVersionCheck', { delayInMinutes: 1, periodInMinutes: 30 });
+});
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === 'snowWeVersionCheck') checkVersions(); });
+chrome.runtime.onStartup.addListener(() => checkVersions());
+chrome.runtime.onInstalled.addListener(() => checkVersions());
+
+// 4時間おき。ブラウザを開いた日は必ず1件以上届くため「その日動いていたか」が分かる。
+// ブラウザを閉じている間は届かないが、それは報告すべき状態ではないので問題にしない
+chrome.alarms.get('snowWeHeartbeat', (existing) => {
+  if (!existing) {
+    chrome.alarms.create('snowWeHeartbeat', { delayInMinutes: 2, periodInMinutes: 4 * 60 });
+  }
+});
+chrome.runtime.onStartup.addListener(() => sendHeartbeat('startup'));
+chrome.runtime.onInstalled.addListener(details => sendHeartbeat(details.reason || 'installed'));
+
+// scoutHistoryの1件だけを、書き込み直前に読み直してから安全に更新する
+// （content.js側の同名ヘルパーと同じ考え方。詳細はそちらのコメント参照）
+async function patchScoutHistoryEntry(candidateId, patch) {
+  try {
+    const { scoutHistory } = await chrome.storage.local.get(['scoutHistory']);
+    const latest = scoutHistory || {};
+    if (!latest[candidateId]) return; // 既に削除・変更されている場合は上書きしない
+    latest[candidateId] = { ...latest[candidateId], ...patch };
+    await chrome.storage.local.set({ scoutHistory: latest });
+  } catch (_) {}
+}
+
+// ② GAS側が検知した「空欄で記録された」件について、ローカルにある正しい値で
+// GAS側の空欄セルを自動で埋める（fixField）。ローカルに対応データが無い、
+// または部分的にしか直せない場合だけ、人の確認が必要な残件として返す。
+async function autoRepairAnomalies(url, secret, serverAnomalies, scoutHistory) {
+  const remaining = [];
+  const { gasSettings } = await chrome.storage.local.get(['gasSettings']);
+  for (const a of serverAnomalies) {
+    const h = a.candidateId ? (scoutHistory || {})[a.candidateId] : null;
+    const fields = {};
+    if (h) {
+      if (a.missing.includes('担当者') && gasSettings?.recruiter) fields.recruiter = gasSettings.recruiter;
+      if (a.missing.includes('会社名') && h.company) fields.company = h.company;
+      if (a.missing.includes('ポジション名') && h.position) fields.position = h.position;
+    }
+    if (!a.candidateId || Object.keys(fields).length === 0) { remaining.push(a); continue; }
+    try {
+      const res = await fetch(url, { method: 'POST', body: JSON.stringify({ secret, action: 'fixField', candidateId: a.candidateId, fields }) });
+      const data = await res.json();
+      if (data.ok) {
+        console.log('[Snow-we] 記録不備を自動修復:', a.candidateId, fields);
+      } else {
+        remaining.push(a);
+      }
+    } catch (_) {
+      remaining.push(a);
+    }
+  }
+  return remaining;
+}
+
+async function checkAnomalies() {
+  try {
+    const { gasSettings, scoutHistory } = await chrome.storage.local.get(['gasSettings', 'scoutHistory']);
+    const url = gasSettings?.url || gasSettings?.dbUrl;
+    const secret = gasSettings?.secret || 'snowwe2024';
+
+    // ① GAS側で検知した「届いたが必須項目が空欄だった」ケース → 自動修復を試みる
+    let serverAnomalies = [];
+    if (url) {
+      try {
+        const res = await fetch(url, { method: 'POST', body: JSON.stringify({ secret, action: 'getAnomalies' }) });
+        const data = await res.json();
+        if (data.ok) serverAnomalies = data.anomalies || [];
+      } catch (_) {
+        // ネットワーク不可時は無視（次の定期チェックで再試行）
+      }
+      if (serverAnomalies.length > 0) {
+        serverAnomalies = await autoRepairAnomalies(url, secret, serverAnomalies, scoutHistory);
+      }
+    }
+
+    // ② クライアント側で「GASに一度も届かなかった」ケース（自動リトライがまだ成功していないもの）
+    const tenMinAgo = Date.now() - 10 * 60 * 1000;
+    const undelivered = Object.values(scoutHistory || {})
+      .filter(h => h.gasSent === false && h.date && h.date < tenMinAgo && (h.retryCount || 0) >= 8)
+      .map(h => ({ ts: h.date, recruiter: '', company: h.company || '', missing: 'GAS未送信(自動リトライ失敗)', sheet: '' }));
+
+    // ③ Supabaseに一度も届かなかったケース（ダッシュボードに表示されない記録）
+    const supabaseUndelivered = Object.values(scoutHistory || {})
+      .filter(h => h.supabaseSent === false && h.date && h.date < tenMinAgo && (h.supabaseGaveUp || (h.supabaseRetryCount || 0) >= 8))
+      .map(h => ({ ts: h.date, recruiter: '', company: h.company || '', missing: 'Supabase未送信(自動リトライ失敗)', sheet: '' }));
+
+    const anomalies = [...serverAnomalies, ...undelivered, ...supabaseUndelivered].sort((a, b) => b.ts - a.ts);
+    await chrome.storage.local.set({ recordAnomalies: { items: anomalies, checkedAt: Date.now() } });
+    updateAnomalyBadge(anomalies.length);
+  } catch (_) {
+    // 想定外エラー時は無視（次の定期チェックで再試行）
+  }
+}
+
+function updateAnomalyBadge(count) {
+  if (count > 0) {
+    chrome.action.setBadgeText({ text: String(Math.min(count, 99)) });
+    chrome.action.setBadgeBackgroundColor({ color: '#DC2626' });
+  } else {
+    chrome.action.setBadgeText({ text: '' });
+  }
+}
+
+// ── 夜間自動実行（並列スロット対応） ──────────────────────────────────────────
+// slotId → {slotId, tabId, windowId, urlQueue, urlIndex, maxPages}
+let _autoRunSlots = [];
+// onUpdated 重複発火防止：送信済みタブIDセット
+const _autoRunSentTabs = new Set();
+
+function _doStartAutoRun(autoRunConfig) {
+  const urls = (autoRunConfig.urls || []).filter(u => u?.trim());
+  if (!urls.length) return;
+  const maxPages = autoRunConfig.maxPagesPerUrl || 2;
+  const concurrency = Math.min(autoRunConfig.concurrency || 1, 3);
+
+  _autoRunSlots = [];
+
+  // URLをconcurrency個のグループにラウンドロビン分配
+  const groups = Array.from({ length: concurrency }, () => []);
+  urls.forEach((url, i) => groups[i % concurrency].push(url));
+  const activeGroups = groups.filter(g => g.length > 0);
+
+  console.log(`[Snow-we] 夜間自動実行: ${urls.length}URL × ${activeGroups.length}並列`);
+  chrome.storage.local.set({ autoRunState: { isRunning: true, startedAt: Date.now() } });
+
+  activeGroups.forEach((groupUrls, slotIdx) => {
+    const slot = { slotId: slotIdx, tabId: null, windowId: null, urlQueue: groupUrls, urlIndex: 0, maxPages };
+    _autoRunSlots.push(slot);
+
+    if (slotIdx === 0) {
+      // スロット0: 既存ウィンドウで開く
+      _openNextUrlInSlot(slot);
+    } else {
+      // スロット1+: 新しいウィンドウ（別ウィンドウなら各々アクティブタブを持てる）
+      chrome.windows.create({ focused: false }, (win) => {
+        slot.windowId = win.id;
+        // windowsは空白タブ付きで開くので、そこに最初のURLを開く
+        const blankTabId = win.tabs?.[0]?.id;
+        chrome.tabs.create({ url: slot.urlQueue[0], windowId: win.id }, (tab) => {
+          slot.tabId = tab.id;
+          if (blankTabId) chrome.tabs.remove(blankTabId, () => {});
+          console.log(`[Snow-we] スロット${slotIdx}: ウィンドウ作成 (${slot.urlQueue.length}URL)`);
+        });
+      });
+    }
+  });
+}
+
+function startAutoRun() {
+  chrome.storage.local.get(['autoRunConfig'], ({ autoRunConfig }) => {
+    if (!autoRunConfig?.enabled) return;
+    _doStartAutoRun(autoRunConfig);
+  });
+}
+
+function _openNextUrlInSlot(slot) {
+  if (slot.urlIndex >= slot.urlQueue.length) {
+    console.log(`[Snow-we] スロット${slot.slotId}: 全URL完了`);
+    if (slot.windowId) { chrome.windows.remove(slot.windowId, () => {}); slot.windowId = null; }
+    _autoRunSlots = _autoRunSlots.filter(s => s.slotId !== slot.slotId);
+    if (_autoRunSlots.length === 0) {
+      console.log('[Snow-we] 夜間自動実行完了 - 全スロット処理済み');
+      chrome.storage.local.set({ autoRunState: { isRunning: false, completedAt: Date.now() } });
+    }
+    return;
+  }
+  const url = slot.urlQueue[slot.urlIndex];
+  const opts = slot.windowId ? { url, windowId: slot.windowId } : { url };
+  chrome.tabs.create(opts, (tab) => {
+    slot.tabId = tab.id;
+    console.log(`[Snow-we] スロット${slot.slotId}: ${slot.urlIndex + 1}/${slot.urlQueue.length} 開始`);
+  });
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== 'complete') return;
+  const slot = _autoRunSlots.find(s => s.tabId === tabId);
+  if (!slot) return;
+  // Angular SPAはルーター初期化でstatus:'complete'が複数回発火する → 重複防止
+  if (_autoRunSentTabs.has(tabId)) return;
+  _autoRunSentTabs.add(tabId);
+  // SPAや仮想スクロールはアクティブタブでないと描画されないため前面に出す
+  chrome.tabs.update(tabId, { active: true }, () => {
+    setTimeout(() => {
+      chrome.tabs.sendMessage(tabId, {
+        type: 'autoRun',
+        slotId: slot.slotId,
+        maxPages: slot.maxPages,
+        urlIndex: slot.urlIndex,
+        totalUrls: slot.urlQueue.length,
+      }).catch(() => {});
+    }, 2500);
+  });
+});
+
+// サービスワーカー起動時にアラームを復元
+chrome.storage.local.get(['autoRunConfig'], ({ autoRunConfig }) => {
+  if (!autoRunConfig?.enabled) return;
+  chrome.alarms.get('snowWeAutoRun', (existing) => {
+    if (existing) return;
+    setAutoRunAlarm(autoRunConfig);
+  });
+});
+
+function setAutoRunAlarm(autoRunConfig) {
+  chrome.alarms.clear('snowWeAutoRun', () => {
+    if (!autoRunConfig?.enabled) return;
+    const now = new Date();
+    const h = autoRunConfig.hour ?? 2;
+    const m = autoRunConfig.minute ?? 0;
+    let minutesUntil = h * 60 + m - (now.getHours() * 60 + now.getMinutes());
+    if (minutesUntil <= 0) minutesUntil += 24 * 60;
+    chrome.alarms.create('snowWeAutoRun', { delayInMinutes: minutesUntil, periodInMinutes: 24 * 60 });
+    console.log(`[Snow-we] 自動実行アラーム: ${minutesUntil}分後 (毎日${h}:${String(m).padStart(2,'0')})`);
+  });
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  // 会社の Google アカウントでのログイン（popup のボタン・content.js / popup.js の Supabase 読み書きから）
+  if (msg.type === 'supabaseLogin') {
+    supabaseLogin()
+      .then(r => sendResponse({ ok: true, ...r }))
+      .catch(e => sendResponse({ ok: false, error: (e && e.message) || String(e) }));
+    return true;
+  }
+  if (msg.type === 'supabaseLogout') {
+    supabaseLogout().then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.type === 'getSupabaseAuthStatus') {
+    getSupabaseAuthStatus().then(sendResponse).catch(() => sendResponse({ loggedIn: false, email: null }));
+    return true;
+  }
+  if (msg.type === 'getSupabaseAccessToken') {
+    getSupabaseAccessToken().then(token => sendResponse({ token })).catch(() => sendResponse({ token: null }));
+    return true;
+  }
+
+  // API利用額の記録（popup/content.jsの短命なコンテキストに依存しないよう、
+  // service worker側で書き込みを完結させる）
+  // APIを呼ぶ直前の歯止め。popup.js / content.js の claudeFetch から必ず通す
+  if (msg.type === 'checkApiBudget') {
+    checkApiBudget()
+      .then(r => sendResponse(r))
+      // 上限の確認自体に失敗したときに止めてしまうと、費用とは無関係な理由で
+      // 業務が止まる。確認できない場合は通す
+      .catch(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  if (msg.type === 'getApiBudget') {
+    Promise.all([getApiBudget(), chrome.storage.local.get(['apiCostStats'])])
+      .then(([budget, { apiCostStats }]) => sendResponse({ budget, ...apiSpendSummary(apiCostStats) }))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
+  if (msg.type === 'setApiBudget') {
+    const clean = (v, fallback) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : fallback;
+    };
+    chrome.storage.local.set({
+      apiBudget: {
+        dailyUSD: clean(msg.dailyUSD, API_BUDGET_DEFAULT.dailyUSD),
+        monthlyUSD: clean(msg.monthlyUSD, API_BUDGET_DEFAULT.monthlyUSD),
+      },
+    })
+      .then(() => sendResponse({ ok: true }))
+      .catch(e => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+
+  if (msg.type === 'recordApiCost') {
+    recordApiCostInBackground(msg.model, msg.usage)
+      .then(stats => sendResponse({ ok: true, stats }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  // 自動実行: 1URL完了 → 次のURLへ
+  if (msg.type === 'autoRunComplete') {
+    const slotId = msg.slotId ?? 0;
+    const slot = _autoRunSlots.find(s => s.slotId === slotId) || _autoRunSlots[0];
+    if (slot) {
+      if (slot.tabId) {
+        _autoRunSentTabs.delete(slot.tabId);
+        chrome.tabs.remove(slot.tabId, () => {});
+        slot.tabId = null;
+      }
+      slot.urlIndex++;
+      setTimeout(() => _openNextUrlInSlot(slot), 1500);
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // アラーム設定
+  if (msg.type === 'setAutoRunAlarm') {
+    setAutoRunAlarm(msg.autoRunConfig);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // 今すぐテスト実行
+  if (msg.type === 'startAutoRunNow') {
+    _doStartAutoRun(msg.autoRunConfig);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // スカウト記録をバッチ送信キューに追加（content.jsの候補者処理から呼ばれる）
+  if (msg.type === 'queueGasScout') {
+    enqueueGasScout(msg.payload)
+      .then(() => { scheduleQuickFlush(); sendResponse({ ok: true }); })
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  // スカウト記録をSupabase送信キューに追加（content.jsの候補者処理から呼ばれる）
+  if (msg.type === 'queueSupabaseScout') {
+    enqueueSupabaseScout(msg.payload)
+      .then(() => { scheduleSupabaseQuickFlush(); sendResponse({ ok: true }); })
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  // 記録不備の再チェック（popup表示時に呼ばれる）
+  if (msg.type === 'refreshAnomalies') {
+    checkAnomalies().then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  // 記録不備を確認済みにする
+  if (msg.type === 'ackAnomalies') {
+    chrome.storage.local.get(['gasSettings']).then(({ gasSettings }) => {
+      const url = gasSettings?.url || gasSettings?.dbUrl;
+      const secret = gasSettings?.secret || 'snowwe2024';
+      if (!url) { sendResponse({ ok: false }); return; }
+      fetch(url, { method: 'POST', body: JSON.stringify({ secret, action: 'ackAnomalies' }) })
+        .then(() => {
+          chrome.storage.local.set({ recordAnomalies: { items: [], checkedAt: Date.now() } });
+          updateAnomalyBadge(0);
+          sendResponse({ ok: true });
+        })
+        .catch(() => sendResponse({ ok: false }));
+    });
+    return true;
+  }
+
+  // GASへのPOST中継
+  if (msg.type === 'gasPost') {
+    const { url, payload } = msg;
+    if (!url) { sendResponse({ ok: false }); return true; }
+    fetch(url, { method: 'POST', body: JSON.stringify(payload) })
+      .then(r => r.json())
+      .then(data => sendResponse({ ok: data.ok !== false, gasError: data.error || null }))
+      .catch(err => sendResponse({ ok: false, gasError: err.message }));
+    return true;
+  }
+
+  // チームのAI判定フィードバック一覧をGASから取得
+  if (msg.type === 'getTeamFeedbacks') {
+    chrome.storage.local.get(['gasSettings']).then(({ gasSettings }) => {
+      const url    = gasSettings?.url || gasSettings?.dbUrl;
+      const secret = gasSettings?.secret || 'snowwe2024';
+      if (!url) { sendResponse({ feedbacks: [] }); return; }
+      fetch(url, {
+        method: 'POST',
+        body: JSON.stringify({ secret, action: 'getFeedbacks', limit: 30 }),
+      })
+        .then(r => r.json())
+        .then(data => sendResponse({ feedbacks: data.feedbacks || [] }))
+        .catch(() => sendResponse({ feedbacks: [] }));
+    });
+    return true;
+  }
+
+  // ポジション要件をSupabaseから取得（会社別採用基準のみ、引き続きGAS「条件」シートから取得）
+  if (msg.type === 'getPositionRequirements') {
+    const { position } = msg;
+    (async () => {
+      let requirements = '';
+      // 候補者管理システムのAPIを正とし、取れなかったときだけSupabaseを見る
+      try {
+        const hit = await findPositionByLabel(position);
+        if (hit) {
+          const [detail] = await fetchPositionDetails([hit.id]);
+          if (detail) requirements = buildApiPositionRequirementsText(detail);
+        }
+      } catch (e) {
+        console.warn('[Snow-we] getPositionRequirements: ポジションAPI取得失敗', e.message);
+      }
+      if (!requirements) {
+        try {
+          const rows = await fetchSupabasePositions(position);
+          if (rows[0]) requirements = buildPositionRequirementsText(rows[0]);
+        } catch (e) {
+          console.warn('[Snow-we] getPositionRequirements: Supabase取得失敗', e.message);
+        }
+      }
+
+      const { gasSettings } = await chrome.storage.local.get(['gasSettings']);
+      const url    = gasSettings?.positionUrl || gasSettings?.url || gasSettings?.dbUrl;
+      const secret = gasSettings?.secret || 'snowwe2024';
+      if (!url) {
+        sendResponse({ ok: !!requirements, requirements, companyCriteria: '' });
+        return;
+      }
+      try {
+        const gasData = await fetch(url, {
+          method: 'POST',
+          body: JSON.stringify({ secret, action: 'getPositionRequirements', position }),
+        }).then(r => r.json());
+        sendResponse({
+          ok: !!requirements || !!gasData.ok,
+          requirements: requirements || gasData.requirements || '',
+          companyCriteria: gasData.companyCriteria || '',
+        });
+      } catch (e) {
+        sendResponse({ ok: !!requirements, requirements, companyCriteria: '' });
+      }
+    })();
+    return true;
+  }
+
+  // ポジション一覧（表示名の配列）を返す。
+  // 候補者管理システムのAPI → Supabase → ハードコード の順にフォールバックする
+  if (msg.type === 'getKnowledge') {
+    (async () => {
+      try {
+        sendResponse({ items: await fetchKnowledgeApi() });
+      } catch (e) {
+        sendResponse({ error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'getPositionList') {
+    (async () => {
+      try {
+        const rows = await fetchPositionsCompact(msg.forceRefresh === true);
+        if (rows.length > 0) {
+          sendResponse({ positions: rows.map(positionLabel), source: 'api' });
+          return;
+        }
+      } catch (e) {
+        console.warn('[Snow-we] getPositionList: ポジションAPI失敗', e.message);
+      }
+      try {
+        const rows = await fetchSupabasePositions();
+        if (rows.length > 0) {
+          console.warn('[Snow-we] getPositionList: ポジションAPIが使えずSupabaseにフォールバック');
+          sendResponse({ positions: rows.map(r => r.name), source: 'supabase' });
+          return;
+        }
+      } catch (e) {
+        console.warn('[Snow-we] getPositionList: Supabaseも失敗', e.message);
+      }
+      console.warn('[Snow-we] getPositionList: ハードコード一覧にフォールバック');
+      sendResponse({ positions: POSITION_LIST, source: 'hardcoded' });
+    })();
+    return true;
+  }
+
+  // ポジション一覧（軽量版の生データ）を返す — AI提案のStep1用。
+  // 職務内容・応募要件は含まないので、絞り込み後に getPositionDetails で取得する
+  if (msg.type === 'getPositionsCompact') {
+    fetchPositionsCompact(msg.forceRefresh === true)
+      .then(rows => sendResponse({
+        positions: rows.map(p => ({
+          ...p,
+          label: positionLabel(p),
+          firmJa: firmToJa(p.firm),
+          matchText: buildPositionMatchText(p),
+        })),
+      }))
+      .catch(e => sendResponse({ positions: [], error: e.message }));
+    return true;
+  }
+
+  // ポジションのスカウト文面を返す。ポジションはid、または表示名（ファーム名｜ポジション名）で指定する
+  if (msg.type === 'getScoutTemplate') {
+    (async () => {
+      try {
+        let id = msg.positionId || '';
+        if (!id && msg.label) {
+          const hit = await findPositionByLabel(msg.label);
+          if (!hit) throw new Error('ポジションマスタに該当する求人が見つかりませんでした');
+          id = hit.id;
+        }
+        if (!id) throw new Error('ポジションが指定されていません');
+        const data = await fetchScoutTemplate(id);
+        sendResponse({ ok: true, ...data });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // 候補者の職務経歴に近い求人を、意味の近さ（ベクトル）で探して返す。
+  // 語彙の一致ではないので、辞書に無い言い回しでも取りこぼさない
+  if (msg.type === 'matchPositions') {
+    fetchPositionMatches(msg.profileText || '', Math.max(1, Math.min(100, msg.limit || 30)))
+      .then(data => sendResponse({
+        ok: true,
+        considered: data.considered || 0,
+        model: data.model || '',
+        positions: (data.positions || []).map(p => ({
+          ...p,
+          label: positionLabel(p),
+          firmJa: firmToJa(p.firm),
+        })),
+      }))
+      .catch(e => sendResponse({ ok: false, error: e.message, positions: [] }));
+    return true;
+  }
+
+  // 指定IDのポジション詳細（職務内容・応募要件つき）を返す — AI提案のStep2用
+  if (msg.type === 'getPositionDetails') {
+    fetchPositionDetails(msg.ids)
+      .then(rows => sendResponse({
+        positions: rows.map(p => ({
+          ...p,
+          label: positionLabel(p),
+          firmJa: firmToJa(p.firm),
+          description: buildApiPositionRequirementsText(p),
+        })),
+      }))
+      .catch(e => sendResponse({ positions: [], error: e.message }));
+    return true;
+  }
+});
