@@ -4,6 +4,9 @@
 # 拡張機能のフォルダは、このファイルの1つ上（autoupdate の親）。タスクの起動コマンドを短くするため引数にしない
 param([string]$ExtDir = (Split-Path -Parent $PSScriptRoot))
 $env:GIT_TERMINAL_PROMPT = '0'
+# Git for Windows は、消せないフォルダ（旧 project1 の scout など）があると「Should I try again? (y/n)」と聞いて止まる。
+# 聞かずに「n」（消さずに続ける）にする
+$env:GIT_ASK_YESNO = 'false'
 $logDir = Join-Path $env:LOCALAPPDATA 'snowwe'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir 'update.log'

@@ -8,6 +8,9 @@ $NewRepo = 'https://github.com/taichi536/snowwe-extension.git'
 $ExtName = 'Snow-we スカウト パーソナライズ生成'
 $TaskName = 'Snow-we 自動更新'
 $env:GIT_TERMINAL_PROMPT = '0'
+# Git for Windows は、消せないフォルダ（旧 project1 の scout など）があると「Should I try again? (y/n)」と聞いて止まる。
+# 聞かずに「n」（消さずに続ける）にする
+$env:GIT_ASK_YESNO = 'false'
 
 Write-Host '========================================'
 Write-Host ' Snow-we 拡張機能 自動更新の設定（Windows）'
