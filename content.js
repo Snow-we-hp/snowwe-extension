@@ -1931,6 +1931,30 @@ async function readChangedCandidate(platform, prevId, waitMs = 3000) {
   return null;
 }
 
+// 文字の中の doda X の会員番号の形（「00」で始まる8桁）の数字を、重ねずに返す
+function dodaxMemberNumbersIn(text) {
+  return [...new Set(String(text || '').match(/(?<!\d)00\d{6}(?!\d)/g) || [])];
+}
+
+// 候補者を確かめられなかった送信の記録につける備考（集計の側はこの文字で見分けて、1件にまとめない）
+const UNSURE_CANDIDATE_REMARK = '続けての送信で候補者を確かめられなかった';
+
+// 送信を記録できたときに画面の右下に出す文言
+function recordedMessage(info, recruiter, uncertain) {
+  const who = [info && info.company, info && info.age ? `${String(info.age).replace(/[歳才]/g, '')}歳` : '']
+    .filter(Boolean).join('・');
+  if (uncertain) return `⚠️ 記録しましたが、候補者を確かめられませんでした${who ? `（${who}）` : ''}`;
+  if (!recruiter) return `⚠️ 記録しましたが、担当者名が空です${who ? `（${who}）` : ''}`;
+  return `✅ 記録しました（${recruiter}${who ? `・${who}` : ''}）`;
+}
+
+// 2つの時刻（ミリ秒）が、この PC の時計で同じ日か
+function isSameLocalDay(a, b) {
+  if (!a || !b) return false;
+  const x = new Date(a), y = new Date(b);
+  return x.getFullYear() === y.getFullYear() && x.getMonth() === y.getMonth() && x.getDate() === y.getDate();
+}
+
 async function recordScoutSent(candidateId, info, templateName, templateRaw = '', fallbackPosition = '', opts = {}) {
   if (!candidateId) return;
   const now = Date.now();
@@ -1947,6 +1971,20 @@ async function recordScoutSent(candidateId, info, templateName, templateRaw = ''
   if (lastRecordedAt && now - lastRecordedAt < RECORD_DEDUPE_MS && !(opts && opts.forceNew)) {
     console.log(`[Snow-we] 直近${Math.round((now - lastRecordedAt) / 1000)}秒前に記録済みのためスキップ:`, candidateId);
     return;
+  }
+  // 同じ候補者を同じ日にもう一度記録しない（ページを開き直した・別のタブで送った等で、上の5分の確認をすり抜けたもの）。
+  // 実データで、doda X の同じ候補者が5〜12分おきに2回記録されていた（10/1〜11/20 で10件）。
+  // 12/1 からは日別シートを数えず、この記録だけで送信数を数えるので、二重の記録はそのまま数の間違いになる。
+  // 同じ日に同じ人へ2通送ることは無い。送信の通信で確かめた別の送信（opts.forceNew）は捨てない
+  if (!(opts && opts.forceNew)) {
+    try {
+      const prev = (await getScoutHistory())[candidateId];
+      if (isSameLocalDay(prev && prev.date, now)) {
+        console.log('[Snow-we] 今日すでに記録した候補者のためスキップ:', candidateId);
+        _recentlyRecorded.set(candidateId, now);
+        return;
+      }
+    } catch (_) {}
   }
   _recentlyRecorded.set(candidateId, now);
   reportDodaxNameInCompany(info.company || '');
@@ -2075,6 +2113,9 @@ async function recordScoutSent(candidateId, info, templateName, templateRaw = ''
         ext_version: (() => {
           try { return chrome.runtime.getManifest().version; } catch (_) { return ''; }
         })(),
+        // 続けて送ったのに画面が前の候補者のままで、候補者番号が前の送信と同じになった記録。
+        // 集計の側（gas/送信記録チェック.gs）は同じ候補者・同じ日の記録を1件にまとめるが、これは別の送信なのでまとめない
+        ...(opts && opts.forceNew ? { remarks: UNSURE_CANDIDATE_REMARK } : {}),
       },
     };
     // 送信を試みる「前」に必ずページ側へ退避しておく。
@@ -2089,6 +2130,8 @@ async function recordScoutSent(candidateId, info, templateName, templateRaw = ''
       // background側のキューに積めた時点で、以降の送信とリトライはそちらの責任に移る。
       // ここで退避を消さないと、次回の再送で二重に送られてしまう
       unstashRecord(supabasePayload.candidateId);
+      // 送るたびに「記録しました」と出す。12/1 から日別シートを数えないので、これが出なければその場で気づけるようにする
+      try { showAutoStatus(recordedMessage(info, sharedRecruiter, opts && opts.forceNew), 5000); } catch (_) {}
     } catch (e) {
       // 拡張機能を更新・再読み込みすると、開いたままのタブの内容は拡張機能から
       // 切り離され、ここが必ず失敗する。退避は済んでいるので記録は失われない
@@ -2347,6 +2390,11 @@ function getCandidateId(cardEl) {
     // 以前はここで汎用の処理に落ち、6〜10桁の別の数字やハッシュになっていた（13/303件）
     const labeled = text.match(/(?:会員番号|会員ID|候補者番号|求職者番号|No\.?)\s*[：:]?\s*(\d{8})(?!\d)/);
     if (labeled) return `dodax_${labeled[1]}`;
+    // 一覧の画面で、会員番号が氏名などとつながって単独行になっていないことがある（11/20 の報告: 8桁の数字が2回、
+    // 同じ番号）。doda X の会員番号は、これまでの記録 2,283件がすべて「00」で始まる8桁なので、
+    // その形の数字が1種類だけなら、それを使う（2種類以上なら、どれか分からないので使わない）
+    const zeroNums = dodaxMemberNumbersIn(text);
+    if (zeroNums.length === 1) return `dodax_${zeroNums[0]}`;
     const dataNum = (() => {
       try {
         for (const el of [cardEl, ...cardEl.querySelectorAll('[data-member-id],[data-candidate-id],[data-id]')]) {
