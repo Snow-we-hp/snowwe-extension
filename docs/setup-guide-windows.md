@@ -37,7 +37,7 @@ git --version
 PowerShellで以下を貼り付けてEnter。
 
 ```powershell
-git clone https://github.com/taichi536/snowwe-extension.git "$env:USERPROFILE\Desktop\project1"
+git clone https://github.com/Snow-we-hp/snowwe-extension.git "$env:USERPROFILE\Desktop\project1"
 ```
 
 デスクトップに `project1` フォルダができます。

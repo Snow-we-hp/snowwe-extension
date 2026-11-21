@@ -1,6 +1,6 @@
 #!/bin/bash
 # 自動更新の導入（Mac。1回だけ）:
-#   curl -fsSL https://raw.githubusercontent.com/taichi536/snowwe-extension/main/autoupdate/install-mac.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Snow-we-hp/snowwe-extension/main/autoupdate/install-mac.sh | bash
 #
 # やること:
 #   1. Chrome が読み込んでいる Snow-we 拡張機能のフォルダを見つける（まだ project1 から取っていれば引っ越しもする）
@@ -8,9 +8,9 @@
 #      → 「デスクトップのファイルへのアクセスを求めています」と出たら【許可】を押す
 #        （macOS は、許可の無い裏の処理がデスクトップのファイルを書き換えるのを止めるため）
 #   3. そのアプリを1時間ごとに裏で起動する設定を入れる
-# 外すとき: curl -fsSL https://raw.githubusercontent.com/taichi536/snowwe-extension/main/autoupdate/uninstall-mac.sh | bash
+# 外すとき: curl -fsSL https://raw.githubusercontent.com/Snow-we-hp/snowwe-extension/main/autoupdate/uninstall-mac.sh | bash
 set -u
-NEW_REPO="${SNOWWE_REPO:-https://github.com/taichi536/snowwe-extension.git}"
+NEW_REPO="${SNOWWE_REPO:-https://github.com/Snow-we-hp/snowwe-extension.git}"
 EXT_NAME="Snow-we スカウト パーソナライズ生成"
 APP="$HOME/Applications/Snow-we 自動更新.app"
 SUPPORT="$HOME/Library/Application Support/snowwe"
@@ -35,7 +35,7 @@ else
     grep -q "\"name\": \"$EXT_NAME\"" "$m" 2>/dev/null || continue
     [ -d "$d/.git" ] || continue
     o=$(git -C "$d" remote get-url origin 2>/dev/null)
-    case "$o" in *taichi536/project1*|*taichi536/snowwe-extension*) ;; *) continue ;; esac
+    case "$o" in *taichi536/project1*|*taichi536/snowwe-extension*|*Snow-we-hp/snowwe-extension*) ;; *) continue ;; esac
     [ "$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)" = "main" ] || continue
     cands+=("$d")
   done < <(find "$HOME" -maxdepth 6 -name manifest.json -not -path "*/Library/*" \

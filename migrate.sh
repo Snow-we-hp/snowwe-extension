@@ -1,8 +1,8 @@
 #!/bin/bash
 # 引っ越し用（Mac）: taichi536/project1（非公開になった）から読み込んでいる拡張機能のフォルダを、
-# 同じ場所のまま taichi536/snowwe-extension から更新できるように切り替える。
+# 同じ場所のまま Snow-we-hp/snowwe-extension から更新できるように切り替える。
 #
-#   curl -fsSL https://raw.githubusercontent.com/taichi536/snowwe-extension/main/migrate.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Snow-we-hp/snowwe-extension/main/migrate.sh | bash
 #   （フォルダを指定する場合: ... | bash -s -- /path/to/folder）
 #
 # 同じフォルダのまま切り替えるので、拡張機能のID・設定（APIキー・担当者名）・記録は変わらない。
@@ -10,10 +10,10 @@
 #
 # 切り替えるのは、次をすべて満たすフォルダだけ:
 #   - manifest.json が「Snow-we スカウト パーソナライズ生成」
-#   - git の取得先が taichi536/project1 か taichi536/snowwe-extension
+#   - git の取得先が taichi536/project1 か Snow-we-hp/snowwe-extension
 #   - 今のブランチが main（開発用のフォルダ・別ブランチのフォルダは触らない）
 set -u
-NEW_REPO="${SNOWWE_REPO:-https://github.com/taichi536/snowwe-extension.git}"
+NEW_REPO="${SNOWWE_REPO:-https://github.com/Snow-we-hp/snowwe-extension.git}"
 EXT_NAME="Snow-we スカウト パーソナライズ生成"
 export GIT_TERMINAL_PROMPT=0
 
@@ -48,7 +48,7 @@ for dir in "${candidates[@]}"; do
 
   origin=$(git -C "$dir" remote get-url origin 2>/dev/null || echo "")
   case "$origin" in
-    *taichi536/project1*|*taichi536/snowwe-extension*) ;;
+    *taichi536/project1*|*taichi536/snowwe-extension*|*Snow-we-hp/snowwe-extension*) ;;
     *) skipped+=("$dir（取得先が違う: ${origin:-なし}）"); continue ;;
   esac
   branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
