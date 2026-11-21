@@ -1,5 +1,8 @@
 // background.js — GAS中継 & ポジション一覧の管理
 
+// 会社のアカウントから担当者名を決める処理（staff-from-account.js）
+importScripts('staff-from-account.js');
+
 // 通常のポップアップ（action.default_popup）は、ページ上をクリックしたりタブを切り替えたり
 // すると自動的に閉じてしまい、承認待ちレビュー中にRDSの候補者詳細を見ながら操作できない・
 // 閉じて承認待ちリストの続きを見失う、という問題が繰り返し起きていた。サイドパネルは
@@ -586,7 +589,8 @@ async function supabaseLogin() {
     throw new Error(`会社のアカウント（${SUPABASE_ALLOWED_EMAIL_DOMAIN}）でログインしてください（${email || '不明'} は使えません）`);
   }
   const session = await _saveSupabaseSession(data);
-  return { email: session.email };
+  await syncRecruiterFromAccount().catch(() => {});
+  return { email: session.email, staffName: staffNameFromEmail(session.email) };
 }
 
 async function supabaseLogout() {
@@ -638,7 +642,21 @@ async function getSupabaseAccessToken() {
 
 async function getSupabaseAuthStatus() {
   const { [SUPABASE_AUTH_STORAGE]: s } = await chrome.storage.local.get([SUPABASE_AUTH_STORAGE]);
-  return { loggedIn: !!(s && s.access_token && _isAllowedEmail(s.email)), email: (s && s.email) || null };
+  const loggedIn = !!(s && s.access_token && _isAllowedEmail(s.email));
+  return { loggedIn, email: (s && s.email) || null, staffName: loggedIn ? staffNameFromEmail(s.email) : '' };
+}
+
+// ログイン中なら、担当者名をアカウントから決めた名前に合わせる（staff-from-account.js）。
+// ほかの人の名前が選ばれたままだと、送信がその人の記録になるため。ログイン直後・起動時・連絡（heartbeat）のたびに確かめる
+async function syncRecruiterFromAccount() {
+  const st = await chrome.storage.local.get([SUPABASE_AUTH_STORAGE, 'gasSettings', 'recruiterName']);
+  const s = st[SUPABASE_AUTH_STORAGE];
+  if (!s || !s.access_token || !_isAllowedEmail(s.email)) return { changed: false };
+  const fix = recruiterFixFor(s.email, st.gasSettings, st.recruiterName);
+  if (!fix) return { changed: false };
+  await chrome.storage.local.set(fix);
+  console.log(`[snowwe] 担当者名をアカウントに合わせました: ${fix.recruiterBeforeAccount || '（空）'} → ${fix.recruiterName}`);
+  return { changed: true, name: fix.recruiterName, before: fix.recruiterBeforeAccount };
 }
 
 // scouts / scout_queue への読み書き。ログイン中はその人の鍵で送り、鍵が通らなかったとき（401）は
@@ -1141,6 +1159,7 @@ async function getInstallId() {
 
 async function sendHeartbeat(trigger) {
   try {
+    await syncRecruiterFromAccount().catch(() => {});
     const store = await chrome.storage.local.get([
       'gasSettings', 'recruiterName', 'scoutHistory', 'supabaseScoutQueue', 'gasScoutQueue', SUPABASE_AUTH_STORAGE,
     ]);
@@ -1506,7 +1525,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.type === 'getSupabaseAuthStatus') {
-    getSupabaseAuthStatus().then(sendResponse).catch(() => sendResponse({ loggedIn: false, email: null }));
+    // popup を開いたときにも、担当者名をアカウントに合わせておく
+    syncRecruiterFromAccount().catch(() => {})
+      .then(() => getSupabaseAuthStatus()).then(sendResponse).catch(() => sendResponse({ loggedIn: false, email: null }));
     return true;
   }
   if (msg.type === 'getSupabaseAccessToken') {
