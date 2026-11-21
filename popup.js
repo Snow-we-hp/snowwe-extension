@@ -854,7 +854,7 @@ async function runSuggestPosition() {
   setStatus('suggest', 'loading', 'プロフィールを取得中...');
   $('suggest-btn').disabled = true;
   $('suggest-result').style.display = 'none';
-  _usageTally = { calls: [], cost: 0, firmBreakdown: '', matchInfo: '', profileInfo: '', detailNote: '' };
+  _usageTally = { calls: [], cost: 0, firmBreakdown: '', matchInfo: '', profileInfo: '', detailNote: '', firmExclusion: '' };
 
   let profileData;
   try {
@@ -946,6 +946,18 @@ async function suggestPosition(apiKey, profileText) {
     }
   } catch (_) {}
 
+  // 候補者が在籍したことのあるファーム（現職・過去とも）のポジションは提案しない。
+  // 判定と別名の対応表は firm-exclusion.js にまとめてある
+  const formerFirms = detectFormerFirms(profileText);
+  const dropFormer = list => excludeFormerFirmPositions(list, formerFirms).kept;
+  if (formerFirms.length > 0) {
+    const { kept, removed } = excludeFormerFirmPositions(all, formerFirms);
+    all = kept;
+    const note = describeFirmExclusion(formerFirms, removed.length);
+    console.log('[Snow-we]', note);
+    if (_usageTally) _usageTally.firmExclusion = note;
+  }
+
   // Step 0: 候補者プロフィールを構造化抽出
   setStatus('suggest', 'loading', '候補者プロフィールを分析中...');
   const candidateAttrs = await extractCandidateAttributes(apiKey, profileText);
@@ -953,10 +965,12 @@ async function suggestPosition(apiKey, profileText) {
   // 一覧が1件も取れなかった場合だけ、画面のドロップダウンに並んでいる名称だけで
   // 判断する簡易経路に落ちる（募集要件を使えないので精度は落ちる）
   if (all.length === 0) {
-    const positionListText = Array.from(document.querySelectorAll('#position-select option'))
-      .map(o => o.value).filter(Boolean).join('\n');
+    const positionListText = dropFormer(Array.from(document.querySelectorAll('#position-select option'))
+      .map(o => o.value).filter(Boolean)).join('\n');
     setStatus('suggest', 'loading', 'ポジションを分析中...');
-    return await suggestPositionSingleStep(apiKey, profileText, positionListText, candidateAttrs);
+    const r = await suggestPositionSingleStep(apiKey, profileText, positionListText, candidateAttrs);
+    r.suggestions = dropFormer(r.suggestions || []);
+    return r;
   }
 
   // ── Step 1: 候補者の職務経歴に近い求人を、意味の近さで探す ──
@@ -986,13 +1000,14 @@ async function suggestPosition(apiKey, profileText) {
   let shortlist = [];
   let matchInfo = '';
   try {
+    // 在籍歴のあるファームの求人は後で外すので、その分だけ多めに取っておく
     const res = await chrome.runtime.sendMessage({
       type: 'matchPositions',
       profileText,
-      limit: SHORTLIST_SIZE,
+      limit: formerFirms.length > 0 ? Math.min(100, SHORTLIST_SIZE * 2) : SHORTLIST_SIZE,
     });
     if (res?.ok && res.positions?.length) {
-      shortlist = res.positions;
+      shortlist = dropFormer(res.positions).slice(0, SHORTLIST_SIZE);
       matchInfo = `意味の近さで ${res.considered}件 → ${shortlist.length}件`;
       // 絞り込んだ30件をコンソールに出す。最終的に表示されるのは8件なので、
       // 提案に出てこない求人が「そもそも30件に入っていなかった」のか
@@ -1065,7 +1080,9 @@ ${profileText}
   // 絞り込みに失敗した場合は、要件なしのまま全件の名称で判断する
   if (shortlist.length === 0) {
     setStatus('suggest', 'loading', 'ポジションを分析中...');
-    return await suggestPositionSingleStep(apiKey, profileText, all.map(p => p.label).join('\n'), candidateAttrs);
+    const r = await suggestPositionSingleStep(apiKey, profileText, all.map(p => p.label).join('\n'), candidateAttrs);
+    r.suggestions = dropFormer(r.suggestions || []);
+    return r;
   }
 
   // ── Step 2: 絞り込んだ分だけ要件付きで取り直し、詳細ランキング ──
@@ -1102,6 +1119,8 @@ ${profileText}
   // ことがあった（実機で「最推奨62点 / 次点48点 / 候補71点」と表示され、最高点が
   // 一番下に出ていた）。表示・初期選択の両方がスコアと食い違うので、ここで並べ替える
   (result.suggestions || []).sort((a, b) => (b.match_score || 0) - (a.match_score || 0));
+  // 念のため最後にも外す（AIが一覧に無い名前を返した場合など）
+  result.suggestions = dropFormer(result.suggestions || []);
 
   // 提案結果に求人URLとファーム名を紐づける。AIが返すのは表示名だけなので、
   // ここで元のポジションに突き合わせる
@@ -1282,6 +1301,7 @@ function renderSuggestDiagnostics(container) {
       今回の分析: $${t.cost.toFixed(4)}（入力${totalIn.toLocaleString()} / 出力${totalOut.toLocaleString()}トークン）
     </div>
     <div>${perCall}</div>
+    ${t.firmExclusion ? `<div style="margin-top:4px;color:#92400E;">${escapeHtml(t.firmExclusion)}</div>` : ''}
     ${t.matchInfo ? `<div style="margin-top:4px;">${escapeHtml(t.matchInfo)}</div>` : ''}
     ${t.profileInfo ? `<div style="margin-top:4px;">${escapeHtml(t.profileInfo)}</div>` : ''}
     ${t.detailNote ? `<div style="margin-top:4px;color:#92400E;">${escapeHtml(t.detailNote)}</div>` : ''}
@@ -2893,8 +2913,10 @@ async function loadChatCandidate() {
       const res = await chrome.runtime.sendMessage({
         type: 'matchPositions', profileText, limit: 12,
       });
-      if (res?.ok && res.positions?.length) matches = res.positions;
-      else if (res?.error) console.warn('[Snow-we] 相談タブ: 求人の検索に失敗:', res.error);
+      // 提案タブと同じく、在籍歴のあるファームの求人は出さない
+      if (res?.ok && res.positions?.length) {
+        matches = excludeFormerFirmPositions(res.positions, detectFormerFirms(profileText)).kept;
+      } else if (res?.error) console.warn('[Snow-we] 相談タブ: 求人の検索に失敗:', res.error);
     } catch (e) {
       console.warn('[Snow-we] 相談タブ: 求人の検索に失敗:', e.message);
     }
