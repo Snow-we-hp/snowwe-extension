@@ -368,6 +368,8 @@ async function loadSettings() {
   if (c.autoTagName) $('auto-tag-name').value = c.autoTagName;
 
   if (gas.recruiter) $('gas-recruiter').value = gas.recruiter;
+  // ログイン中は、アカウントから決めた名前で上書きして手で変えられなくする（保存していた名前が違っていても）
+  refreshLoginBar();
   if (gas.url) $('gas-url').value = gas.url;
   if (gas.dbUrl) $('gas-db-url').value = gas.dbUrl;
   if (gas.secret) $('gas-secret').value = gas.secret;
@@ -2095,9 +2097,30 @@ async function refreshLoginBar() {
     loginBtn.style.display = 'none';
     logoutBtn.style.display = '';
   } else {
-    status.textContent = '未ログイン（今は使えます。会社のアカウントでログインしてください）';
+    status.textContent = '未ログイン（今は使えます。会社のアカウントでログインすると、担当者名が自動で決まります）';
     loginBtn.style.display = '';
     logoutBtn.style.display = 'none';
+  }
+  lockRecruiterToAccount(st);
+}
+
+// ログイン中は、担当者名をアカウントから決めた名前にして、手では変えられなくする（staff-from-account.js）。
+// ほかの人の名前を選んだまま送ると、その人の送信として記録されてしまうため
+function lockRecruiterToAccount(st) {
+  const select = $('gas-recruiter'), note = $('gas-recruiter-note');
+  if (!select) return;
+  const name = st && st.loggedIn ? (st.staffName || '') : '';
+  if (name) {
+    select.value = name;
+    select.disabled = true;
+    if (note) note.textContent = `会社のアカウント（${st.email}）から自動で決まります`;
+  } else {
+    select.disabled = false;
+    if (note) {
+      note.textContent = st && st.loggedIn
+        ? 'このアカウントからは名前を決められませんでした。自分の名前を選んでください'
+        : '上の「会社のGoogleでログイン」を押すと、自動で決まります';
+    }
   }
 }
 
