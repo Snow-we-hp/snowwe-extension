@@ -1207,10 +1207,10 @@ async function sendHeartbeat(trigger) {
 // ① 手元のファイルが新しくなっていたら（update.bat は実行したが再読み込みしていない）、
 //    自分で再読み込みする。開発者モードで読み込んだ拡張は、再読み込みでディスクから読み直す
 // ② GitHub の main と比べて古ければ、媒体の画面に警告を出す（content.js が表示する）
-const LATEST_MANIFEST_URL = 'https://raw.githubusercontent.com/taichi536/snowwe-extension/main/manifest.json';
+const LATEST_MANIFEST_URL = 'https://raw.githubusercontent.com/Snow-we-hp/snowwe-extension/main/manifest.json';
 // 「この版より前では送らせない」最低バージョン。記録が誤った内容になる不具合を
 // 直したときだけ上げる。通常の更新では上げない（毎回止まると仕事にならない）
-const MIN_VERSION_URL = 'https://raw.githubusercontent.com/taichi536/snowwe-extension/main/min-version.json';
+const MIN_VERSION_URL = 'https://raw.githubusercontent.com/Snow-we-hp/snowwe-extension/main/min-version.json';
 
 function compareVersions(a, b) {
   const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);

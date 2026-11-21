@@ -16,7 +16,7 @@ function Version { ([regex]::Match((Get-Content -Raw -Encoding UTF8 (Join-Path $
 if ((Test-Path $log) -and ((Get-Content $log).Count -gt 1000)) { (Get-Content $log -Tail 500) | Set-Content -Encoding UTF8 $log }
 if (-not (Test-Path (Join-Path $ExtDir '.git'))) { Log "NG フォルダがありません: $ExtDir"; exit 0 }
 $origin = git -C $ExtDir remote get-url origin 2>$null
-if ($origin -notmatch 'taichi536/snowwe-extension') { Log "NG 取得先が違うため何もしません: $origin"; exit 0 }
+if ($origin -notmatch '(taichi536|Snow-we-hp)/snowwe-extension') { Log "NG 取得先が違うため何もしません: $origin"; exit 0 }
 $branch = git -C $ExtDir rev-parse --abbrev-ref HEAD 2>$null
 if ($branch -ne 'main') { Log "NG ブランチが main ではないため何もしません: $branch"; exit 0 }
 

@@ -15,7 +15,7 @@ echo ""
 # 一時期このリポジトリを非公開にしており、その間はトークン入りのURLで
 # 取得していた。その設定が手元に残っていると、トークンを失効させたあとに
 # 取得できなくなる。ここで毎回入れ直すことで、古い設定のまま止まらない。
-REPO="https://github.com/taichi536/snowwe-extension.git"
+REPO="https://github.com/Snow-we-hp/snowwe-extension.git"
 git remote set-url origin "$REPO"
 echo "取得先を設定しました。"
 echo ""
