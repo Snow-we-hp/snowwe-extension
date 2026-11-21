@@ -1,6 +1,6 @@
 #!/bin/bash
 # 自動更新を外す（Mac）。拡張機能のフォルダは触らない。
-#   curl -fsSL https://raw.githubusercontent.com/taichi536/snowwe-extension/main/autoupdate/uninstall-mac.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Snow-we-hp/snowwe-extension/main/autoupdate/uninstall-mac.sh | bash
 AGENT="$HOME/Library/LaunchAgents/jp.snowwe.autoupdate.plist"
 launchctl bootout "gui/$(id -u)" "$AGENT" 2>/dev/null
 rm -f "$AGENT"

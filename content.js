@@ -414,7 +414,7 @@ async function recordScoutQueueEntry({ candidateId, platform, position, info, re
     // 「詳細を見る」として展開表示できるようにする（RDSに行かなくても中身が見える）
     full_profile: (fullProfile || '').substring(0, 3000),
     // gicsAutoClassify()はscoutsテーブルへの手動記録時(recordScoutSent)と同じ分類器。
-    // RPA(taichi536/scout)は自ブラウザにこの分類ロジックを持たないため、ここで先に
+    // RPA(Snow-we-hp/scout)は自ブラウザにこの分類ロジックを持たないため、ここで先に
     // 計算して保存しておき、RPA送信時にはこの値をそのままscoutsテーブルへ引き継ぐ
     // （分類ロジックの複製・二重メンテナンスを避けるため）
     industry: gicsAutoClassify(info?.company || ''),
@@ -4092,7 +4092,7 @@ document.addEventListener('click', e => {
 // -------------------------------------------------------
 // 承認待ちレビュー時、検討中リストページで対象候補者を自動で探してハイライトする
 // -------------------------------------------------------
-// スカウト送信RPA（taichi536/scout, src/rds/findCandidateCard.js）で実機検証済みの
+// スカウト送信RPA（Snow-we-hp/scout, src/rds/findCandidateCard.js）で実機検証済みの
 // マッチングロジック（法人格つきフル会社名優先＋短いコアへのフォールバック、大学名での
 // タイブレーク、祖先階層探索でのボタン特定、レスポンシブ重複レイアウトの除外）をそのまま
 // 移植したもの。RPAは自動送信のためにこれを使うが、ここでは「本人らしきカードを見つけて

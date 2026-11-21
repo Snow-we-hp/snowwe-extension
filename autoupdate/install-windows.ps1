@@ -1,10 +1,10 @@
 # 自動更新の導入（Windows。1回だけ）。PowerShell に貼り付けて Enter:
-#   powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/taichi536/snowwe-extension/main/autoupdate/install-windows.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Snow-we-hp/snowwe-extension/main/autoupdate/install-windows.ps1 | iex"
 # まだ project1 から取っていれば、同じフォルダのまま引っ越してから、1時間ごとに自動で最新版にするタスクを入れる。
 # 外すとき: schtasks /Delete /TN "Snow-we 自動更新" /F
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$NewRepo = 'https://github.com/taichi536/snowwe-extension.git'
+$NewRepo = 'https://github.com/Snow-we-hp/snowwe-extension.git'
 $ExtName = 'Snow-we スカウト パーソナライズ生成'
 $TaskName = 'Snow-we 自動更新'
 $env:GIT_TERMINAL_PROMPT = '0'
@@ -28,7 +28,7 @@ foreach ($r in $roots) {
       if ($t -and $t -match [regex]::Escape("""name"": ""$ExtName""") -and (Test-Path (Join-Path $d '.git'))) {
         $o = git -C $d remote get-url origin 2>$null
         $b = git -C $d rev-parse --abbrev-ref HEAD 2>$null
-        if ($o -match 'taichi536/(project1|snowwe-extension)' -and $b -eq 'main') { $cands += $d }
+        if ($o -match '(taichi536/(project1|snowwe-extension)|Snow-we-hp/snowwe-extension)' -and $b -eq 'main') { $cands += $d }
       }
     }
 }

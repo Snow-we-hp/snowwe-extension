@@ -29,7 +29,7 @@ echo.
 set DEST=%USERPROFILE%\Desktop\snow-we
 
 :: 公開リポジトリなので、GitHubアカウントもログインも不要。
-set REPO=https://github.com/taichi536/snowwe-extension.git
+set REPO=https://github.com/Snow-we-hp/snowwe-extension.git
 
 rem 認証が通らないときにGitHubのログイン画面を出さない。メンバーはアカウントを
 rem 持っていないので答えようがなく、原因も分からないまま止まってしまう

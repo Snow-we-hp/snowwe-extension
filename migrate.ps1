@@ -1,14 +1,14 @@
 # 引っ越し用（Windows）: taichi536/project1（非公開になった）から読み込んでいる拡張機能のフォルダを、
-# 同じ場所のまま taichi536/snowwe-extension から更新できるように切り替える。
+# 同じ場所のまま Snow-we-hp/snowwe-extension から更新できるように切り替える。
 #
-#   powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/taichi536/snowwe-extension/main/migrate.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Snow-we-hp/snowwe-extension/main/migrate.ps1 | iex"
 #
 # 同じフォルダのまま切り替えるので、拡張機能のID・設定（APIキー・担当者名）・記録は変わらない。
 # 切り替えるのは、manifest.json が Snow-we の拡張機能で、取得先が project1 / snowwe-extension で、
 # ブランチが main のフォルダだけ（開発用のフォルダは触らない）。
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$NewRepo = 'https://github.com/taichi536/snowwe-extension.git'
+$NewRepo = 'https://github.com/Snow-we-hp/snowwe-extension.git'
 $ExtName = 'Snow-we スカウト パーソナライズ生成'
 $env:GIT_TERMINAL_PROMPT = '0'
 # Git for Windows は、消せないフォルダ（旧 project1 の scout など）があると「Should I try again? (y/n)」と聞いて止まる。
@@ -41,7 +41,7 @@ foreach ($m in ($manifests | Sort-Object FullName -Unique)) {
   if (-not (Test-Path (Join-Path $dir '.git'))) { $skipped += "$dir（git のフォルダではない）"; continue }
 
   $origin = (git -C $dir remote get-url origin 2>$null)
-  if ($origin -notmatch 'taichi536/(project1|snowwe-extension)') { $skipped += "$dir（取得先が違う: $origin）"; continue }
+  if ($origin -notmatch '(taichi536/(project1|snowwe-extension)|Snow-we-hp/snowwe-extension)') { $skipped += "$dir（取得先が違う: $origin）"; continue }
   $branch = (git -C $dir rev-parse --abbrev-ref HEAD 2>$null)
   if ($branch -ne 'main') { $skipped += "$dir（ブランチが main ではない: $branch）"; continue }
 

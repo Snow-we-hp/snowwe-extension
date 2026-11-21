@@ -21,6 +21,7 @@
   ],
   "host_permissions": [
     "https://api.anthropic.com/*",
+    "https://raw.githubusercontent.com/Snow-we-hp/snowwe-extension/*",
     "https://raw.githubusercontent.com/taichi536/snowwe-extension/*",
     "https://script.google.com/*",
     "https://script.googleusercontent.com/*",

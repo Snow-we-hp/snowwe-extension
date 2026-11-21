@@ -18,7 +18,7 @@ fi
 cd "$EXT_DIR" 2>/dev/null || { log "NG フォルダに入れません（macOS の許可が無い可能性）: $EXT_DIR"; exit 0; }
 origin=$(git remote get-url origin 2>/dev/null)
 case "$origin" in
-  *taichi536/snowwe-extension*) ;;
+  *taichi536/snowwe-extension*|*Snow-we-hp/snowwe-extension*) ;;
   *) log "NG 取得先が違うため何もしません: ${origin:-なし}"; exit 0 ;;
 esac
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
