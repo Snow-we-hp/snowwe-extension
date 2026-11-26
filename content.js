@@ -203,6 +203,50 @@ function showRecruiterMissingBanner() {
   });
 }
 
+// ── 会社の Google アカウントでのログインを必須にする ──────────────
+// ログインしていないと、媒体の画面に閉じられない案内を出す（ログインすると自動で消える）。
+// 送信の記録は止めない。記録を受け取る側がログインしていない人の書き込みを受け付けなくなっても、
+// 記録は端末に取っておき、ログインしたときにまとめて送る（background.js の isPermanentSupabaseError）
+const LOGIN_OVERLAY_ID = 'snowwe-login-overlay';
+
+function isCompanyLogin(auth) {
+  return !!(auth && auth.access_token && typeof auth.email === 'string' && auth.email.toLowerCase().endsWith('@snow-we.jp'));
+}
+
+function showLoginRequiredOverlay() {
+  showBigWarningOverlay({
+    id: LOGIN_OVERLAY_ID,
+    title: '🔒 会社のGoogleアカウントでログインしてください',
+    message: 'この拡張機能は、会社のGoogleアカウント（@snow-we.jp）でログインしないと使えません。'
+      + 'ログインすると、担当者名も自動で決まります。送ったスカウトの記録は消えずに残り、ログインするとまとめて送られます。',
+    actionLabel: '会社のGoogleでログイン',
+    onAction: async () => {
+      try {
+        const r = await chrome.runtime.sendMessage({ type: 'supabaseLogin' });
+        if (r && r.ok) {
+          document.getElementById(LOGIN_OVERLAY_ID)?.remove();
+          showAutoStatus(`✅ ログインしました（${r.staffName || r.email || ''}）`, 5000);
+        } else {
+          showAutoStatus(`❌ ${(r && r.error) || 'ログインできませんでした。もう一度押してください'}`, 8000);
+        }
+      } catch (e) {
+        if (String(e && e.message).includes('Extension context invalidated')) showExtensionInvalidatedBanner();
+        else showAutoStatus('❌ ログインできませんでした。もう一度押してください', 8000);
+      }
+    },
+  });
+}
+
+chrome.storage.local.get(['supabaseAuth']).then(r => {
+  if (!isCompanyLogin(r.supabaseAuth)) setTimeout(showLoginRequiredOverlay, 1500);
+}).catch(() => {});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.supabaseAuth) return;
+  if (isCompanyLogin(changes.supabaseAuth.newValue)) document.getElementById(LOGIN_OVERLAY_ID)?.remove();
+  else showLoginRequiredOverlay();
+});
+
 // ページを開いた時点で担当者名を確認する。設定済みならキャッシュにも載るので、
 // 記録時に chrome.storage の読み込みが空を返しても取り違えない
 chrome.storage.local.get(['gasSettings', 'recruiterName']).then(r => {
