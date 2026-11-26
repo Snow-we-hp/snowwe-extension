@@ -590,6 +590,13 @@ async function supabaseLogin() {
   }
   const session = await _saveSupabaseSession(data);
   await syncRecruiterFromAccount().catch(() => {});
+  // ログインするまで送れなかった記録を、すぐ送る
+  try {
+    await requeueAuthDeadLetters();
+    // ログインしていない間の失敗で送り直しを遅らせていたら、その待ちを解く
+    await recordSupabaseSuccess();
+    flushSupabaseScoutQueue().catch(() => {});
+  } catch (_) {}
   return { email: session.email, staffName: staffNameFromEmail(session.email) };
 }
 
@@ -990,7 +997,23 @@ function isPermanentSupabaseError(reason) {
   const status = reason && reason.status;
   if (!status) return false;
   if (status === 408 || status === 429) return false;
+  // 401・403 は「ログインしていない／鍵が切れた」。ログインすれば通るので諦めない。
+  // 記録を受け取る側で、ログインしていない人の書き込みを閉じたあと（段階B）、ログインを忘れていても
+  // 記録が捨てられないように、ログインするまで端末に取っておいて送り直す
+  if (status === 401 || status === 403) return false;
   return status >= 400 && status < 500;
+}
+
+// ログインしたとき、前の版で「権限が無い（401・403）」として諦めた記録を、送り直しの列に戻す
+async function requeueAuthDeadLetters() {
+  const { supabaseDeadLetter, supabaseScoutQueue } = await chrome.storage.local.get(['supabaseDeadLetter', 'supabaseScoutQueue']);
+  const dead = supabaseDeadLetter || [];
+  const isAuth = it => /^HTTP 40[13]\b/.test(String(it._lastError || ''));
+  const back = dead.filter(isAuth);
+  if (back.length === 0) return 0;
+  const queue = (supabaseScoutQueue || []).concat(back.map(({ _deadAt, _permanent, ...it }) => ({ ...it, _attempts: 0 })));
+  await chrome.storage.local.set({ supabaseDeadLetter: dead.filter(it => !isAuth(it)), supabaseScoutQueue: queue });
+  return back.length;
 }
 
 async function moveToSupabaseDeadLetter(items) {

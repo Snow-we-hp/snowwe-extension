@@ -2102,6 +2102,15 @@ async function refreshLoginBar() {
     logoutBtn.style.display = 'none';
   }
   lockRecruiterToAccount(st);
+  lockUntilLogin(st);
+}
+
+// ログインしていないあいだは、ログインの欄以外を隠す（ログインを必須にする）
+function lockUntilLogin(st) {
+  const required = !(st && st.loggedIn);
+  document.body.classList.toggle('login-required', required);
+  const gate = $('login-gate');
+  if (gate) gate.style.display = required ? '' : 'none';
 }
 
 // ログイン中は、担当者名をアカウントから決めた名前にして、手では変えられなくする（staff-from-account.js）。
